@@ -88,19 +88,29 @@ fn tlsOptions(
     };
 }
 
-fn mapTimeout(err: anyerror) anyerror {
+/// Classify an I/O error from the probe pipeline.
+///
+/// Genuine timeouts (`ConnectionTimedOut`, `Timeout`) always map to `Timeout`.
+/// `shutdown(2)`-induced EOF/reset errors map to `Timeout` only when our watchdog
+/// actually fired (`fired == true`); otherwise they are real server-side rejections
+/// (wrong password, dead upstream, TLS protocol error) and pass through unchanged
+/// so the caller can distinguish "slow" from "broken/auth-rejected".
+fn classifyErr(err: anyerror, fired: bool) anyerror {
     return switch (err) {
-        error.ConnectionResetByPeer,
         error.ConnectionTimedOut,
+        error.Timeout,
+        => error.Timeout,
+        // Errors that shutdown(fd, SHUT.RDWR) typically produces on a blocked
+        // TLS/reader — only treat as timeout if we caused them.
         error.EndOfStream,
+        error.UnexpectedEndOfStream,
         error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.TlsConnectionTruncated,
         error.SocketNotConnected,
         error.NotOpenForReading,
         error.NotOpenForWriting,
-        error.TlsConnectionTruncated,
-        error.TlsUnexpectedMessage,
-        error.UnexpectedEndOfStream,
-        => error.Timeout,
+        => if (fired) error.Timeout else err,
         else => err,
     };
 }
@@ -126,7 +136,8 @@ pub fn probe(
 
     // std.crypto.tls blocks without our poll deadlines — force-unblock via shutdown.
     var done = std.atomic.Value(bool).init(false);
-    var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done);
+    var fired = std.atomic.Value(bool).init(false);
+    var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
 
     const bundle = try ensureCaBundle(gpa, io);
@@ -148,7 +159,7 @@ pub fn probe(
         &stream_reader.interface,
         &stream_writer.interface,
         tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, bundle),
-    ) catch |err| return mapTimeout(err);
+    ) catch |err| return classifyErr(err, fired.load(.acquire));
 
     const tls_reader = &tls_client.reader;
     const tls_writer = &tls_client.writer;
@@ -156,25 +167,25 @@ pub fn probe(
     if (transport_ws) {
         const path = if (ws_path.len > 0) ws_path else "/";
         const host_hdr = if (ws_host.len > 0) ws_host else sni_use;
-        ws.performUpgrade(tls_reader, tls_writer, io, path, host_hdr) catch |err| return mapTimeout(err);
+        ws.performUpgrade(tls_reader, tls_writer, io, path, host_hdr) catch |err| return classifyErr(err, fired.load(.acquire));
     }
 
     var req_buf: [256]u8 = undefined;
     const req_len = try buildRequest(password, &req_buf);
 
     if (transport_ws) {
-        ws.writeBinaryFrame(tls_writer, io, req_buf[0..req_len]) catch |err| return mapTimeout(err);
+        ws.writeBinaryFrame(tls_writer, io, req_buf[0..req_len]) catch |err| return classifyErr(err, fired.load(.acquire));
     } else {
-        tls_writer.writeAll(req_buf[0..req_len]) catch |err| return mapTimeout(err);
-        tls_writer.flush() catch |err| return mapTimeout(err);
+        tls_writer.writeAll(req_buf[0..req_len]) catch |err| return classifyErr(err, fired.load(.acquire));
+        tls_writer.flush() catch |err| return classifyErr(err, fired.load(.acquire));
     }
 
     var one: [1]u8 = undefined;
     if (transport_ws) {
         var frame_buf: [2048]u8 = undefined;
-        _ = ws.readBinaryFrame(tls_reader, tls_writer, io, &frame_buf) catch |err| return mapTimeout(err);
+        _ = ws.readBinaryFrame(tls_reader, tls_writer, io, &frame_buf) catch |err| return classifyErr(err, fired.load(.acquire));
     } else {
-        tls_reader.readSliceAll(&one) catch |err| return mapTimeout(err);
+        tls_reader.readSliceAll(&one) catch |err| return classifyErr(err, fired.load(.acquire));
     }
 
     return netutil.elapsedMs(start, io);
@@ -221,13 +232,31 @@ test "buildRequest wire layout" {
     try std.testing.expectEqualStrings(probe_http, buf[82..n]);
 }
 
-test "mapTimeout collapses stream errors to Timeout" {
-    try std.testing.expect(mapTimeout(error.ConnectionResetByPeer) == error.Timeout);
-    try std.testing.expect(mapTimeout(error.TlsConnectionTruncated) == error.Timeout);
-    try std.testing.expect(mapTimeout(error.EndOfStream) == error.Timeout);
-    try std.testing.expect(mapTimeout(error.UnexpectedEndOfStream) == error.Timeout);
+test "classifyErr: genuine timeouts always map to Timeout" {
+    try std.testing.expect(classifyErr(error.ConnectionTimedOut, false) == error.Timeout);
+    try std.testing.expect(classifyErr(error.Timeout, false) == error.Timeout);
+    try std.testing.expect(classifyErr(error.ConnectionTimedOut, true) == error.Timeout);
 }
 
-test "mapTimeout passes through unrelated errors" {
-    try std.testing.expect(mapTimeout(error.OutOfMemory) == error.OutOfMemory);
+test "classifyErr: shutdown-induced errors map to Timeout only when fired" {
+    // Not fired → real server-side close/reset, pass through unchanged.
+    try std.testing.expect(classifyErr(error.EndOfStream, false) == error.EndOfStream);
+    try std.testing.expect(classifyErr(error.UnexpectedEndOfStream, false) == error.UnexpectedEndOfStream);
+    try std.testing.expect(classifyErr(error.ConnectionResetByPeer, false) == error.ConnectionResetByPeer);
+    try std.testing.expect(classifyErr(error.TlsConnectionTruncated, false) == error.TlsConnectionTruncated);
+    try std.testing.expect(classifyErr(error.BrokenPipe, false) == error.BrokenPipe);
+    // Fired → our watchdog shut the socket, treat as timeout.
+    try std.testing.expect(classifyErr(error.EndOfStream, true) == error.Timeout);
+    try std.testing.expect(classifyErr(error.UnexpectedEndOfStream, true) == error.Timeout);
+    try std.testing.expect(classifyErr(error.ConnectionResetByPeer, true) == error.Timeout);
+    try std.testing.expect(classifyErr(error.TlsConnectionTruncated, true) == error.Timeout);
+    try std.testing.expect(classifyErr(error.BrokenPipe, true) == error.Timeout);
+}
+
+test "classifyErr: unrelated and protocol errors pass through regardless of fired" {
+    try std.testing.expect(classifyErr(error.OutOfMemory, false) == error.OutOfMemory);
+    try std.testing.expect(classifyErr(error.OutOfMemory, true) == error.OutOfMemory);
+    // TlsUnexpectedMessage is a real protocol failure, not shutdown-induced.
+    try std.testing.expect(classifyErr(error.TlsUnexpectedMessage, false) == error.TlsUnexpectedMessage);
+    try std.testing.expect(classifyErr(error.TlsUnexpectedMessage, true) == error.TlsUnexpectedMessage);
 }

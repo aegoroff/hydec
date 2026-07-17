@@ -213,18 +213,30 @@ pub fn waitReadableUntil(stream: Io.net.Stream, io: Io, deadline_ns: ?i128) !voi
 
 /// Unblocks a stuck blocking read/write by shutting the socket down after `timeout_ns`.
 /// Needed for `std.crypto.tls` which ignores our poll-based deadlines.
-/// Caller must keep `done` alive until `disarm` returns.
+/// Caller must keep `done` and `fired` alive until `disarm` returns.
+///
+/// `done` is set by `disarm` to signal the watchdog to stop without firing.
+/// `fired` is set by the watchdog right before calling `shutdown(2)`, so callers
+/// can distinguish a timeout-induced I/O error (fired=true) from a genuine
+/// server-side close/reset (fired=false).
 pub const DeadlineShutdown = struct {
     done: *std.atomic.Value(bool),
+    fired: *std.atomic.Value(bool),
     thread: ?std.Thread,
 
-    pub fn arm(fd: posix.fd_t, timeout_ns: u64, done: *std.atomic.Value(bool)) !DeadlineShutdown {
+    pub fn arm(
+        fd: posix.fd_t,
+        timeout_ns: u64,
+        done: *std.atomic.Value(bool),
+        fired: *std.atomic.Value(bool),
+    ) !DeadlineShutdown {
         done.* = std.atomic.Value(bool).init(false);
+        fired.* = std.atomic.Value(bool).init(false);
         if (builtin.os.tag == .windows or timeout_ns == 0) {
-            return .{ .done = done, .thread = null };
+            return .{ .done = done, .fired = fired, .thread = null };
         }
-        const thread = try std.Thread.spawn(.{}, watchdog, .{ fd, timeout_ns, done });
-        return .{ .done = done, .thread = thread };
+        const thread = try std.Thread.spawn(.{}, watchdog, .{ fd, timeout_ns, done, fired });
+        return .{ .done = done, .fired = fired, .thread = thread };
     }
 
     pub fn disarm(self: *DeadlineShutdown) void {
@@ -235,7 +247,12 @@ pub const DeadlineShutdown = struct {
         }
     }
 
-    fn watchdog(fd: posix.fd_t, timeout_ns: u64, done: *std.atomic.Value(bool)) void {
+    fn watchdog(
+        fd: posix.fd_t,
+        timeout_ns: u64,
+        done: *std.atomic.Value(bool),
+        fired: *std.atomic.Value(bool),
+    ) void {
         const chunk: u64 = 50 * std.time.ns_per_ms;
         var left = timeout_ns;
         while (left > 0 and !done.load(.acquire)) {
@@ -244,6 +261,7 @@ pub const DeadlineShutdown = struct {
             left -= step;
         }
         if (!done.load(.acquire)) {
+            fired.store(true, .release);
             _ = posix.system.shutdown(fd, posix.SHUT.RDWR);
         }
     }

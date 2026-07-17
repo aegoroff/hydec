@@ -175,7 +175,8 @@ pub fn probe(io: Io, host: []const u8, port: u16, method_name: []const u8, passw
     const remain = netutil.remainingTimeoutNs(start, io, timeout_secs);
     if (remain == 0) return error.Timeout;
     var done = std.atomic.Value(bool).init(false);
-    var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done);
+    var fired = std.atomic.Value(bool).init(false);
+    var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
 
     try netutil.waitReadableUntil(stream, io, deadline);
