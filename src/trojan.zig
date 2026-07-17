@@ -12,6 +12,12 @@ fn trojanHash(password: []const u8, out: *[56]u8) void {
     @memcpy(out, &hex);
 }
 
+/// HTTP/1.1 on port 80 — remote replies immediately so the probe read unblocks.
+/// Targeting :443 without payload would hang (TLS server waits for ClientHello).
+const probe_http_port: u16 = 80;
+const probe_http =
+    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ util.probe_domain ++ "\r\nConnection: close\r\n\r\n";
+
 fn buildRequest(password: []const u8, out: []u8) !usize {
     var hex: [56]u8 = undefined;
     trojanHash(password, &hex);
@@ -25,12 +31,15 @@ fn buildRequest(password: []const u8, out: []u8) !usize {
     i += 1;
     out[i] = 0x01; // CONNECT
     i += 1;
-    const n = try util.writeSocksAddrDomain(out[i..], util.probe_domain, util.probe_port);
+    const n = try util.writeSocksAddrDomain(out[i..], util.probe_domain, probe_http_port);
     i += n;
     out[i] = '\r';
     i += 1;
     out[i] = '\n';
     i += 1;
+    if (out.len < i + probe_http.len) return error.BufferTooSmall;
+    @memcpy(out[i..][0..probe_http.len], probe_http);
+    i += probe_http.len;
     return i;
 }
 
@@ -162,7 +171,7 @@ pub fn probe(
 
     var one: [1]u8 = undefined;
     if (transport_ws) {
-        var frame_buf: [256]u8 = undefined;
+        var frame_buf: [2048]u8 = undefined;
         _ = ws.readBinaryFrame(tls_reader, tls_writer, io, &frame_buf) catch |err| return mapTimeout(err);
     } else {
         tls_reader.readSliceAll(&one) catch |err| return mapTimeout(err);
@@ -193,7 +202,7 @@ test "trojanHash empty password" {
 test "buildRequest wire layout" {
     var buf: [256]u8 = undefined;
     const n = try buildRequest("password", &buf);
-    try std.testing.expectEqual(@as(usize, 82), n);
+    try std.testing.expectEqual(@as(usize, 82 + probe_http.len), n);
 
     var want_hex: [56]u8 = undefined;
     trojanHash("password", &want_hex);
@@ -205,10 +214,11 @@ test "buildRequest wire layout" {
     try std.testing.expectEqual(@as(u8, 0x03), buf[59]); // ATYP domain
     try std.testing.expectEqual(@as(u8, 17), buf[60]); // domain length
     try std.testing.expectEqualStrings("cp.cloudflare.com", buf[61..78]);
-    try std.testing.expectEqual(@as(u8, 0x01), buf[78]); // port 443 high
-    try std.testing.expectEqual(@as(u8, 0xBB), buf[79]); // port 443 low
+    try std.testing.expectEqual(@as(u8, 0x00), buf[78]); // port 80 high
+    try std.testing.expectEqual(@as(u8, 0x50), buf[79]); // port 80 low
     try std.testing.expectEqual(@as(u8, '\r'), buf[80]);
     try std.testing.expectEqual(@as(u8, '\n'), buf[81]);
+    try std.testing.expectEqualStrings(probe_http, buf[82..n]);
 }
 
 test "mapTimeout collapses stream errors to Timeout" {
