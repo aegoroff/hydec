@@ -4,85 +4,114 @@ Instructions for AI coding agents working in the **hydec** repository.
 
 ## Project overview
 
-A non-interactive file system information tool implemented in Zig. It gets and probes sing-box proxies and finds the best one.
+Non-interactive CLI that downloads a base64-encoded proxy subscription, probes working nodes, and prints the fastest one.
 
 | Item | Value |
 |------|-------|
 | Language | Zig **0.16.0** (see `mise.toml`) |
 | CLI parsing | [zig-cli](https://github.com/zig-utils/zig-cli) |
 | License | MIT |
+| Default version | `0.1.0-dev` (`-Dversion=...` / `build_options.version`) |
+
+**Supported probes**
+
+| Protocol | Notes |
+|----------|--------|
+| Shadowsocks | AEAD methods |
+| Trojan | TLS; WebSocket transport |
+| VLESS | REALITY only; TCP (`xtls-rprx-vision`) and gRPC gun |
+| VMess | Skipped (counted in stats) |
+
+**Behavior**
+
+1. Fetch subscription URL (HTTPS).
+2. Base64-decode body; iterate URI lines.
+3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**.
+4. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
+
+## Layout
+
+| Path | Role |
+|------|------|
+| `src/main.zig` | Entry, orchestration |
+| `src/cli.zig` | Args: `URI`, `-t/--timeout`, `-v/--verbose`, `-V/--version` |
+| `src/fetch.zig` | Download subscription |
+| `src/subscription.zig` | Base64 decode, line iteration |
+| `src/proxy_uri.zig` | URI parse (kind, host/port, query, `#name`) |
+| `src/probe.zig` | Group-by-host parallel `findBest`, `probeOne` |
+| `src/ss.zig` / `trojan.zig` / `reality.zig` | Protocol probes |
+| `src/vless.zig` / `grpc_gun.zig` / `ws.zig` | Framing helpers |
+| `src/netutil.zig` | Timed connect, poll deadlines, TLS watchdog |
+| `src/util.zig` | Shared helpers (URL decode, query params, …) |
 
 ## Build and run
 
-Use **mise** to pin the Zig version, or install Zig 0.16.0 manually.
+Use **mise** for Zig 0.16.0, or install it manually.
 
 ```bash
-# Standard local build
 zig build
-
-# Run tests
 zig build test
 
-# Run with a path to analyze
-zig build run -- .
+# Probe a subscription (URI required)
+zig build run -- "https://example.com/sub"
 
 # Cross-compile example
 zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
 ```
 
-Via **just** (uses mise for Zig; CI uses the same recipes):
+Via **just** (mise-wrapped Zig):
 
 ```bash
 just build                                                      # ReleaseFast, x86_64-linux-musl, core2
 just test
-just arch=x86_64 os=linux abi=musl ver=0.3.0 cpu=core2 release
-just ver=0.3.0 build-all                                        # all CI targets + archives
+just arch=x86_64 os=linux abi=musl ver=0.1.0 cpu=core2 release
+just ver=0.1.0 build-all                                        # all release targets + archives
 ```
 
-Binary output: `zig-out/bin/hydec` (or custom prefix from `--prefix-exe-dir`).
+Binary: `zig-out/bin/hydec` (or `--prefix-exe-dir`).
 
-**Linux-gnu note:** `build.zig` pins glibc to 2.38 so Zig links its bundled CRT. Do not drop that pin without understanding the `.sframe` / system `crt1.o` issue documented in `build.zig`.
+**Linux-gnu note:** `build.zig` pins glibc to **2.38** so Zig links its bundled CRT. Do not drop that pin without understanding the `.sframe` / system `crt1.o` issue documented in `build.zig`.
 
 ## Zig conventions for this repo
 
 - **Minimize scope.** Small, focused diffs. No drive-by refactors.
-- **Match existing style.** Follow patterns in existing `src/*.zig` modules for naming, error handling, and allocator use.
-- **Use std library first.** Avoid adding dependencies without discussion.
-- **I/O.** This codebase uses Zig 0.16 `std.Io` APIs (`init.io`, `std.Io.File`, `std.Io.Dir`, `std.Io.Clock`, `std.Io.Writer`). Do not revert to pre-0.16 file APIs.
-- **Comments.** Only for non-obvious logic; the code should read clearly on its own.
-- **Tests.** Add `test` blocks in the same file as the code under test. Run `zig build test` before finishing.
-- **Format.** Apply `zig fmt` to changed Zig files before finishing.
+- **Match existing style.** Follow patterns in `src/*.zig` for naming, errors, and allocators.
+- **Use std library first.** Avoid new dependencies without discussion.
+- **I/O.** Zig 0.16 `std.Io` (`init.io`, `std.Io.File`, `std.Io.Clock`, `std.Io.Writer`, `Io.Mutex`). Do not revert to pre-0.16 APIs.
+- **Networking.** Prefer `netutil` helpers for connect/timeouts. IP connects use non-blocking + `poll` (Zig `IpAddress.connect` timeout is still TODO on Linux). Blocking `std.crypto.tls` needs `DeadlineShutdown`, not only poll.
+- **Concurrency.** Parallelism is **by host** in `probe.zig` (`std.Thread` + `Io.Mutex`). Do not probe the same IP concurrently.
+- **Comments.** Only for non-obvious logic.
+- **Tests.** `test` blocks in the same file as the code. Run `zig build test` before finishing.
+- **Format.** `zig fmt` on changed Zig files before finishing.
 
 ## Code style
 
-- Follow Zig standard library conventions
-- `snake_case` for functions and variables; `PascalCase` for types; `SCREAMING_SNAKE_CASE` for constants
-- Prefer explicit error handling with `!` return types
-- Keep functions small and focused on a single responsibility
-- Prefer `gpa` as the allocator parameter name
-- Prefer `init.gpa` / `init.io` from `std.process.Init` in `main` rather than inventing globals
+- Zig stdlib conventions: `snake_case` functions/vars; `PascalCase` types; `SCREAMING_SNAKE_CASE` constants
+- Explicit `!` error returns; keep functions focused
+- Allocator parameter name: `gpa`
+- In `main`, use `init.gpa` / `init.io` from `std.process.Init`
 
 ## Development rules
 
 ### Before making changes
 
-1. Read existing code to understand patterns and conventions
-2. Check for existing tests related to modified functionality
-3. Keep changes compatible with the existing CLI unless the task changes it
+1. Read existing code for patterns
+2. Check tests near the code you touch
+3. Keep CLI compatible unless the task changes it
 
 ### When writing code
 
-1. Write idiomatic Zig following std lib patterns
-2. Handle errors explicitly — no silent failures (existing `catch {}` / `catch continue` in the walk path are intentional; do not broaden that pattern casually)
-3. Add tests for new functionality (AAA: Arrange, Act, Assert)
+1. Idiomatic Zig / std patterns
+2. Handle errors explicitly — no silent failures
+3. Add tests for new logic (AAA)
 4. Keep backward compatibility when possible
 
 ### When fixing bugs
 
-1. Understand root cause before fixing
+1. Find root cause before fixing
 2. Add a regression test if missing
-3. Check for similar issues in related code
-4. Verify the fix does not break existing tests
+3. Check similar code paths (SS / Trojan / VLESS / gRPC)
+4. Confirm `zig build test` still passes
 
 ## Testing
 
@@ -90,53 +119,50 @@ Binary output: `zig-out/bin/hydec` (or custom prefix from `--prefix-exe-dir`).
 zig build test
 ```
 
-Prefer table-driven or focused unit tests (see `src/lib.zig`). Full-tree scans are for manual smoke checks, not default automated tests.
+Prefer focused unit tests (URI parse, framing, grouping). Live subscription probes are manual smoke checks, not default CI.
 
-CI runs tests only for `x86_64-linux` builds (`just release`). Ensure tests pass on that target.
+`just release` runs tests only for **x86_64-linux** targets. Ensure tests pass there.
 
-## CI and releases
+## Releases
 
-- **Branches:** `master`, `develop`; PRs target `master`.
-- **CI:** `.github/workflows/ci_build.yml` — matrix build for Linux, Windows, macOS (x86_64 + aarch64).
-- **Releases:** Tags `v*` trigger changelog generation (`cliff.toml` / git-cliff) and GitHub release with `.tar.gz` artifacts.
-- **Version:** Passed at build time via `-Dversion=...` (`build_options.version` in code). Default: `0.3.0-dev`.
+- Version via `-Dversion=...` (default `0.1.0-dev`).
+- Multi-target archives: `just ver=0.1.0 build-all` (see `justfile`).
+- There is currently **no** checked-in GitHub Actions workflow or git-cliff config; do not assume them.
 
 ## Commit and PR guidelines
 
-Follow [Conventional Commits](https://www.conventionalcommits.org/):
+[Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
-feat: human-readable size in reporter
-fix: skip unreadable entries without aborting walk
-chore: readme corrected
-ci: migration to mise
+feat: probe distinct IPs in parallel
+fix: respect Trojan TLS timeout via socket shutdown
+chore: correct project overview in AGENTS.md
 build: zig 0.16
-refactor: pass walker entry by reference
 ```
 
 - Do **not** commit unless explicitly asked.
 - Do **not** push or force-push without explicit request.
-- Keep PRs focused; describe what changed and how to verify (`zig build test`, manual `hydec .` smoke test).
+- Keep PRs focused; verify with `zig build test` and a manual `hydec -v <subscription-url>` smoke run when networking changed.
 
 ## Security
 
 - Never commit secrets, tokens, or credentials.
-- Treat user-supplied paths carefully; prefer `std.Io.Dir` / path helpers over ad-hoc string concatenation when opening or joining paths.
+- Subscription URIs and proxy lines often embed passwords/UUIDs — avoid logging full URIs; prefer host/port and decoded `#fragment` name (as in `probe.zig` verbose output).
+- Treat user-supplied URLs carefully when fetching.
 
 ## What agents should avoid
 
-- Adding large frameworks or unnecessary abstractions for one-off logic.
-- Copying entire files into rules or docs — reference paths instead.
-- Changing `build.zig.zon` dependency hashes without fetching and verifying the new package.
-- Breaking cross-compilation targets listed in CI without updating the workflow.
-- Editing `README.md` or this file unless the task requires documentation updates.
-- Reintroducing multithreading for the walk without a clear, measured plan (previously rolled back).
+- Large frameworks or abstractions for one-off logic.
+- Copying entire files into rules/docs — reference paths instead.
+- Changing `build.zig.zon` dependency hashes without fetching and verifying the package.
+- Breaking cross-compile targets listed in `justfile` `build-all` without updating that recipe.
+- Editing `README.md` or this file unless the task asks for documentation updates.
+- Probing multiple protocols on the **same host** in parallel (overloads one endpoint; current design is sequential per IP).
+- Reintroducing untimed blocking connects/reads where `netutil` deadlines already apply.
 
 ## Verification checklist
 
-Before considering a task done:
-
 1. `zig build` succeeds.
 2. `zig build test` passes.
-3. Changed Zig sources are formatted with `zig fmt`.
-4. No new compiler warnings in ReleaseFast (CI default).
+3. Changed Zig sources are `zig fmt`'d.
+4. No new compiler warnings in ReleaseFast (just/CI default).

@@ -1,0 +1,309 @@
+const std = @import("std");
+const zig_cli = @import("zig_cli");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
+
+pub const Options = struct {
+    /// Owned by the caller; free with `gpa.free`.
+    uri: []u8,
+    timeout_secs: u32,
+    verbose: bool,
+};
+
+const Capture = struct {
+    gpa: std.mem.Allocator,
+    options: ?Options = null,
+};
+
+var capture: Capture = undefined;
+
+fn onParsed(ctx: *zig_cli.BaseCommand.ParseContext) !void {
+    const uri_arg = ctx.getArgument(0) orelse return error.MissingRequiredArgument;
+    const uri = try capture.gpa.dupe(u8, uri_arg);
+    errdefer capture.gpa.free(uri);
+
+    const timeout_secs: u32 = blk: {
+        if (ctx.getOption("timeout")) |value| {
+            break :blk std.fmt.parseInt(u32, value, 10) catch return error.InvalidTimeout;
+        }
+        break :blk 5;
+    };
+    if (timeout_secs == 0) return error.InvalidTimeout;
+
+    capture.options = .{
+        .uri = uri,
+        .timeout_secs = timeout_secs,
+        .verbose = ctx.hasOption("verbose"),
+    };
+}
+
+fn wantsHelp(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return true;
+    }
+    return false;
+}
+
+fn wantsVersion(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) return true;
+    }
+    return false;
+}
+
+fn shortTakesValue(options: []const zig_cli.Option, short: u8) bool {
+    for (options) |opt| {
+        if (opt.short) |s| {
+            if (s == short) return opt.option_type != .bool;
+        }
+    }
+    return false;
+}
+
+fn normalizeArgs(
+    gpa: std.mem.Allocator,
+    options: []const zig_cli.Option,
+    args: []const []const u8,
+) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer list.deinit(gpa);
+
+    for (args) |arg| {
+        if (arg.len >= 3 and arg[0] == '-' and arg[1] != '-' and shortTakesValue(options, arg[1])) {
+            try list.append(gpa, arg[0..2]);
+            try list.append(gpa, arg[2..]);
+            continue;
+        }
+        if (arg.len >= 4 and std.mem.startsWith(u8, arg, "--")) {
+            if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
+                if (eq > 2) {
+                    try list.append(gpa, arg[0..eq]);
+                    try list.append(gpa, arg[eq + 1 ..]);
+                    continue;
+                }
+            }
+        }
+        try list.append(gpa, arg);
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+fn collectArgs(gpa: std.mem.Allocator, args: std.process.Args) ![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (list.items) |s| gpa.free(s);
+        list.deinit(gpa);
+    }
+
+    var iter = try std.process.Args.Iterator.initAllocator(args, gpa);
+    defer iter.deinit();
+    _ = iter.skip();
+    while (iter.next()) |arg| {
+        const owned = try gpa.dupe(u8, arg);
+        errdefer gpa.free(owned);
+        try list.append(gpa, owned);
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+fn freeCollectedArgs(gpa: std.mem.Allocator, args: []const []const u8) void {
+    for (args) |s| gpa.free(s);
+    gpa.free(args);
+}
+
+fn buildCommand(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseCommand {
+    const cmd = try zig_cli.BaseCommand.init(gpa, "hydec", description);
+    errdefer {
+        cmd.deinit();
+        gpa.destroy(cmd);
+    }
+
+    _ = try cmd.addArgument(
+        zig_cli.Argument.init("URI", "Subscription URL (HTTPS, base64 body)", .string).withRequired(true),
+    );
+    _ = try cmd.addOption(
+        zig_cli.Option.init(
+            "timeout",
+            "timeout",
+            "Per-proxy probe timeout in seconds (default: 5)",
+            .int,
+        ).withShort('t'),
+    );
+    _ = try cmd.addOption(
+        zig_cli.Option.init(
+            "verbose",
+            "verbose",
+            "Log each probe result to stderr",
+            .bool,
+        ).withShort('v'),
+    );
+    _ = try cmd.addOption(
+        zig_cli.Option.init(
+            "version",
+            "version",
+            "Print version and exit",
+            .bool,
+        ).withShort('V'),
+    );
+    _ = cmd.setAction(onParsed);
+    return cmd;
+}
+
+fn optionValueLabel(option_type: zig_cli.Option.OptionType) []const u8 {
+    return switch (option_type) {
+        .string => " <VALUE>",
+        .int => " <INT>",
+        .float => " <FLOAT>",
+        .bool => "",
+    };
+}
+
+fn optionLeftWidth(opt: zig_cli.Option) usize {
+    return 6 + 2 + opt.long.len + optionValueLabel(opt.option_type).len;
+}
+
+fn argumentLeftWidth(arg: zig_cli.Argument) usize {
+    var width: usize = 4 + arg.name.len;
+    if (arg.variadic) width += 3;
+    return width;
+}
+
+fn writePadding(writer: *std.Io.Writer, used: usize, column: usize) !void {
+    var i = used;
+    while (i < column) : (i += 1) {
+        try writer.writeByte(' ');
+    }
+}
+
+fn printHelp(cmd: *zig_cli.BaseCommand) !void {
+    var buf: [4096]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
+    const out = &file_writer.interface;
+
+    const help_left = "  -h, --help";
+    var left_column: usize = help_left.len;
+    for (cmd.arguments.items) |arg| {
+        left_column = @max(left_column, argumentLeftWidth(arg));
+    }
+    for (cmd.options.items) |opt| {
+        left_column = @max(left_column, optionLeftWidth(opt));
+    }
+    const desc_column = left_column + 2;
+
+    try out.print("\n{s} v{s}\n{s}\n\n", .{ "hydec", build_options.version, cmd.description });
+
+    try out.print("USAGE:\n  {s}", .{cmd.name});
+    if (cmd.options.items.len > 0) try out.print(" [OPTIONS]", .{});
+    for (cmd.arguments.items) |arg| {
+        if (arg.required) {
+            try out.print(" <{s}>", .{arg.name});
+        } else {
+            try out.print(" [{s}]", .{arg.name});
+        }
+    }
+    try out.print("\n\n", .{});
+
+    if (cmd.arguments.items.len > 0) {
+        try out.print("ARGUMENTS:\n", .{});
+        for (cmd.arguments.items) |arg| {
+            try out.print("  <{s}>", .{arg.name});
+            try writePadding(out, argumentLeftWidth(arg), desc_column);
+            try out.print("{s}\n", .{arg.description});
+        }
+        try out.print("\n", .{});
+    }
+
+    if (cmd.options.items.len > 0) {
+        try out.print("OPTIONS:\n", .{});
+        for (cmd.options.items) |opt| {
+            if (opt.short) |s| {
+                try out.print("  -{c}, ", .{s});
+            } else {
+                try out.print("      ", .{});
+            }
+            try out.print("--{s}{s}", .{ opt.long, optionValueLabel(opt.option_type) });
+            try writePadding(out, optionLeftWidth(opt), desc_column);
+            try out.print("{s}\n", .{opt.description});
+        }
+        try out.print("{s}", .{help_left});
+        try writePadding(out, help_left.len, desc_column);
+        try out.print("Print help\n\n", .{});
+    }
+
+    try out.flush();
+}
+
+pub fn printVersion() !void {
+    var buf: [256]u8 = undefined;
+    var file_writer = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
+    try file_writer.interface.print("hydec {s}\n", .{build_options.version});
+    try file_writer.interface.flush();
+}
+
+pub const ParseResult = union(enum) {
+    help,
+    version,
+    run: Options,
+};
+
+pub fn parse(gpa: std.mem.Allocator, args: std.process.Args) !ParseResult {
+    const query = std.Target.Query.fromTarget(&builtin.target);
+    const description = try std.fmt.allocPrint(
+        gpa,
+        \\Find the fastest working proxy from a base64 subscription URL ({s})
+        \\Copyright (C) 2026. MIT License.
+    ,
+        .{@tagName(query.cpu_arch.?)},
+    );
+    defer gpa.free(description);
+
+    const cmd = try buildCommand(gpa, description);
+    defer {
+        cmd.deinit();
+        gpa.destroy(cmd);
+    }
+
+    const raw_args = try collectArgs(gpa, args);
+    defer freeCollectedArgs(gpa, raw_args);
+    const arg_slice = try normalizeArgs(gpa, cmd.options.items, raw_args);
+    defer gpa.free(arg_slice);
+
+    if (arg_slice.len == 0 or wantsHelp(arg_slice)) {
+        try printHelp(cmd);
+        return .help;
+    }
+    if (wantsVersion(arg_slice)) {
+        return .version;
+    }
+
+    capture = .{ .gpa = gpa };
+    var parser = zig_cli.Parser.init(gpa);
+    try parser.parse(cmd, arg_slice);
+    const opts = capture.options orelse return error.MissingRequiredArgument;
+    return .{ .run = opts };
+}
+
+test "normalizeArgs expands attached timeout" {
+    const options = [_]zig_cli.Option{
+        zig_cli.Option.init("timeout", "timeout", "", .int).withShort('t'),
+        zig_cli.Option.init("verbose", "verbose", "", .bool).withShort('v'),
+    };
+    const raw = [_][]const u8{ "-t3", "-v", "https://example.com/s/x" };
+    const normalized = try normalizeArgs(std.testing.allocator, &options, &raw);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqual(@as(usize, 4), normalized.len);
+    try std.testing.expectEqualStrings("-t", normalized[0]);
+    try std.testing.expectEqualStrings("3", normalized[1]);
+}
+
+test "normalizeArgs expands --timeout=value" {
+    const options = [_]zig_cli.Option{
+        zig_cli.Option.init("timeout", "timeout", "", .int).withShort('t'),
+    };
+    const raw = [_][]const u8{ "--timeout=5", "https://example.com/s/x" };
+    const normalized = try normalizeArgs(std.testing.allocator, &options, &raw);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqual(@as(usize, 3), normalized.len);
+    try std.testing.expectEqualStrings("--timeout", normalized[0]);
+    try std.testing.expectEqualStrings("5", normalized[1]);
+}
