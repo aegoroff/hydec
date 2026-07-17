@@ -116,6 +116,28 @@ fn considerBest(shared: *Shared, latency: u64, raw: []const u8, host: []const u8
     }
 }
 
+/// Short hint for verbose FAIL logs (why the probe likely failed).
+fn failHint(err: anyerror) []const u8 {
+    return switch (err) {
+        error.Timeout, error.ConnectionTimedOut => "slow/timeout",
+        error.ConnectionResetByPeer,
+        error.EndOfStream,
+        error.UnexpectedEndOfStream,
+        error.BrokenPipe,
+        error.TlsConnectionTruncated,
+        => "rejected/closed",
+        error.TlsAlert,
+        error.TlsUnexpectedMessage,
+        error.CertificateBundleLoadFailure,
+        => "tls/cert",
+        error.ConnectionRefused,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        => "unreachable",
+        else => "error",
+    };
+}
+
 fn probeGroup(shared: *Shared, items: []WorkItem) void {
     for (items) |*item| {
         const proxy = item.proxy;
@@ -137,9 +159,9 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
         const latency = probeOne(shared.gpa, shared.io, proxy, shared.timeout_secs) catch |err| {
             if (shared.verbose) {
                 if (proxy.name) |n| {
-                    std.log.warn("FAIL: {s} ({s}): {}", .{ n, proxy.host, err });
+                    std.log.warn("FAIL: {s} ({s}): {s} ({})", .{ n, proxy.host, failHint(err), err });
                 } else {
-                    std.log.warn("FAIL: {s}: {}", .{ proxy.host, err });
+                    std.log.warn("FAIL: {s}: {s} ({})", .{ proxy.host, failHint(err), err });
                 }
             }
             continue;
