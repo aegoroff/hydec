@@ -151,15 +151,26 @@ fn sealChunk(ctx: *AeadCtx, out: []u8, plaintext: []const u8) error{BufferTooSma
     return off;
 }
 
+/// Decrypt length header and validate SIP004 payload size against `out_capacity`.
+fn openLength(
+    ctx: *AeadCtx,
+    len_ct: *const [2]u8,
+    len_tag: *const [16]u8,
+    out_capacity: usize,
+) error{ AuthenticationFailed, InvalidSsChunk, BufferTooSmall }!usize {
+    var len_be: [2]u8 = undefined;
+    try ctx.open(&len_be, len_ct, len_tag);
+    const payload_len = std.mem.readInt(u16, &len_be, .big);
+    if (payload_len == 0 or payload_len > max_chunk_payload) return error.InvalidSsChunk;
+    if (payload_len > out_capacity) return error.BufferTooSmall;
+    return payload_len;
+}
+
 /// Decrypt one AEAD chunk from `in` into `out`. Returns plaintext length.
 fn openChunk(ctx: *AeadCtx, in: []const u8, out: []u8) error{ AuthenticationFailed, InvalidSsChunk, BufferTooSmall }!usize {
     if (in.len < 2 + 16) return error.InvalidSsChunk;
 
-    var len_be: [2]u8 = undefined;
-    try ctx.open(&len_be, in[0..2], in[2..18][0..16]);
-    const payload_len = std.mem.readInt(u16, &len_be, .big);
-    if (payload_len == 0 or payload_len > max_chunk_payload) return error.InvalidSsChunk;
-    if (payload_len > out.len) return error.BufferTooSmall;
+    const payload_len = try openLength(ctx, in[0..2][0..2], in[2..18][0..16], out.len);
 
     const need = 2 + 16 + payload_len + 16;
     if (in.len < need) return error.InvalidSsChunk;
@@ -177,11 +188,7 @@ fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8) !usize {
     try reader.readSliceAll(&len_ct);
     try reader.readSliceAll(&len_tag);
 
-    var len_be: [2]u8 = undefined;
-    try ctx.open(&len_be, &len_ct, &len_tag);
-    const payload_len = std.mem.readInt(u16, &len_be, .big);
-    if (payload_len == 0 or payload_len > max_chunk_payload) return error.InvalidSsChunk;
-    if (payload_len > out.len) return error.BufferTooSmall;
+    const payload_len = try openLength(ctx, &len_ct, &len_tag, out.len);
 
     var payload_ct: [max_chunk_payload]u8 = undefined;
     var payload_tag: [16]u8 = undefined;
@@ -189,6 +196,24 @@ fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8) !usize {
     try reader.readSliceAll(&payload_tag);
     try ctx.open(out[0..payload_len], payload_ct[0..payload_len], &payload_tag);
     return payload_len;
+}
+
+/// Map shutdown-induced EOF/reset to Timeout when our DeadlineShutdown fired.
+fn classifyErr(err: anyerror, fired: bool) anyerror {
+    return switch (err) {
+        error.ConnectionTimedOut,
+        error.Timeout,
+        => error.Timeout,
+        error.EndOfStream,
+        error.UnexpectedEndOfStream,
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.SocketNotConnected,
+        error.NotOpenForReading,
+        error.NotOpenForWriting,
+        => if (fired) error.Timeout else err,
+        else => err,
+    };
 }
 
 /// Probe SS AEAD: dial, send encrypted target + HTTP request, wait for first decrypted payload.
@@ -243,9 +268,9 @@ pub fn probe(io: Io, host: []const u8, port: u16, method_name: []const u8, passw
     var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
 
-    try netutil.waitReadableUntil(stream, io, deadline);
+    netutil.waitReadableUntil(stream, io, deadline) catch |err| return classifyErr(err, fired.load(.acquire));
     var server_salt: [32]u8 = undefined;
-    try r.interface.readSliceAll(server_salt[0..method.saltLen()]);
+    r.interface.readSliceAll(server_salt[0..method.saltLen()]) catch |err| return classifyErr(err, fired.load(.acquire));
 
     var server_subkey: [32]u8 = undefined;
     @memset(&server_subkey, 0);
@@ -257,7 +282,7 @@ pub fn probe(io: Io, host: []const u8, port: u16, method_name: []const u8, passw
 
     // First decrypted payload proves the tunnel carries remote data (parity with Trojan/VLESS).
     var discard: [max_chunk_payload]u8 = undefined;
-    _ = try readOpenChunk(&server_ctx, &r.interface, &discard);
+    _ = readOpenChunk(&server_ctx, &r.interface, &discard) catch |err| return classifyErr(err, fired.load(.acquire));
 
     return netutil.elapsedMs(start, io);
 }
@@ -307,4 +332,10 @@ test "aead open rejects bad tag" {
 
 test "method from name" {
     try std.testing.expect(Method.fromName("chacha20-ietf-poly1305") == .chacha20_ietf_poly1305);
+}
+
+test "classifyErr maps shutdown EOF to Timeout only when fired" {
+    try std.testing.expect(classifyErr(error.EndOfStream, true) == error.Timeout);
+    try std.testing.expect(classifyErr(error.EndOfStream, false) == error.EndOfStream);
+    try std.testing.expect(classifyErr(error.AuthenticationFailed, true) == error.AuthenticationFailed);
 }
