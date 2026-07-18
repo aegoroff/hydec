@@ -4,7 +4,7 @@ Instructions for AI coding agents working in the **hydec** repository.
 
 ## Project overview
 
-Non-interactive CLI that downloads a base64-encoded proxy subscription, probes working nodes, and prints the fastest one.
+Non-interactive CLI with subcommands: `best` (subscription → fastest proxy) and `ping` (single proxy probe).
 
 | Item | Value |
 |------|-------|
@@ -22,19 +22,25 @@ Non-interactive CLI that downloads a base64-encoded proxy subscription, probes w
 | VLESS | REALITY only; TCP (`xtls-rprx-vision`) and gRPC gun |
 | VMess | Skipped (counted in stats) |
 
-**Behavior**
+**Behavior (`best`)**
 
 1. Fetch subscription URL (HTTPS).
 2. Base64-decode body; iterate URI lines.
 3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**.
 4. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
 
+**Behavior (`ping`)**
+
+1. Parse one proxy URI from the CLI.
+2. Probe it; log `OK: …` or `FAIL: …` to **stderr**.
+3. Exit `0` on success, `1` on probe failure.
+
 ## Layout
 
 | Path | Role |
 |------|------|
 | `src/main.zig` | Entry, orchestration |
-| `src/cli.zig` | Args: `URI`, `-t/--timeout`, `-v/--verbose`, `-V/--version` |
+| `src/cli.zig` | Commands: `best <URI>`, `ping <PROXY>`; `-t/--timeout`, `-v/--verbose` (`best`), `-V/--version` |
 | `src/fetch.zig` | Download subscription |
 | `src/subscription.zig` | Base64 decode, line iteration |
 | `src/proxy_uri.zig` | URI parse (kind, host/port, query, `#name`) |
@@ -52,8 +58,9 @@ Use **mise** for Zig 0.16.0, or install it manually.
 zig build
 zig build test
 
-# Probe a subscription (URI required)
-zig build run -- "https://example.com/sub"
+# Probe a subscription (best) or a single proxy (ping)
+zig build run -- best "https://example.com/sub"
+zig build run -- ping 'ss://...'
 
 # Cross-compile example
 zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
@@ -142,7 +149,7 @@ build: zig 0.16
 
 - Do **not** commit unless explicitly asked.
 - Do **not** push or force-push without explicit request.
-- Keep PRs focused; verify with `zig build test` and a manual `hydec -v <subscription-url>` smoke run when networking changed.
+- Keep PRs focused; verify with `zig build test` and a manual `hydec best -v <subscription-url>` smoke run when networking changed.
 
 ## Security
 

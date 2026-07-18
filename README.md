@@ -36,29 +36,39 @@ just ver=0.1.0 build-all   # linux / macos / windows targets
 ## Usage
 
 ```bash
-hydec <SUBSCRIPTION_URL>
-hydec -v -t 5 https://example.com/sub
-hydec --timeout=10 --verbose https://example.com/sub
+hydec best <SUBSCRIPTION_URL>
+hydec best -v -t 5 https://example.com/sub
+hydec ping 'ss://...#remark'
+hydec ping -t 10 'vless://...'
 ```
+
+| Command | Description |
+|---------|-------------|
+| `best <URI>` | Download subscription, probe nodes, print fastest URI |
+| `ping <PROXY>` | Probe a single proxy URI; exit `1` on failure |
 
 | Flag | Description |
 |------|-------------|
-| `URI` | Subscription URL (required) |
 | `-t`, `--timeout` | Per-operation timeout in seconds (default: `5`) |
-| `-v`, `--verbose` | Log each probe (Testing / OK / FAIL) |
+| `-v`, `--verbose` | `best` only: log each probe (Testing / OK / FAIL) |
 | `-V`, `--version` | Print version |
 | `-h`, `--help` | Help |
 
-### Output
+### Output (`best`)
 
 - **stderr:** download progress, optional verbose probe lines, summary stats, winner line  
   `Best: 59ms 192.168.11.1 — 🇸🇪 SHADOWSOCKS - Швеция`
 - **stdout:** raw winning proxy URI (one line)
 
+### Output (`ping`)
+
+- **stderr:** `OK: …ms host — name` or `FAIL: name (host): hint (error)`
+- exit `0` on success, `1` on probe failure
+
 Example:
 
 ```bash
-fastest=$(hydec -v "$SUB_URL")
+fastest=$(hydec best -v "$SUB_URL")
 # use $fastest with your proxy client
 ```
 

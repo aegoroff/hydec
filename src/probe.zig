@@ -119,8 +119,8 @@ fn considerBest(shared: *Shared, latency: u64, raw: []const u8, host: []const u8
     }
 }
 
-/// Short hint for verbose FAIL logs (why the probe likely failed).
-fn failHint(err: anyerror) []const u8 {
+/// Short hint for FAIL logs (why the probe likely failed).
+pub fn failHint(err: anyerror) []const u8 {
     return switch (err) {
         error.Timeout, error.ConnectionTimedOut => "slow/timeout",
         error.ConnectionResetByPeer,

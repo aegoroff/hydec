@@ -3,8 +3,12 @@ const zig_cli = @import("zig_cli");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
+pub const Command = enum { best, ping };
+
 pub const Options = struct {
+    command: Command,
     /// Owned by the caller; free with `gpa.free`.
+    /// `best`: subscription URL; `ping`: full proxy URI.
     uri: []u8,
     timeout_secs: u32,
     verbose: bool,
@@ -17,11 +21,7 @@ const Capture = struct {
 
 var capture: Capture = undefined;
 
-fn onParsed(ctx: *zig_cli.BaseCommand.ParseContext) !void {
-    const uri_arg = ctx.getArgument(0) orelse return error.MissingRequiredArgument;
-    const uri = try capture.gpa.dupe(u8, uri_arg);
-    errdefer capture.gpa.free(uri);
-
+fn parseTimeout(ctx: *zig_cli.BaseCommand.ParseContext) !u32 {
     const timeout_secs: u32 = blk: {
         if (ctx.getOption("timeout")) |value| {
             break :blk std.fmt.parseInt(u32, value, 10) catch return error.InvalidTimeout;
@@ -29,11 +29,32 @@ fn onParsed(ctx: *zig_cli.BaseCommand.ParseContext) !void {
         break :blk 5;
     };
     if (timeout_secs == 0) return error.InvalidTimeout;
+    return timeout_secs;
+}
+
+fn onBest(ctx: *zig_cli.BaseCommand.ParseContext) !void {
+    const uri_arg = ctx.getArgument(0) orelse return error.MissingRequiredArgument;
+    const uri = try capture.gpa.dupe(u8, uri_arg);
+    errdefer capture.gpa.free(uri);
 
     capture.options = .{
+        .command = .best,
         .uri = uri,
-        .timeout_secs = timeout_secs,
+        .timeout_secs = try parseTimeout(ctx),
         .verbose = ctx.hasOption("verbose"),
+    };
+}
+
+fn onPing(ctx: *zig_cli.BaseCommand.ParseContext) !void {
+    const uri_arg = ctx.getArgument(0) orelse return error.MissingRequiredArgument;
+    const uri = try capture.gpa.dupe(u8, uri_arg);
+    errdefer capture.gpa.free(uri);
+
+    capture.options = .{
+        .command = .ping,
+        .uri = uri,
+        .timeout_secs = try parseTimeout(ctx),
+        .verbose = false,
     };
 }
 
@@ -111,17 +132,8 @@ fn freeCollectedArgs(gpa: std.mem.Allocator, args: []const []const u8) void {
     gpa.free(args);
 }
 
-fn buildCommand(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseCommand {
-    const cmd = try zig_cli.BaseCommand.init(gpa, "hydec", description);
-    errdefer {
-        cmd.deinit();
-        gpa.destroy(cmd);
-    }
-
-    _ = try cmd.addArgument(
-        zig_cli.Argument.init("URI", "Subscription URL (HTTPS, base64 body)", .string).withRequired(true),
-    );
-    _ = try cmd.addOption(
+fn addTimeoutOption(cmd: *zig_cli.BaseCommand) !*zig_cli.BaseCommand {
+    return cmd.addOption(
         zig_cli.Option.init(
             "timeout",
             "timeout",
@@ -129,15 +141,16 @@ fn buildCommand(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseC
             .int,
         ).withShort('t'),
     );
-    _ = try cmd.addOption(
-        zig_cli.Option.init(
-            "verbose",
-            "verbose",
-            "Log each probe result to stderr",
-            .bool,
-        ).withShort('v'),
-    );
-    _ = try cmd.addOption(
+}
+
+fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseCommand {
+    const root = try zig_cli.BaseCommand.init(gpa, "hydec", description);
+    errdefer {
+        root.deinit();
+        gpa.destroy(root);
+    }
+
+    _ = try root.addOption(
         zig_cli.Option.init(
             "version",
             "version",
@@ -145,8 +158,48 @@ fn buildCommand(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseC
             .bool,
         ).withShort('V'),
     );
-    _ = cmd.setAction(onParsed);
-    return cmd;
+
+    {
+        var owned = true;
+        const best = try zig_cli.BaseCommand.init(gpa, "best", "Find the fastest working proxy from a subscription URL");
+        errdefer if (owned) {
+            best.deinit();
+            gpa.destroy(best);
+        };
+        _ = try best.addArgument(
+            zig_cli.Argument.init("URI", "Subscription URL (HTTPS, base64 body)", .string).withRequired(true),
+        );
+        _ = try addTimeoutOption(best);
+        _ = try best.addOption(
+            zig_cli.Option.init(
+                "verbose",
+                "verbose",
+                "Log each probe result to stderr",
+                .bool,
+            ).withShort('v'),
+        );
+        _ = best.setAction(onBest);
+        _ = try root.addCommand(best);
+        owned = false;
+    }
+
+    {
+        var owned = true;
+        const ping = try zig_cli.BaseCommand.init(gpa, "ping", "Probe a single proxy URI");
+        errdefer if (owned) {
+            ping.deinit();
+            gpa.destroy(ping);
+        };
+        _ = try ping.addArgument(
+            zig_cli.Argument.init("PROXY", "Full proxy URI (ss://, trojan://, vless://)", .string).withRequired(true),
+        );
+        _ = try addTimeoutOption(ping);
+        _ = ping.setAction(onPing);
+        _ = try root.addCommand(ping);
+        owned = false;
+    }
+
+    return root;
 }
 
 fn optionValueLabel(option_type: zig_cli.Option.OptionType) []const u8 {
@@ -175,7 +228,7 @@ fn writePadding(writer: *std.Io.Writer, used: usize, column: usize) !void {
     }
 }
 
-fn printHelp(cmd: *zig_cli.BaseCommand) !void {
+fn printHelp(cmd: *zig_cli.BaseCommand, usage_name: []const u8) !void {
     var buf: [4096]u8 = undefined;
     var file_writer = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
     const out = &file_writer.interface;
@@ -188,11 +241,15 @@ fn printHelp(cmd: *zig_cli.BaseCommand) !void {
     for (cmd.options.items) |opt| {
         left_column = @max(left_column, optionLeftWidth(opt));
     }
+    for (cmd.subcommands.items) |sub| {
+        left_column = @max(left_column, 2 + sub.name.len);
+    }
     const desc_column = left_column + 2;
 
     try out.print("\n{s} v{s}\n{s}\n\n", .{ "hydec", build_options.version, cmd.description });
 
-    try out.print("USAGE:\n  {s}", .{cmd.name});
+    try out.print("USAGE:\n  {s}", .{usage_name});
+    if (cmd.subcommands.items.len > 0) try out.print(" <COMMAND>", .{});
     if (cmd.options.items.len > 0) try out.print(" [OPTIONS]", .{});
     for (cmd.arguments.items) |arg| {
         if (arg.required) {
@@ -228,6 +285,21 @@ fn printHelp(cmd: *zig_cli.BaseCommand) !void {
         try out.print("{s}", .{help_left});
         try writePadding(out, help_left.len, desc_column);
         try out.print("Print help\n\n", .{});
+    } else if (cmd.subcommands.items.len > 0) {
+        try out.print("OPTIONS:\n", .{});
+        try out.print("{s}", .{help_left});
+        try writePadding(out, help_left.len, desc_column);
+        try out.print("Print help\n\n", .{});
+    }
+
+    if (cmd.subcommands.items.len > 0) {
+        try out.print("COMMANDS:\n", .{});
+        for (cmd.subcommands.items) |sub| {
+            try out.print("  {s}", .{sub.name});
+            try writePadding(out, 2 + sub.name.len, desc_column);
+            try out.print("{s}\n", .{sub.description});
+        }
+        try out.print("\nRun 'hydec <COMMAND> --help' for more information on a command.\n\n", .{});
     }
 
     try out.flush();
@@ -246,39 +318,58 @@ pub const ParseResult = union(enum) {
     run: Options,
 };
 
+fn normalizeOptionsFor(root: *zig_cli.BaseCommand, args: []const []const u8) []const zig_cli.Option {
+    if (args.len > 0) {
+        if (root.findSubcommand(args[0])) |sub| return sub.options.items;
+    }
+    return root.options.items;
+}
+
 pub fn parse(gpa: std.mem.Allocator, args: std.process.Args) !ParseResult {
     const query = std.Target.Query.fromTarget(&builtin.target);
     const description = try std.fmt.allocPrint(
         gpa,
-        \\Find the fastest working proxy from a base64 subscription URL ({s})
+        \\Probe proxies from a subscription or a single URI ({s})
         \\Copyright (C) 2026. MIT License.
     ,
         .{@tagName(query.cpu_arch.?)},
     );
     defer gpa.free(description);
 
-    const cmd = try buildCommand(gpa, description);
+    const root = try buildRoot(gpa, description);
     defer {
-        cmd.deinit();
-        gpa.destroy(cmd);
+        root.deinit();
+        gpa.destroy(root);
     }
 
     const raw_args = try collectArgs(gpa, args);
     defer freeCollectedArgs(gpa, raw_args);
-    const arg_slice = try normalizeArgs(gpa, cmd.options.items, raw_args);
+    const arg_slice = try normalizeArgs(gpa, normalizeOptionsFor(root, raw_args), raw_args);
     defer gpa.free(arg_slice);
 
     if (arg_slice.len == 0 or wantsHelp(arg_slice)) {
-        try printHelp(cmd);
+        if (arg_slice.len >= 1) {
+            if (root.findSubcommand(arg_slice[0])) |sub| {
+                const usage = try std.fmt.allocPrint(gpa, "hydec {s}", .{sub.name});
+                defer gpa.free(usage);
+                try printHelp(sub, usage);
+                return .help;
+            }
+        }
+        try printHelp(root, "hydec");
         return .help;
     }
     if (wantsVersion(arg_slice)) {
         return .version;
     }
 
+    if (arg_slice.len == 0 or root.findSubcommand(arg_slice[0]) == null) {
+        return error.UnknownCommand;
+    }
+
     capture = .{ .gpa = gpa };
     var parser = zig_cli.Parser.init(gpa);
-    try parser.parse(cmd, arg_slice);
+    try parser.parse(root, arg_slice);
     const opts = capture.options orelse return error.MissingRequiredArgument;
     return .{ .run = opts };
 }

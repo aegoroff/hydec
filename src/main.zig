@@ -22,11 +22,15 @@ pub fn main(init: std.process.Init) !void {
 
     const parsed = cli.parse(gpa, init.minimal.args) catch |err| switch (err) {
         error.MissingRequiredArgument => {
-            std.log.err("missing subscription URI", .{});
+            std.log.err("missing required argument", .{});
             std.process.exit(2);
         },
         error.InvalidTimeout => {
             std.log.err("invalid --timeout", .{});
+            std.process.exit(2);
+        },
+        error.UnknownCommand => {
+            std.log.err("unknown command (try 'hydec --help')", .{});
             std.process.exit(2);
         },
         else => |e| return e,
@@ -40,12 +44,15 @@ pub fn main(init: std.process.Init) !void {
         },
         .run => |opts| {
             defer gpa.free(opts.uri);
-            try run(gpa, io, opts);
+            switch (opts.command) {
+                .best => try runBest(gpa, io, opts),
+                .ping => try runPing(gpa, io, opts),
+            }
         },
     }
 }
 
-fn run(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
+fn runBest(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     std.log.info("Downloading subscription...", .{});
     const body = fetch.fetchUrl(gpa, io, opts.uri, opts.timeout_secs) catch |err| {
         std.log.err("failed to download subscription: {}", .{err});
@@ -103,6 +110,29 @@ fn run(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     } else {
         std.log.err("No working proxies found", .{});
         std.process.exit(1);
+    }
+}
+
+fn runPing(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
+    var proxy = proxy_uri.parse(gpa, opts.uri) catch |err| {
+        std.log.err("invalid proxy URI: {}", .{err});
+        std.process.exit(2);
+    };
+    defer proxy.deinit(gpa);
+
+    const latency = probe.probeOne(gpa, io, proxy, opts.timeout_secs) catch |err| {
+        if (proxy.name) |n| {
+            std.log.warn("FAIL: {s} ({s}): {s} ({})", .{ n, proxy.host, probe.failHint(err), err });
+        } else {
+            std.log.warn("FAIL: {s}: {s} ({})", .{ proxy.host, probe.failHint(err), err });
+        }
+        std.process.exit(1);
+    };
+
+    if (proxy.name) |n| {
+        std.log.info("OK: {d}ms {s} — {s}", .{ latency, proxy.host, n });
+    } else {
+        std.log.info("OK: {d}ms {s}", .{ latency, proxy.host });
     }
 }
 
