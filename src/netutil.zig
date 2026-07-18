@@ -5,20 +5,80 @@ const posix = std.posix;
 
 pub fn connectHostPort(io: Io, host: []const u8, port: u16, timeout_secs: u32) !Io.net.Stream {
     // Zig's Threaded Io panics on ConnectOptions.timeout ("TODO"), so IP dials
-    // use a non-blocking connect + poll. Hostnames fall back to untimed Io connect.
+    // use a non-blocking connect + poll. Hostnames resolve via DNS then use the
+    // same timed IP dial against a shared absolute deadline.
     if (Io.net.IpAddress.parse(host, port)) |addr| {
         const stream = try connectIpTimed(io, addr, timeout_secs);
         setTcpNoDelay(stream);
         return stream;
     } else |_| {}
 
+    return connectHostnameTimed(io, host, port, timeout_secs);
+}
+
+fn connectHostnameTimed(io: Io, host: []const u8, port: u16, timeout_secs: u32) !Io.net.Stream {
     const hostname = try Io.net.HostName.init(host);
-    const stream = try hostname.connect(io, port, .{ .mode = .stream });
-    setTcpNoDelay(stream);
-    return stream;
+    if (builtin.os.tag == .windows) {
+        // Best-effort: timed IP connect is Linux/posix-only below.
+        const stream = try hostname.connect(io, port, .{ .mode = .stream });
+        setTcpNoDelay(stream);
+        return stream;
+    }
+
+    const deadline = deadlineNs(io, timeout_secs);
+
+    var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
+    var lookup_buffer: [32]Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+
+    var lookup_future = io.async(Io.net.HostName.lookup, .{
+        hostname,
+        io,
+        &lookup_queue,
+        .{
+            .port = port,
+            .canonical_name_buffer = &canonical_name_buffer,
+        },
+    });
+    defer {
+        lookup_future.cancel(io) catch {};
+        while (lookup_queue.getOneUncancelable(io)) |_| {} else |_| {}
+    }
+
+    var last_err: anyerror = error.UnknownHostName;
+    var saw_address = false;
+
+    while (lookup_queue.getOne(io)) |dns_result| {
+        switch (dns_result) {
+            .canonical_name => {},
+            .address => |address| {
+                saw_address = true;
+                if (deadline) |d| {
+                    if (monoNow(io) >= d) return error.Timeout;
+                }
+                if (connectIpUntil(io, address, deadline)) |stream| {
+                    setTcpNoDelay(stream);
+                    return stream;
+                } else |err| {
+                    last_err = err;
+                    if (err == error.Timeout) return error.Timeout;
+                }
+            },
+        }
+    } else |err| switch (err) {
+        error.Canceled => return error.Timeout,
+        error.Closed => {
+            try lookup_future.await(io);
+            return last_err;
+        },
+    }
 }
 
 fn connectIpTimed(io: Io, address: Io.net.IpAddress, timeout_secs: u32) !Io.net.Stream {
+    return connectIpUntil(io, address, deadlineNs(io, timeout_secs));
+}
+
+fn connectIpUntil(io: Io, address: Io.net.IpAddress, deadline: ?i128) !Io.net.Stream {
     if (builtin.os.tag == .windows) {
         // Best-effort: Zig Windows connect timeout is also TODO.
         return address.connect(io, .{ .mode = .stream });
@@ -33,7 +93,7 @@ fn connectIpTimed(io: Io, address: Io.net.IpAddress, timeout_secs: u32) !Io.net.
     errdefer _ = posix.system.close(sock);
 
     try startConnect(sock, address);
-    try waitConnected(io, sock, timeout_secs);
+    try waitConnectedUntil(io, sock, deadline);
     try clearNonblock(sock);
 
     return .{ .socket = .{ .handle = sock, .address = address } };
@@ -87,8 +147,7 @@ fn startConnect(sock: posix.socket_t, address: Io.net.IpAddress) !void {
     }
 }
 
-fn waitConnected(io: Io, sock: posix.socket_t, timeout_secs: u32) !void {
-    const deadline = deadlineNs(io, timeout_secs);
+fn waitConnectedUntil(io: Io, sock: posix.socket_t, deadline: ?i128) !void {
     while (true) {
         const now = monoNow(io);
         if (deadline) |d| {

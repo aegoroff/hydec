@@ -415,6 +415,10 @@ fn buildClientHello(
     }
 
     if (sni.len > 0) {
+        // RFC 6066 host_name is length-prefixed with a u8 / u16; keep within DNS max and body.
+        if (sni.len > 255) return error.SniTooLong;
+        const sni_need = 2 + 2 + 2 + 1 + 2 + sni.len;
+        if (i + sni_need > body.len) return error.BufferTooSmall;
         putU16(body[i..][0..2], 0);
         i += 2;
         putU16(body[i..][0..2], @intCast(2 + 1 + 2 + sni.len));
@@ -476,6 +480,27 @@ pub const RealityConn = struct {
     deadline_fired: std.atomic.Value(bool) = .init(false),
     deadline_guard: ?netutil.DeadlineShutdown = null,
 
+    fn classifyErr(err: anyerror, watchdog_fired: bool) anyerror {
+        return switch (err) {
+            error.ConnectionTimedOut,
+            error.Timeout,
+            => error.Timeout,
+            error.EndOfStream,
+            error.UnexpectedEndOfStream,
+            error.BrokenPipe,
+            error.ConnectionResetByPeer,
+            error.SocketNotConnected,
+            error.NotOpenForReading,
+            error.NotOpenForWriting,
+            => if (watchdog_fired) error.Timeout else err,
+            else => err,
+        };
+    }
+
+    fn deadlineFired(self: *const RealityConn) bool {
+        return self.deadline_fired.load(.acquire);
+    }
+
     pub fn deinit(self: *RealityConn) void {
         if (self.deadline_guard) |*g| {
             g.disarm();
@@ -488,7 +513,15 @@ pub const RealityConn = struct {
     }
 
     pub fn writeApp(self: *RealityConn, data: []const u8) !void {
-        try self.conn.writeRecord(23, data, false);
+        self.conn.writeRecord(23, data, false) catch |err| return classifyErr(err, self.deadlineFired());
+    }
+
+    fn writeClear(self: *RealityConn, content_type: u8, data: []const u8) !void {
+        self.conn.writeClear(content_type, data) catch |err| return classifyErr(err, self.deadlineFired());
+    }
+
+    fn writeHandshake(self: *RealityConn, data: []const u8) !void {
+        self.conn.writeRecord(22, data, true) catch |err| return classifyErr(err, self.deadlineFired());
     }
 
     fn waitForReadable(self: *RealityConn) !void {
@@ -496,13 +529,14 @@ pub const RealityConn = struct {
         // falsely times out while TLS records sit in sock_rbuf.
         const r = self.conn.reader;
         if (r.seek >= r.end) {
-            try netutil.waitReadableUntil(self.stream, self.io, self.read_deadline_ns);
+            netutil.waitReadableUntil(self.stream, self.io, self.read_deadline_ns) catch |err|
+                return classifyErr(err, self.deadlineFired());
         }
     }
 
     fn readRecordDeadline(self: *RealityConn, out: []u8, handshake_keys: bool) !TlsRecord {
         try self.waitForReadable();
-        return self.conn.readRecord(out, handshake_keys);
+        return self.conn.readRecord(out, handshake_keys) catch |err| return classifyErr(err, self.deadlineFired());
     }
 
     pub fn readApp(self: *RealityConn, out: []u8) !usize {
@@ -587,7 +621,7 @@ pub fn connect(
     rc.transcript.update(hello_raw[0..hello_len]);
 
     // Send ClientHello record
-    try rc.conn.writeClear(22, hello_raw[0..hello_len]);
+    try rc.writeClear(22, hello_raw[0..hello_len]);
 
     // Read ServerHello (cleartext); buffer sized for max TLS record
     var sh_buf: [16640]u8 = undefined;
@@ -668,7 +702,7 @@ pub fn connect(
     fin_msg[0] = 20;
     putU24(fin_msg[1..4], 32);
     @memcpy(fin_msg[4..], &finished_verify);
-    try rc.conn.writeRecord(22, &fin_msg, true);
+    try rc.writeHandshake(&fin_msg);
 
     deriveAppKeys(&rc.conn, &master, &hs_hash);
 
@@ -865,6 +899,24 @@ test "clientHello session id at offset 39" {
     try std.testing.expectEqual(@as(u8, 1), out[0]); // client_hello
     try std.testing.expectEqual(@as(u8, 32), out[38]); // session id length
     try std.testing.expectEqualSlices(u8, &sid, out[39..][0..32]);
+}
+
+test "buildClientHello rejects oversized SNI" {
+    var out: [2048]u8 = undefined;
+    const random = [_]u8{0x11} ** 32;
+    const sid = [_]u8{0x22} ** 32;
+    const pubk = [_]u8{0x33} ** 32;
+    const long_sni = "a" ** 256;
+    try std.testing.expectError(
+        error.SniTooLong,
+        buildClientHello(&out, long_sni, &random, &sid, &pubk, false),
+    );
+}
+
+test "RealityConn.classifyErr maps watchdog EOF to Timeout" {
+    try std.testing.expectEqual(error.Timeout, RealityConn.classifyErr(error.EndOfStream, true));
+    try std.testing.expectEqual(error.EndOfStream, RealityConn.classifyErr(error.EndOfStream, false));
+    try std.testing.expectEqual(error.Timeout, RealityConn.classifyErr(error.Timeout, false));
 }
 
 test "decodePublicKey length" {

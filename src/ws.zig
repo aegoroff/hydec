@@ -2,6 +2,64 @@ const std = @import("std");
 const util = @import("util.zig");
 const Io = std.Io;
 
+const ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+fn expectAccept(key_b64: []const u8, out: *[28]u8) []const u8 {
+    var digest: [20]u8 = undefined;
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    hasher.update(key_b64);
+    hasher.update(ws_guid);
+    hasher.final(&digest);
+    return std.base64.standard.Encoder.encode(out, &digest);
+}
+
+fn headerValue(response: []const u8, name: []const u8) ?[]const u8 {
+    var rest = response;
+    // Skip status line
+    if (std.mem.indexOf(u8, rest, "\r\n")) |nl| {
+        rest = rest[nl + 2 ..];
+    } else return null;
+
+    while (std.mem.indexOf(u8, rest, "\r\n")) |nl| {
+        const line = rest[0..nl];
+        rest = rest[nl + 2 ..];
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon], " \t");
+        if (std.ascii.eqlIgnoreCase(key, name)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
+fn headerContainsToken(value: []const u8, token: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, value, ", \t");
+    while (it.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(part, token)) return true;
+    }
+    return false;
+}
+
+fn validateUpgradeResponse(hdr: []const u8, key_b64: []const u8) !void {
+    if (!std.mem.startsWith(u8, hdr, "HTTP/1.1 101") and
+        !std.mem.startsWith(u8, hdr, "HTTP/1.0 101"))
+    {
+        return error.WebSocketUpgradeFailed;
+    }
+
+    const upgrade = headerValue(hdr, "Upgrade") orelse return error.WebSocketUpgradeFailed;
+    if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return error.WebSocketUpgradeFailed;
+
+    const connection = headerValue(hdr, "Connection") orelse return error.WebSocketUpgradeFailed;
+    if (!headerContainsToken(connection, "Upgrade")) return error.WebSocketUpgradeFailed;
+
+    const accept = headerValue(hdr, "Sec-WebSocket-Accept") orelse return error.WebSocketUpgradeFailed;
+    var expect_buf: [28]u8 = undefined;
+    const expected = expectAccept(key_b64, &expect_buf);
+    if (!std.mem.eql(u8, accept, expected)) return error.WebSocketAcceptMismatch;
+}
+
 pub fn performUpgrade(
     reader: *Io.Reader,
     writer: *Io.Writer,
@@ -9,6 +67,9 @@ pub fn performUpgrade(
     path: []const u8,
     host_header: []const u8,
 ) !void {
+    if (std.mem.indexOfAny(u8, path, "\r\n") != null) return error.InvalidWsPath;
+    if (std.mem.indexOfAny(u8, host_header, "\r\n") != null) return error.InvalidWsHost;
+
     var key_raw: [16]u8 = undefined;
     io.random(&key_raw);
 
@@ -32,11 +93,7 @@ pub fn performUpgrade(
         hdr_len += n;
         if (std.mem.indexOf(u8, hdr[0..hdr_len], "\r\n\r\n")) |_| break;
     }
-    if (!std.mem.startsWith(u8, hdr[0..hdr_len], "HTTP/1.1 101") and
-        !std.mem.startsWith(u8, hdr[0..hdr_len], "HTTP/1.0 101"))
-    {
-        return error.WebSocketUpgradeFailed;
-    }
+    try validateUpgradeResponse(hdr[0..hdr_len], key_b64);
 }
 
 fn writeControlFrame(writer: *Io.Writer, io: Io, opcode: u8, payload: []const u8) !void {
@@ -83,11 +140,13 @@ pub fn writeBinaryFrame(writer: *Io.Writer, io: Io, payload: []const u8) !void {
     try writer.flush();
 }
 
-/// Read the next data frame, answering ping and ignoring pong.
+/// Read the next complete binary data frame (FIN), answering ping and ignoring pong.
+/// Empty or text frames are rejected so Trojan-over-WS matches TCP's ≥1-byte bar.
 pub fn readBinaryFrame(reader: *Io.Reader, writer: *Io.Writer, io: Io, out: []u8) !usize {
     while (true) {
         var hdr: [2]u8 = undefined;
         try reader.readSliceAll(&hdr);
+        const fin = (hdr[0] & 0x80) != 0;
         const opcode = hdr[0] & 0x0f;
         const masked = (hdr[1] & 0x80) != 0;
         var len: usize = hdr[1] & 0x7f;
@@ -112,10 +171,41 @@ pub fn readBinaryFrame(reader: *Io.Reader, writer: *Io.Writer, io: Io, out: []u8
                 continue;
             },
             0xA => continue,
-            0x1, 0x2 => return len,
+            0x2 => {
+                if (!fin) return error.WsFragmentUnsupported;
+                if (len == 0) return error.EmptyWsFrame;
+                return len;
+            },
+            0x1 => return error.UnexpectedWsOpcode,
             else => return error.UnexpectedWsOpcode,
         }
     }
+}
+
+test "expectAccept matches RFC 6455 example" {
+    // RFC 6455 §1.3 example key → accept
+    var out: [28]u8 = undefined;
+    const accept = expectAccept("dGhlIHNhbXBsZSBub25jZQ==", &out);
+    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept);
+}
+
+test "validateUpgradeResponse requires accept" {
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const hdr =
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "\r\n";
+    try validateUpgradeResponse(hdr, key);
+
+    const bad =
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: wrong\r\n" ++
+        "\r\n";
+    try std.testing.expectError(error.WebSocketAcceptMismatch, validateUpgradeResponse(bad, key));
 }
 
 test "ws module loads" {

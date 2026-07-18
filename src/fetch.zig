@@ -88,11 +88,18 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
     while (!ctx.done.load(.acquire)) {
         if (netutil.monoNow(io) - start >= budget) {
             ctx.abandoned.store(true, .release);
+            // Brief grace so a nearly-finished worker can free resources before detach.
+            const grace_deadline = netutil.monoNow(io) + 250 * std.time.ns_per_ms;
+            while (!ctx.done.load(.acquire) and netutil.monoNow(io) < grace_deadline) {
+                const pause: Io.Duration = .fromMilliseconds(20);
+                io.sleep(pause, .awake) catch {};
+            }
             if (ctx.done.load(.acquire)) {
                 thread.join();
                 if (tryTakeCleanup(ctx)) destroyCtx(ctx);
                 return error.Timeout;
             }
+            // Detach as last resort: std.http has no cancel; process exit reclaims the rest.
             thread.detach();
             return error.Timeout;
         }
