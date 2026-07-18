@@ -14,9 +14,10 @@ const FetchCtx = struct {
     body: ?[]u8 = null,
     err: ?anyerror = null,
     done: std.atomic.Value(bool) = .init(false),
-    /// Set by fetchUrl on timeout; worker then may take cleanup ownership.
+    /// Set by fetchUrl on timeout; worker must not destroy ctx after this —
+    /// only publish done (and free an orphan body) so the joiner can clean up.
     abandoned: std.atomic.Value(bool) = .init(false),
-    /// Only one of {caller, worker} destroys the context.
+    /// Only the joining caller destroys the context (worker never takes cleanup).
     cleanup_taken: std.atomic.Value(bool) = .init(false),
 };
 
@@ -31,18 +32,13 @@ fn destroyCtx(ctx: *FetchCtx) void {
     gpa.destroy(ctx);
 }
 
-fn workerFinishAbandoned(ctx: *FetchCtx, orphan_body: ?[]u8) void {
-    if (orphan_body) |b| ctx.gpa.free(b);
-    if (tryTakeCleanup(ctx)) destroyCtx(ctx);
-}
-
 fn fetchWorker(ctx: *FetchCtx) void {
     const gpa = ctx.gpa;
     const body = fetchUrlInner(gpa, ctx.io, ctx.url) catch |e| {
-        // If abandoned before publishing done, worker owns cleanup (caller will detach).
-        // After done=true, only the joining caller may destroy — never both.
+        // Abandoned: publish done so the grace poller never touches freed memory.
+        // Caller joins and destroys; do not free ctx here.
         if (ctx.abandoned.load(.acquire)) {
-            workerFinishAbandoned(ctx, null);
+            ctx.done.store(true, .release);
             return;
         }
         ctx.err = e;
@@ -51,7 +47,9 @@ fn fetchWorker(ctx: *FetchCtx) void {
     };
 
     if (ctx.abandoned.load(.acquire)) {
-        workerFinishAbandoned(ctx, body);
+        // Body not needed on timeout; free before signaling done.
+        gpa.free(body);
+        ctx.done.store(true, .release);
         return;
     }
 
@@ -88,20 +86,20 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
     while (!ctx.done.load(.acquire)) {
         if (netutil.monoNow(io) - start >= budget) {
             ctx.abandoned.store(true, .release);
-            // Brief grace so a nearly-finished worker can free resources before detach.
+            // Brief grace so a nearly-finished worker can publish done before detach.
             const grace_deadline = netutil.monoNow(io) + 250 * std.time.ns_per_ms;
             while (!ctx.done.load(.acquire) and netutil.monoNow(io) < grace_deadline) {
                 const pause: Io.Duration = .fromMilliseconds(20);
                 io.sleep(pause, .awake) catch {};
             }
             if (ctx.done.load(.acquire)) {
-                // Worker published done without taking cleanup (see fetchWorker).
-                // Safe to join and destroy: worker never frees after done=true.
+                // Worker finished (possibly abandoned); always join + destroy here.
                 thread.join();
                 if (tryTakeCleanup(ctx)) destroyCtx(ctx);
                 return error.Timeout;
             }
-            // Detach as last resort: std.http has no cancel; process exit reclaims the rest.
+            // Detach as last resort: std.http has no cancel; process exit reclaims
+            // the thread and the still-live FetchCtx once the worker eventually exits.
             thread.detach();
             return error.Timeout;
         }
