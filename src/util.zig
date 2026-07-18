@@ -108,6 +108,78 @@ pub const probe_port: u16 = 443;
 
 /// SOCKS5 ATYP domain for a fixed well-known host (reachable from most VPS).
 pub const probe_domain = "cp.cloudflare.com";
+pub const probe_http_port: u16 = 80;
+
+/// Keep-alive so the tunnel stays open for a second (steady-state) request.
+pub const probe_http =
+    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nConnection: keep-alive\r\n\r\n";
+
+/// If `buf` holds a complete HTTP/1.x response, return its total size; otherwise `null`.
+/// Supports `Content-Length` and `Transfer-Encoding: chunked` (cdn-cgi/trace uses chunked).
+pub fn httpResponseTotalLen(buf: []const u8) ?usize {
+    const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
+    const headers = buf[0..sep];
+    const body_start = sep + 4;
+
+    var chunked = false;
+    var content_len: ?usize = null;
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next(); // status line
+    while (lines.next()) |line| {
+        if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
+            const v = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
+            if (std.ascii.indexOfIgnoreCase(v, "chunked") != null) chunked = true;
+        } else if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            const v = std.mem.trim(u8, line["content-length:".len..], " \t");
+            content_len = std.fmt.parseInt(usize, v, 10) catch return null;
+        }
+    }
+
+    if (chunked) return httpChunkedBodyEnd(buf, body_start);
+
+    const cl = content_len orelse return null;
+    if (buf.len < body_start + cl) return null;
+    return body_start + cl;
+}
+
+/// Parse chunked body starting at `body_start`; return end offset past the final chunk, or null.
+fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?usize {
+    var pos = body_start;
+    while (true) {
+        const line_end = std.mem.indexOfPos(u8, buf, pos, "\r\n") orelse return null;
+        const size_line = buf[pos..line_end];
+        const size_tok = if (std.mem.indexOfScalar(u8, size_line, ';')) |sc|
+            size_line[0..sc]
+        else
+            size_line;
+        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_tok, " \t"), 16) catch return null;
+        pos = line_end + 2;
+        if (size == 0) {
+            // Optional trailers, then terminating CRLF.
+            if (std.mem.indexOfPos(u8, buf, pos, "\r\n\r\n")) |end| return end + 4;
+            if (pos + 2 <= buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') return pos + 2;
+            return null;
+        }
+        if (pos + size + 2 > buf.len) return null;
+        pos += size + 2; // chunk data + CRLF
+    }
+}
+
+/// True when the peer closed the tunnel (keep-alive second request often hits this).
+pub fn isPeerClosed(err: anyerror) bool {
+    return switch (err) {
+        error.EndOfStream,
+        error.UnexpectedEndOfStream,
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.TlsConnectionTruncated,
+        error.SocketNotConnected,
+        error.NotOpenForReading,
+        error.NotOpenForWriting,
+        => true,
+        else => false,
+    };
+}
 
 pub fn writeSocksAddrIp4(buf: []u8, ip: *const [4]u8, port: u16) usize {
     buf[0] = 0x01; // ATYP IPv4
@@ -164,4 +236,19 @@ test "splitHostPortOrDefault" {
     const hp = try splitHostPortOrDefault("example.com", 443);
     try std.testing.expectEqualStrings("example.com", hp.host);
     try std.testing.expectEqual(@as(u16, 443), hp.port);
+}
+
+test "httpResponseTotalLen needs Content-Length body" {
+    const partial = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab";
+    try std.testing.expect(httpResponseTotalLen(partial) == null);
+    const full = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(@as(usize, full.len), httpResponseTotalLen(full).?);
+    try std.testing.expect(httpResponseTotalLen("HTTP/1.1 200 OK\r\n\r\n") == null);
+}
+
+test "httpResponseTotalLen chunked body" {
+    const partial = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+    try std.testing.expect(httpResponseTotalLen(partial) == null);
+    const full = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    try std.testing.expectEqual(@as(usize, full.len), httpResponseTotalLen(full).?);
 }

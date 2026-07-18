@@ -75,15 +75,14 @@ pub fn requireTunneledByte(buf: []const u8) error{ NeedMore, InvalidVlessRespons
     if (buf.len <= hdr) return error.EmptyTunnelResponse;
 }
 
-const probe_http =
-    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ util.probe_domain ++ "\r\nConnection: close\r\n\r\n";
+const probe_http = util.probe_http;
 
 /// Encode a VLESS probe: TCP CONNECT to probe host:80 + HTTP GET (matches ss probe).
 pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8, flow: []const u8) !usize {
     var uuid: [16]u8 = undefined;
     try parseUuid(uuid_text, &uuid);
     // Port 80 + HTTP GET so the remote answers without a TLS handshake hang.
-    var n = try encodeRequestDomain(out, &uuid, util.probe_domain, 80, flow);
+    var n = try encodeRequestDomain(out, &uuid, util.probe_domain, util.probe_http_port, flow);
     if (std.mem.indexOf(u8, flow, "vision") != null) {
         n += try appendVisionPaddingEnd(out[n..], &uuid, probe_http);
     } else {

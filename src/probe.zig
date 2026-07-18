@@ -129,10 +129,9 @@ fn failHint(err: anyerror) []const u8 {
         error.BrokenPipe,
         error.TlsConnectionTruncated,
         => "rejected/closed",
-        error.TlsAlert,
-        error.TlsUnexpectedMessage,
-        error.CertificateBundleLoadFailure,
-        => "tls/cert",
+        // REALITY/TLS alert record — peer rejected ClientHello (wrong pbk/sid/sni), not CA verify.
+        error.TlsAlert, error.TlsUnexpectedMessage => "handshake/alert",
+        error.CertificateBundleLoadFailure => "tls/cert",
         error.ConnectionRefused,
         error.NetworkUnreachable,
         error.HostUnreachable,

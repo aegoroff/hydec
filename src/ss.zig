@@ -117,11 +117,6 @@ const AeadCtx = struct {
 /// Shadowsocks AEAD max payload length (SIP004).
 const max_chunk_payload: u16 = 0x3FFF;
 
-/// HTTP/1.1 on port 80 — remote replies immediately so the SS server emits its salt.
-const probe_http_port: u16 = 80;
-const probe_http =
-    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ util.probe_domain ++ "\r\nConnection: close\r\n\r\n";
-
 fn sealChunk(ctx: *AeadCtx, out: []u8, plaintext: []const u8) error{BufferTooSmall}!usize {
     // [len_ct(2)][len_tag(16)][payload_ct][payload_tag(16)]
     const need = 2 + 16 + plaintext.len + 16;
@@ -217,7 +212,7 @@ fn classifyErr(err: anyerror, fired: bool) anyerror {
     };
 }
 
-/// Probe SS AEAD: dial, send encrypted target + HTTP request, wait for first decrypted payload.
+/// Probe SS AEAD: dial, warmup HTTP, then time a second request (steady-state).
 pub fn probe(
     gpa: std.mem.Allocator,
     io: Io,
@@ -257,7 +252,7 @@ pub fn probe(
     };
 
     var addr_buf: [64]u8 = undefined;
-    const addr_len = try util.writeSocksAddrDomain(&addr_buf, util.probe_domain, probe_http_port);
+    const addr_len = try util.writeSocksAddrDomain(&addr_buf, util.probe_domain, util.probe_http_port);
 
     var packet: [1024]u8 = undefined;
     var off: usize = 0;
@@ -265,8 +260,9 @@ pub fn probe(
     off += method.saltLen();
     off += try sealChunk(&ctx, packet[off..], addr_buf[0..addr_len]);
     // Server only emits its salt once it has remote payload; push an HTTP request.
-    off += try sealChunk(&ctx, packet[off..], probe_http);
+    off += try sealChunk(&ctx, packet[off..], util.probe_http);
 
+    const first_start = netutil.monoNow(io);
     try w.interface.writeAll(packet[0..off]);
     try w.interface.flush();
 
@@ -289,12 +285,37 @@ pub fn probe(
         .key = server_subkey,
     };
 
-    // First decrypted payload proves the tunnel carries remote data (parity with Trojan/VLESS).
-    const discard = try gpa.alloc(u8, max_chunk_payload);
-    defer gpa.free(discard);
-    _ = readOpenChunk(gpa, &server_ctx, &r.interface, discard) catch |err| return classifyErr(err, fired.load(.acquire));
+    const chunk_buf = try gpa.alloc(u8, max_chunk_payload);
+    defer gpa.free(chunk_buf);
+    var http_buf: [4096]u8 = undefined;
+    var http_len: usize = 0;
 
-    return netutil.elapsedMs(start, io);
+    // Warmup: drain first HTTP response so the second request is clean.
+    while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
+        const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| return classifyErr(err, fired.load(.acquire));
+        if (http_len + n > http_buf.len) return error.BufferTooSmall;
+        @memcpy(http_buf[http_len..][0..n], chunk_buf[0..n]);
+        http_len += n;
+    }
+    const first_ms = netutil.elapsedMs(first_start, io);
+
+    const steady_start = netutil.monoNow(io);
+    var second: [512]u8 = undefined;
+    const second_len = try sealChunk(&ctx, &second, util.probe_http);
+    w.interface.writeAll(second[0..second_len]) catch |err| {
+        const e = classifyErr(err, fired.load(.acquire));
+        return if (util.isPeerClosed(e)) first_ms else e;
+    };
+    w.interface.flush() catch |err| {
+        const e = classifyErr(err, fired.load(.acquire));
+        return if (util.isPeerClosed(e)) first_ms else e;
+    };
+    _ = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
+        const e = classifyErr(err, fired.load(.acquire));
+        return if (util.isPeerClosed(e)) first_ms else e;
+    };
+
+    return netutil.elapsedMs(steady_start, io);
 }
 
 test "evpBytesToKey chacha length" {

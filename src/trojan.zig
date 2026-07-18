@@ -14,10 +14,6 @@ fn trojanHash(password: []const u8, out: *[56]u8) void {
 
 /// HTTP/1.1 on port 80 — remote replies immediately so the probe read unblocks.
 /// Targeting :443 without payload would hang (TLS server waits for ClientHello).
-const probe_http_port: u16 = 80;
-const probe_http =
-    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ util.probe_domain ++ "\r\nConnection: close\r\n\r\n";
-
 fn buildRequest(password: []const u8, out: []u8) !usize {
     var hex: [56]u8 = undefined;
     trojanHash(password, &hex);
@@ -31,15 +27,15 @@ fn buildRequest(password: []const u8, out: []u8) !usize {
     i += 1;
     out[i] = 0x01; // CONNECT
     i += 1;
-    const n = try util.writeSocksAddrDomain(out[i..], util.probe_domain, probe_http_port);
+    const n = try util.writeSocksAddrDomain(out[i..], util.probe_domain, util.probe_http_port);
     i += n;
     out[i] = '\r';
     i += 1;
     out[i] = '\n';
     i += 1;
-    if (out.len < i + probe_http.len) return error.BufferTooSmall;
-    @memcpy(out[i..][0..probe_http.len], probe_http);
-    i += probe_http.len;
+    if (out.len < i + util.probe_http.len) return error.BufferTooSmall;
+    @memcpy(out[i..][0..util.probe_http.len], util.probe_http);
+    i += util.probe_http.len;
     return i;
 }
 
@@ -173,6 +169,7 @@ pub fn probe(
     var req_buf: [256]u8 = undefined;
     const req_len = try buildRequest(password, &req_buf);
 
+    const first_start = netutil.monoNow(io);
     if (transport_ws) {
         ws.writeBinaryFrame(tls_writer, io, req_buf[0..req_len]) catch |err| return classifyErr(err, fired.load(.acquire));
     } else {
@@ -180,15 +177,55 @@ pub fn probe(
         tls_writer.flush() catch |err| return classifyErr(err, fired.load(.acquire));
     }
 
-    var one: [1]u8 = undefined;
+    // Warmup: drain first HTTP response so the second request is clean.
+    var http_buf: [4096]u8 = undefined;
+    var http_len: usize = 0;
+    while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
+        if (transport_ws) {
+            var frame_buf: [2048]u8 = undefined;
+            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, &frame_buf) catch |err| return classifyErr(err, fired.load(.acquire));
+            if (http_len + n > http_buf.len) return error.BufferTooSmall;
+            @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
+            http_len += n;
+        } else {
+            var chunk: [512]u8 = undefined;
+            const n = tls_reader.readSliceShort(&chunk) catch |err| return classifyErr(err, fired.load(.acquire));
+            if (n == 0) return classifyErr(error.EndOfStream, fired.load(.acquire));
+            if (http_len + n > http_buf.len) return error.BufferTooSmall;
+            @memcpy(http_buf[http_len..][0..n], chunk[0..n]);
+            http_len += n;
+        }
+    }
+    const first_ms = netutil.elapsedMs(first_start, io);
+
+    const steady_start = netutil.monoNow(io);
     if (transport_ws) {
+        ws.writeBinaryFrame(tls_writer, io, util.probe_http) catch |err| {
+            const e = classifyErr(err, fired.load(.acquire));
+            return if (util.isPeerClosed(e)) first_ms else e;
+        };
         var frame_buf: [2048]u8 = undefined;
-        _ = ws.readBinaryFrame(tls_reader, tls_writer, io, &frame_buf) catch |err| return classifyErr(err, fired.load(.acquire));
+        _ = ws.readBinaryFrame(tls_reader, tls_writer, io, &frame_buf) catch |err| {
+            const e = classifyErr(err, fired.load(.acquire));
+            return if (util.isPeerClosed(e)) first_ms else e;
+        };
     } else {
-        tls_reader.readSliceAll(&one) catch |err| return classifyErr(err, fired.load(.acquire));
+        tls_writer.writeAll(util.probe_http) catch |err| {
+            const e = classifyErr(err, fired.load(.acquire));
+            return if (util.isPeerClosed(e)) first_ms else e;
+        };
+        tls_writer.flush() catch |err| {
+            const e = classifyErr(err, fired.load(.acquire));
+            return if (util.isPeerClosed(e)) first_ms else e;
+        };
+        var one: [1]u8 = undefined;
+        tls_reader.readSliceAll(&one) catch |err| {
+            const e = classifyErr(err, fired.load(.acquire));
+            return if (util.isPeerClosed(e)) first_ms else e;
+        };
     }
 
-    return netutil.elapsedMs(start, io);
+    return netutil.elapsedMs(steady_start, io);
 }
 
 test "trojanHash matches SHA-224 hex (lowercase)" {
@@ -213,7 +250,7 @@ test "trojanHash empty password" {
 test "buildRequest wire layout" {
     var buf: [256]u8 = undefined;
     const n = try buildRequest("password", &buf);
-    try std.testing.expectEqual(@as(usize, 82 + probe_http.len), n);
+    try std.testing.expectEqual(@as(usize, 82 + util.probe_http.len), n);
 
     var want_hex: [56]u8 = undefined;
     trojanHash("password", &want_hex);
@@ -229,7 +266,7 @@ test "buildRequest wire layout" {
     try std.testing.expectEqual(@as(u8, 0x50), buf[79]); // port 80 low
     try std.testing.expectEqual(@as(u8, '\r'), buf[80]);
     try std.testing.expectEqual(@as(u8, '\n'), buf[81]);
-    try std.testing.expectEqualStrings(probe_http, buf[82..n]);
+    try std.testing.expectEqualStrings(util.probe_http, buf[82..n]);
 }
 
 test "classifyErr: genuine timeouts always map to Timeout" {

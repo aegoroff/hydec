@@ -710,6 +710,7 @@ pub fn connect(
 }
 
 /// Probe VLESS over REALITY (TCP or gRPC gun).
+/// Warmup HTTP proves the tunnel; returned latency is the second (steady-state) request.
 pub fn probeVless(
     io: Io,
     host: []const u8,
@@ -724,7 +725,6 @@ pub fn probeVless(
     authority_param: []const u8,
     timeout_secs: u32,
 ) !u64 {
-    const start = netutil.monoNow(io);
     const sni_use = if (sni.len > 0) sni else host;
 
     var rc = try connect(io, host, port, sni_use, pbk, sid, grpc, timeout_secs);
@@ -748,9 +748,19 @@ pub fn probeVless(
         var settings_seen = false;
         var request_sent = false;
         var saw_headers_ok = false;
+        var stripped_vless = false;
+        var warmup_done = false;
+        var steady_start: ?i128 = null;
+        var first_start: ?i128 = null;
+        var first_ms: ?u64 = null;
+        var http_buf: [4096]u8 = undefined;
+        var http_len: usize = 0;
         var attempts: usize = 0;
-        while (attempts < 32) : (attempts += 1) {
-            const n = try rc.readApp(app_buf[0..]);
+        while (attempts < 48) : (attempts += 1) {
+            const n = rc.readApp(app_buf[0..]) catch |err| {
+                if (warmup_done and first_ms != null and util.isPeerClosed(err)) return first_ms.?;
+                return err;
+            };
             if (gather_len + n > gather.len) return error.BufferTooSmall;
             @memcpy(gather[gather_len..][0..n], app_buf[0..n]);
             gather_len += n;
@@ -779,6 +789,7 @@ pub fn probeVless(
                     const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
                     // Keep the stream open — gun-lite is bidirectional; END_STREAM yields empty 200s.
                     fl += try grpc_gun.buildDataFrame(flight[fl..], 1, grpc_msg[0..glen], false);
+                    first_start = netutil.monoNow(io);
                     try rc.writeApp(flight[0..fl]);
                     request_sent = true;
                 } else if (ftyp == 0x06 and (fflags & 0x01) == 0 and frame_len == 8) {
@@ -795,15 +806,46 @@ pub fn probeVless(
                     if ((fflags & 0x01) != 0 and saw_headers_ok) return error.GrpcEmptyResponse;
                 } else if (ftyp == 0x00 and frame_len >= 5 and request_sent) {
                     const msg = try grpc_gun.vlessFromGrpcData(payload);
-                    try vless.requireTunneledByte(msg);
-                    return netutil.elapsedMs(start, io);
+                    var piece = msg;
+                    if (!stripped_vless) {
+                        try vless.requireTunneledByte(msg);
+                        const hdr = try vless.responseHeaderLen(msg);
+                        piece = msg[hdr..];
+                        stripped_vless = true;
+                    }
+                    if (!warmup_done) {
+                        if (piece.len > 0) {
+                            if (http_len + piece.len > http_buf.len) return error.BufferTooSmall;
+                            @memcpy(http_buf[http_len..][0..piece.len], piece);
+                            http_len += piece.len;
+                        }
+                        if (util.httpResponseTotalLen(http_buf[0..http_len]) != null) {
+                            warmup_done = true;
+                            first_ms = netutil.elapsedMs(first_start.?, io);
+                            var hunk: [256]u8 = undefined;
+                            const hunk_len = try grpc_gun.wrapHunk(&hunk, util.probe_http);
+                            var grpc_msg: [320]u8 = undefined;
+                            const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
+                            var data_frame: [384]u8 = undefined;
+                            const dlen = try grpc_gun.buildDataFrame(&data_frame, 1, grpc_msg[0..glen], false);
+                            rc.writeApp(data_frame[0..dlen]) catch |err| {
+                                if (util.isPeerClosed(err)) return first_ms.?;
+                                return err;
+                            };
+                            steady_start = netutil.monoNow(io);
+                        }
+                    } else if (piece.len > 0) {
+                        return netutil.elapsedMs(steady_start.?, io);
+                    }
                 } else if (ftyp == 0x03) {
                     if (frame_len >= 4) {
                         const code = std.mem.readInt(u32, payload[0..4], .big);
                         std.log.warn("gRPC RST_STREAM error_code={d}", .{code});
                     }
+                    if (first_ms) |ms| return ms;
                     return error.GrpcRstStream;
                 } else if (ftyp == 0x07) {
+                    if (first_ms) |ms| return ms;
                     return error.GrpcGoAway;
                 }
 
@@ -815,16 +857,44 @@ pub fn probeVless(
                 gather_len = remain;
             }
         }
+        if (first_ms) |ms| return ms;
         return error.GrpcNoData;
     } else {
+        const first_start = netutil.monoNow(io);
         try rc.writeApp(vless_buf[0..vless_len]);
-        var resp: [4096]u8 = undefined;
-        const n = try rc.readApp(&resp);
         var uuid_bytes: [16]u8 = undefined;
         try vless.parseUuid(uuid, &uuid_bytes);
+
+        var http_buf: [4096]u8 = undefined;
+        var http_len: usize = 0;
+        var stripped_header = false;
+        var resp: [4096]u8 = undefined;
+
+        while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
+            const n = try rc.readApp(&resp);
+            var piece = vless.maybeUnwrapVision(resp[0..n], &uuid_bytes);
+            if (!stripped_header) {
+                const hdr = try vless.responseHeaderLen(piece);
+                piece = piece[hdr..];
+                stripped_header = true;
+            }
+            if (piece.len == 0) continue;
+            if (http_len + piece.len > http_buf.len) return error.BufferTooSmall;
+            @memcpy(http_buf[http_len..][0..piece.len], piece);
+            http_len += piece.len;
+        }
+        const first_ms = netutil.elapsedMs(first_start, io);
+
+        const steady_start = netutil.monoNow(io);
+        rc.writeApp(util.probe_http) catch |err| {
+            return if (util.isPeerClosed(err)) first_ms else err;
+        };
+        const n = rc.readApp(&resp) catch |err| {
+            return if (util.isPeerClosed(err)) first_ms else err;
+        };
         const body = vless.maybeUnwrapVision(resp[0..n], &uuid_bytes);
-        try vless.requireTunneledByte(body);
-        return netutil.elapsedMs(start, io);
+        if (body.len == 0) return first_ms;
+        return netutil.elapsedMs(steady_start, io);
     }
 }
 
