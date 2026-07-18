@@ -50,7 +50,7 @@ pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_
         .shadowsocks => blk: {
             const method = proxy.method orelse return error.InvalidProxyUri;
             const password = proxy.password orelse return error.InvalidProxyUri;
-            break :blk try ss.probe(io, proxy.host, proxy.port, method, password, timeout_secs);
+            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, timeout_secs);
         },
         .trojan => blk: {
             const sni = proxy.getParam("sni") orelse proxy.host;

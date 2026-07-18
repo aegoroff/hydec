@@ -182,7 +182,7 @@ fn openChunk(ctx: *AeadCtx, in: []const u8, out: []u8) error{ AuthenticationFail
 }
 
 /// Read and decrypt one AEAD chunk from the stream (matches Trojan: first tunneled bytes).
-fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8) !usize {
+fn readOpenChunk(gpa: std.mem.Allocator, ctx: *AeadCtx, reader: *Io.Reader, out: []u8) !usize {
     var len_ct: [2]u8 = undefined;
     var len_tag: [16]u8 = undefined;
     try reader.readSliceAll(&len_ct);
@@ -190,11 +190,12 @@ fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8) !usize {
 
     const payload_len = try openLength(ctx, &len_ct, &len_tag, out.len);
 
-    var payload_ct: [max_chunk_payload]u8 = undefined;
+    const payload_ct = try gpa.alloc(u8, payload_len);
+    defer gpa.free(payload_ct);
     var payload_tag: [16]u8 = undefined;
-    try reader.readSliceAll(payload_ct[0..payload_len]);
+    try reader.readSliceAll(payload_ct);
     try reader.readSliceAll(&payload_tag);
-    try ctx.open(out[0..payload_len], payload_ct[0..payload_len], &payload_tag);
+    try ctx.open(out[0..payload_len], payload_ct, &payload_tag);
     return payload_len;
 }
 
@@ -217,7 +218,15 @@ fn classifyErr(err: anyerror, fired: bool) anyerror {
 }
 
 /// Probe SS AEAD: dial, send encrypted target + HTTP request, wait for first decrypted payload.
-pub fn probe(io: Io, host: []const u8, port: u16, method_name: []const u8, password: []const u8, timeout_secs: u32) !u64 {
+pub fn probe(
+    gpa: std.mem.Allocator,
+    io: Io,
+    host: []const u8,
+    port: u16,
+    method_name: []const u8,
+    password: []const u8,
+    timeout_secs: u32,
+) !u64 {
     const method = Method.fromName(method_name) orelse return error.UnsupportedSsMethod;
 
     var master: [32]u8 = undefined;
@@ -281,8 +290,9 @@ pub fn probe(io: Io, host: []const u8, port: u16, method_name: []const u8, passw
     };
 
     // First decrypted payload proves the tunnel carries remote data (parity with Trojan/VLESS).
-    var discard: [max_chunk_payload]u8 = undefined;
-    _ = readOpenChunk(&server_ctx, &r.interface, &discard) catch |err| return classifyErr(err, fired.load(.acquire));
+    const discard = try gpa.alloc(u8, max_chunk_payload);
+    defer gpa.free(discard);
+    _ = readOpenChunk(gpa, &server_ctx, &r.interface, discard) catch |err| return classifyErr(err, fired.load(.acquire));
 
     return netutil.elapsedMs(start, io);
 }
