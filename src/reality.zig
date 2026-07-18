@@ -189,51 +189,57 @@ const RecordConn = struct {
         try self.writer.flush();
     }
 
+    /// TLS peers send at most one CCS; bound skips so a flood cannot recurse/stack-DoS.
+    const max_ccs_skip: usize = 8;
+
     fn readRecord(self: *RecordConn, out: []u8, handshake_keys: bool) !TlsRecord {
-        var hdr: [5]u8 = undefined;
-        try self.reader.readSliceAll(&hdr);
-        const content_type = hdr[0];
-        const length = readU16(hdr[3..5]);
-        if (length > 16640) return error.TlsRecordOverflow;
+        var ccs_skipped: usize = 0;
+        while (true) {
+            var hdr: [5]u8 = undefined;
+            try self.reader.readSliceAll(&hdr);
+            const content_type = hdr[0];
+            const length = readU16(hdr[3..5]);
+            if (length > 16640) return error.TlsRecordOverflow;
 
-        var payload: [16640]u8 = undefined;
-        try self.reader.readSliceAll(payload[0..length]);
+            var payload: [16640]u8 = undefined;
+            try self.reader.readSliceAll(payload[0..length]);
 
-        if (content_type == 23) {
-            // decrypt
-            if (length < 16) return error.TlsBadLength;
-            const ct_len = length - 16;
-            const key = if (handshake_keys) self.hs_server_key else self.server_key;
-            const iv = if (handshake_keys) self.hs_server_iv else self.server_iv;
-            const seq = if (handshake_keys) self.hs_read_seq else self.read_seq;
-            const nonce = xorNonce(&iv, seq);
-            var aad: [5]u8 = .{ 23, 0x03, 0x03, 0, 0 };
-            putU16(aad[3..5], length);
-            var plain: [16640]u8 = undefined;
-            var tag: [16]u8 = undefined;
-            @memcpy(&tag, payload[ct_len..][0..16]);
-            try Aes128Gcm.decrypt(plain[0..ct_len], payload[0..ct_len], tag, &aad, nonce, key);
-            if (handshake_keys) self.hs_read_seq += 1 else self.read_seq += 1;
+            if (content_type == 20) {
+                ccs_skipped += 1;
+                if (ccs_skipped > max_ccs_skip) return error.TlsUnexpectedMessage;
+                continue;
+            }
+            if (content_type == 23) {
+                // decrypt
+                if (length < 16) return error.TlsBadLength;
+                const ct_len = length - 16;
+                const key = if (handshake_keys) self.hs_server_key else self.server_key;
+                const iv = if (handshake_keys) self.hs_server_iv else self.server_iv;
+                const seq = if (handshake_keys) self.hs_read_seq else self.read_seq;
+                const nonce = xorNonce(&iv, seq);
+                var aad: [5]u8 = .{ 23, 0x03, 0x03, 0, 0 };
+                putU16(aad[3..5], length);
+                var plain: [16640]u8 = undefined;
+                var tag: [16]u8 = undefined;
+                @memcpy(&tag, payload[ct_len..][0..16]);
+                try Aes128Gcm.decrypt(plain[0..ct_len], payload[0..ct_len], tag, &aad, nonce, key);
+                if (handshake_keys) self.hs_read_seq += 1 else self.read_seq += 1;
 
-            // strip trailing content type and padding zeros
-            var end = ct_len;
-            while (end > 0 and plain[end - 1] == 0) end -= 1;
-            if (end == 0) return error.TlsDecodeError;
-            const inner_type = plain[end - 1];
-            const msg_len = end - 1;
-            if (msg_len > out.len) return error.BufferTooSmall;
-            @memcpy(out[0..msg_len], plain[0..msg_len]);
-            return .{ .typ = inner_type, .len = msg_len };
+                // strip trailing content type and padding zeros
+                var end = ct_len;
+                while (end > 0 and plain[end - 1] == 0) end -= 1;
+                if (end == 0) return error.TlsDecodeError;
+                const inner_type = plain[end - 1];
+                const msg_len = end - 1;
+                if (msg_len > out.len) return error.BufferTooSmall;
+                @memcpy(out[0..msg_len], plain[0..msg_len]);
+                return .{ .typ = inner_type, .len = msg_len };
+            }
+            if (content_type == 21) return error.TlsAlert;
+            if (length > out.len) return error.BufferTooSmall;
+            @memcpy(out[0..length], payload[0..length]);
+            return .{ .typ = content_type, .len = length };
         }
-
-        if (content_type == 20) {
-            // CCS - ignore, read next
-            return self.readRecord(out, handshake_keys);
-        }
-        if (content_type == 21) return error.TlsAlert;
-        if (length > out.len) return error.BufferTooSmall;
-        @memcpy(out[0..length], payload[0..length]);
-        return .{ .typ = content_type, .len = length };
     }
 
     /// Skip post-handshake messages (NewSessionTicket, KeyUpdate) until application_data.
@@ -273,6 +279,48 @@ fn deriveAppKeys(conn: *RecordConn, master: *const [32]u8, handshake_hash: *cons
     conn.read_seq = 0;
     conn.write_seq = 0;
     conn.app_phase = true;
+}
+
+/// Extract the peer X25519 key_share from a ServerHello body (no handshake header).
+fn parseServerHelloX25519(sh_body: []const u8) ![32]u8 {
+    if (sh_body.len < 2 + 32 + 1) return error.TlsDecodeError;
+    // Detect Hello Retry Request (unsupported in v1)
+    if (std.mem.eql(u8, sh_body[2..34], &tls.hello_retry_request_sequence)) {
+        return error.HelloRetryRequestUnsupported;
+    }
+    var pos: usize = 2 + 32; // version + random
+    const sid_echo_len = sh_body[pos];
+    pos += 1 + sid_echo_len;
+    if (pos + 3 > sh_body.len) return error.TlsDecodeError;
+    const suite = readU16(sh_body[pos..][0..2]);
+    pos += 2;
+    pos += 1; // compression
+    if (suite != TLS_AES_128_GCM_SHA256) return error.UnsupportedCipherSuite;
+
+    if (pos + 2 > sh_body.len) return error.TlsDecodeError;
+    const ext_len = readU16(sh_body[pos..][0..2]);
+    pos += 2;
+    if (pos + ext_len > sh_body.len) return error.TlsDecodeError;
+    const ext_end = pos + ext_len;
+
+    var server_x25519: ?[32]u8 = null;
+    while (pos + 4 <= ext_end) {
+        const et = readU16(sh_body[pos..][0..2]);
+        const el = readU16(sh_body[pos + 2 ..][0..2]);
+        pos += 4;
+        if (pos + el > ext_end) return error.TlsDecodeError;
+        if (et == 51 and el >= 4 + 32) { // key_share
+            const group = readU16(sh_body[pos..][0..2]);
+            const klen = readU16(sh_body[pos + 2 ..][0..2]);
+            if (group == named_group_x25519 and klen == 32) {
+                var pubk: [32]u8 = undefined;
+                @memcpy(&pubk, sh_body[pos + 4 ..][0..32]);
+                server_x25519 = pubk;
+            }
+        }
+        pos += el;
+    }
+    return server_x25519 orelse error.MissingKeyShare;
 }
 
 fn buildClientHello(
@@ -553,41 +601,7 @@ pub fn connect(
     const sh_body_len = readU24(sh_buf[1..4]);
     if (4 + sh_body_len > sh_rec.len) return error.TlsDecodeError;
     const sh_body = sh_buf[4 .. 4 + sh_body_len];
-    if (sh_body.len < 2 + 32 + 1) return error.TlsDecodeError;
-    // Detect Hello Retry Request (unsupported in v1)
-    if (std.mem.eql(u8, sh_body[2..34], &tls.hello_retry_request_sequence)) {
-        return error.HelloRetryRequestUnsupported;
-    }
-    var pos: usize = 2 + 32; // version + random
-    const sid_echo_len = sh_body[pos];
-    pos += 1 + sid_echo_len;
-    if (pos + 3 > sh_body.len) return error.TlsDecodeError;
-    const suite = readU16(sh_body[pos..][0..2]);
-    pos += 2;
-    pos += 1; // compression
-    if (suite != TLS_AES_128_GCM_SHA256) return error.UnsupportedCipherSuite;
-
-    const ext_len = readU16(sh_body[pos..][0..2]);
-    pos += 2;
-    const ext_end = pos + ext_len;
-    var server_x25519: ?[32]u8 = null;
-    while (pos + 4 <= ext_end) {
-        const et = readU16(sh_body[pos..][0..2]);
-        const el = readU16(sh_body[pos + 2 ..][0..2]);
-        pos += 4;
-        if (pos + el > ext_end) return error.TlsDecodeError;
-        if (et == 51 and el >= 4 + 32) { // key_share
-            const group = readU16(sh_body[pos..][0..2]);
-            const klen = readU16(sh_body[pos + 2 ..][0..2]);
-            if (group == named_group_x25519 and klen == 32) {
-                var pubk: [32]u8 = undefined;
-                @memcpy(&pubk, sh_body[pos + 4 ..][0..32]);
-                server_x25519 = pubk;
-            }
-        }
-        pos += el;
-    }
-    const server_share = server_x25519 orelse return error.MissingKeyShare;
+    const server_share = try parseServerHelloX25519(sh_body);
     const shared = try X25519.scalarmult(kp.secret_key, server_share);
 
     // Hash(ClientHello || ServerHello) — recompute explicitly
@@ -747,7 +761,7 @@ pub fn probeVless(
                     if ((fflags & 0x01) != 0 and saw_headers_ok) return error.GrpcEmptyResponse;
                 } else if (ftyp == 0x00 and frame_len >= 5 and request_sent) {
                     const msg = try grpc_gun.vlessFromGrpcData(payload);
-                    _ = try vless.responseHeaderLen(msg);
+                    try vless.requireTunneledByte(msg);
                     return netutil.elapsedMs(start, io);
                 } else if (ftyp == 0x03) {
                     if (frame_len >= 4) {
@@ -775,9 +789,39 @@ pub fn probeVless(
         var uuid_bytes: [16]u8 = undefined;
         try vless.parseUuid(uuid, &uuid_bytes);
         const body = vless.maybeUnwrapVision(resp[0..n], &uuid_bytes);
-        _ = try vless.responseHeaderLen(body);
+        try vless.requireTunneledByte(body);
         return netutil.elapsedMs(start, io);
     }
+}
+
+fn appendServerHelloMinimal(buf: []u8, key_share: *const [32]u8, ext_len_override: ?u16) !usize {
+    var i: usize = 0;
+    putU16(buf[i..][0..2], 0x0303);
+    i += 2;
+    @memset(buf[i..][0..32], 0xaa);
+    i += 32;
+    buf[i] = 0; // empty session id
+    i += 1;
+    putU16(buf[i..][0..2], TLS_AES_128_GCM_SHA256);
+    i += 2;
+    buf[i] = 0; // compression
+    i += 1;
+
+    const ext_payload_len: u16 = 4 + 4 + 32; // type+len + group+klen+key
+    const ext_len = ext_len_override orelse ext_payload_len;
+    putU16(buf[i..][0..2], ext_len);
+    i += 2;
+    putU16(buf[i..][0..2], 51); // key_share
+    i += 2;
+    putU16(buf[i..][0..2], 4 + 32);
+    i += 2;
+    putU16(buf[i..][0..2], named_group_x25519);
+    i += 2;
+    putU16(buf[i..][0..2], 32);
+    i += 2;
+    @memcpy(buf[i..][0..32], key_share);
+    i += 32;
+    return i;
 }
 
 test "decodeShortId" {
@@ -785,6 +829,30 @@ test "decodeShortId" {
     try decodeShortId("0123456789abcdef", &sid);
     try std.testing.expectEqual(@as(u8, 0x01), sid[0]);
     try std.testing.expectEqual(@as(u8, 0xef), sid[7]);
+}
+
+test "parseServerHelloX25519 accepts key_share" {
+    var body: [128]u8 = undefined;
+    const key = [_]u8{0x42} ** 32;
+    const n = try appendServerHelloMinimal(&body, &key, null);
+    const got = try parseServerHelloX25519(body[0..n]);
+    try std.testing.expectEqualSlices(u8, &key, &got);
+}
+
+test "parseServerHelloX25519 rejects truncated extensions" {
+    var body: [128]u8 = undefined;
+    const key = [_]u8{0x42} ** 32;
+    const n = try appendServerHelloMinimal(&body, &key, null);
+    // Claim a huge extensions length past the real buffer.
+    try std.testing.expectError(error.TlsDecodeError, parseServerHelloX25519(body[0 .. n - 1]));
+    try std.testing.expectError(error.TlsDecodeError, parseServerHelloX25519(body[0..40]));
+}
+
+test "parseServerHelloX25519 rejects ext_len past body" {
+    var body: [128]u8 = undefined;
+    const key = [_]u8{0x42} ** 32;
+    const n = try appendServerHelloMinimal(&body, &key, 0xffff);
+    try std.testing.expectError(error.TlsDecodeError, parseServerHelloX25519(body[0..n]));
 }
 
 test "clientHello session id at offset 39" {

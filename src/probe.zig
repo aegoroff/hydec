@@ -24,6 +24,9 @@ const WorkItem = struct {
     proxy: proxy_uri.Proxy,
 };
 
+/// Cap concurrent host workers so a large subscription cannot exhaust OS threads.
+const max_parallel_hosts: usize = 64;
+
 const Shared = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -134,6 +137,10 @@ fn failHint(err: anyerror) []const u8 {
         error.NetworkUnreachable,
         error.HostUnreachable,
         => "unreachable",
+        error.EmptyTunnelResponse,
+        error.GrpcEmptyResponse,
+        error.GrpcNoData,
+        => "empty/no-data",
         else => "error",
     };
 }
@@ -260,19 +267,25 @@ pub fn findBest(
         .stats = stats,
     };
 
-    const n = groups.count();
-    const threads = try gpa.alloc(std.Thread, n);
+    const lists = groups.values();
+    const n = lists.len;
+    const threads = try gpa.alloc(std.Thread, @min(n, max_parallel_hosts));
     defer gpa.free(threads);
 
-    var spawned: usize = 0;
-    errdefer for (threads[0..spawned]) |t| t.join();
+    var next: usize = 0;
+    while (next < n) {
+        const batch = @min(max_parallel_hosts, n - next);
+        var spawned: usize = 0;
+        errdefer for (threads[0..spawned]) |t| t.join();
 
-    for (groups.values()) |*list| {
-        threads[spawned] = try std.Thread.spawn(.{}, probeGroup, .{ &shared, list.items });
-        spawned += 1;
+        for (lists[next..][0..batch]) |*list| {
+            threads[spawned] = try std.Thread.spawn(.{}, probeGroup, .{ &shared, list.items });
+            spawned += 1;
+        }
+
+        for (threads[0..spawned]) |t| t.join();
+        next += batch;
     }
-
-    for (threads[0..spawned]) |t| t.join();
 
     return shared.best;
 }
