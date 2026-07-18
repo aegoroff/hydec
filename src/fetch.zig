@@ -39,13 +39,14 @@ fn workerFinishAbandoned(ctx: *FetchCtx, orphan_body: ?[]u8) void {
 fn fetchWorker(ctx: *FetchCtx) void {
     const gpa = ctx.gpa;
     const body = fetchUrlInner(gpa, ctx.io, ctx.url) catch |e| {
+        // If abandoned before publishing done, worker owns cleanup (caller will detach).
+        // After done=true, only the joining caller may destroy — never both.
         if (ctx.abandoned.load(.acquire)) {
             workerFinishAbandoned(ctx, null);
             return;
         }
         ctx.err = e;
         ctx.done.store(true, .release);
-        if (ctx.abandoned.load(.acquire)) workerFinishAbandoned(ctx, null);
         return;
     };
 
@@ -56,7 +57,6 @@ fn fetchWorker(ctx: *FetchCtx) void {
 
     ctx.body = body;
     ctx.done.store(true, .release);
-    if (ctx.abandoned.load(.acquire)) workerFinishAbandoned(ctx, null);
 }
 
 /// Download URL body with an overall wall-clock deadline.
@@ -95,6 +95,8 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
                 io.sleep(pause, .awake) catch {};
             }
             if (ctx.done.load(.acquire)) {
+                // Worker published done without taking cleanup (see fetchWorker).
+                // Safe to join and destroy: worker never frees after done=true.
                 thread.join();
                 if (tryTakeCleanup(ctx)) destroyCtx(ctx);
                 return error.Timeout;
