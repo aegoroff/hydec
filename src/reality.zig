@@ -579,7 +579,11 @@ pub const RealityConn = struct {
     }
 };
 
+/// Handshake into caller-owned `rc`. Out-parameter is required: RealityConn is
+/// self-referential (sock buffers, DeadlineShutdown atomics) and must not move
+/// after arming — returning by value would rely on RLO alone.
 pub fn connect(
+    rc: *RealityConn,
     io: Io,
     host: []const u8,
     port: u16,
@@ -588,7 +592,7 @@ pub fn connect(
     sid_hex: []const u8,
     alpn_h2: bool,
     timeout_secs: u32,
-) !RealityConn {
+) !void {
     var server_pub: [32]u8 = undefined;
     try decodePublicKey(pbk_b64, &server_pub);
     var short_id: [8]u8 = undefined;
@@ -617,7 +621,7 @@ pub fn connect(
     // sealSessionId already updated hello_raw session id bytes.
 
     const dial_start = netutil.monoNow(io);
-    var rc: RealityConn = .{
+    rc.* = .{
         .stream = try netutil.connectHostPort(io, host, port, timeout_secs),
         .io = io,
         .open = true,
@@ -735,8 +739,6 @@ pub fn connect(
     try rc.writeHandshake(&fin_msg);
 
     deriveAppKeys(&rc.conn, &master, &hs_hash);
-
-    return rc;
 }
 
 /// Append tunnel bytes into `buf`, stripping the VLESS response header once it is complete.
@@ -774,7 +776,8 @@ pub fn probeVless(
 ) !u64 {
     const sni_use = if (sni.len > 0) sni else host;
 
-    var rc = try connect(io, host, port, sni_use, pbk, sid, grpc, timeout_secs);
+    var rc: RealityConn = undefined;
+    try connect(&rc, io, host, port, sni_use, pbk, sid, grpc, timeout_secs);
     defer rc.deinit();
 
     var vless_buf: [512]u8 = undefined;
