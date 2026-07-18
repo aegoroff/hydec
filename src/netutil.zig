@@ -68,8 +68,15 @@ fn connectHostnameTimed(io: Io, host: []const u8, port: u16, timeout_secs: u32) 
     } else |err| switch (err) {
         error.Canceled => return error.Timeout,
         error.Closed => {
-            try lookup_future.await(io);
-            return last_err;
+            if (saw_address) {
+                // Addresses were tried; connect failures beat lookup status.
+                lookup_future.await(io) catch {};
+                return last_err;
+            }
+            // No addresses: surface the real DNS/lookup error (do not keep the
+            // UnknownHostName placeholder when await carries NameServerFailure etc.).
+            lookup_future.await(io) catch |lookup_err| return lookup_err;
+            return error.NoAddressReturned;
         },
     }
 }
