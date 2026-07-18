@@ -90,7 +90,32 @@ const AeadCtx = struct {
         }
         self.bumpNonce();
     }
+
+    fn open(self: *AeadCtx, plaintext: []u8, ciphertext: []const u8, tag: *const [16]u8) error{AuthenticationFailed}!void {
+        const ad = &[_]u8{};
+        switch (self.method) {
+            .aes_128_gcm => {
+                var key: [16]u8 = undefined;
+                @memcpy(&key, self.key[0..16]);
+                try Aes128Gcm.decrypt(plaintext, ciphertext, tag.*, ad, self.nonce, key);
+            },
+            .aes_256_gcm => {
+                var key: [32]u8 = undefined;
+                @memcpy(&key, self.key[0..32]);
+                try Aes256Gcm.decrypt(plaintext, ciphertext, tag.*, ad, self.nonce, key);
+            },
+            .chacha20_ietf_poly1305 => {
+                var key: [32]u8 = undefined;
+                @memcpy(&key, self.key[0..32]);
+                try ChaCha20Poly1305.decrypt(plaintext, ciphertext, tag.*, ad, self.nonce, key);
+            },
+        }
+        self.bumpNonce();
+    }
 };
+
+/// Shadowsocks AEAD max payload length (SIP004).
+const max_chunk_payload: u16 = 0x3FFF;
 
 /// HTTP/1.1 on port 80 — remote replies immediately so the SS server emits its salt.
 const probe_http_port: u16 = 80;
@@ -126,7 +151,47 @@ fn sealChunk(ctx: *AeadCtx, out: []u8, plaintext: []const u8) error{BufferTooSma
     return off;
 }
 
-/// Probe SS AEAD: dial, send encrypted target + HTTP request, wait for server salt.
+/// Decrypt one AEAD chunk from `in` into `out`. Returns plaintext length.
+fn openChunk(ctx: *AeadCtx, in: []const u8, out: []u8) error{ AuthenticationFailed, InvalidSsChunk, BufferTooSmall }!usize {
+    if (in.len < 2 + 16) return error.InvalidSsChunk;
+
+    var len_be: [2]u8 = undefined;
+    try ctx.open(&len_be, in[0..2], in[2..18][0..16]);
+    const payload_len = std.mem.readInt(u16, &len_be, .big);
+    if (payload_len == 0 or payload_len > max_chunk_payload) return error.InvalidSsChunk;
+    if (payload_len > out.len) return error.BufferTooSmall;
+
+    const need = 2 + 16 + payload_len + 16;
+    if (in.len < need) return error.InvalidSsChunk;
+
+    const payload_ct = in[18 .. 18 + payload_len];
+    const payload_tag = in[18 + payload_len ..][0..16];
+    try ctx.open(out[0..payload_len], payload_ct, payload_tag);
+    return payload_len;
+}
+
+/// Read and decrypt one AEAD chunk from the stream (matches Trojan: first tunneled bytes).
+fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8) !usize {
+    var len_ct: [2]u8 = undefined;
+    var len_tag: [16]u8 = undefined;
+    try reader.readSliceAll(&len_ct);
+    try reader.readSliceAll(&len_tag);
+
+    var len_be: [2]u8 = undefined;
+    try ctx.open(&len_be, &len_ct, &len_tag);
+    const payload_len = std.mem.readInt(u16, &len_be, .big);
+    if (payload_len == 0 or payload_len > max_chunk_payload) return error.InvalidSsChunk;
+    if (payload_len > out.len) return error.BufferTooSmall;
+
+    var payload_ct: [max_chunk_payload]u8 = undefined;
+    var payload_tag: [16]u8 = undefined;
+    try reader.readSliceAll(payload_ct[0..payload_len]);
+    try reader.readSliceAll(&payload_tag);
+    try ctx.open(out[0..payload_len], payload_ct[0..payload_len], &payload_tag);
+    return payload_len;
+}
+
+/// Probe SS AEAD: dial, send encrypted target + HTTP request, wait for first decrypted payload.
 pub fn probe(io: Io, host: []const u8, port: u16, method_name: []const u8, password: []const u8, timeout_secs: u32) !u64 {
     const method = Method.fromName(method_name) orelse return error.UnsupportedSsMethod;
 
@@ -171,7 +236,6 @@ pub fn probe(io: Io, host: []const u8, port: u16, method_name: []const u8, passw
     try w.interface.writeAll(packet[0..off]);
     try w.interface.flush();
 
-    // Server salt alone proves AEAD was accepted (server starts its own salt+chunks).
     const remain = netutil.remainingTimeoutNs(start, io, timeout_secs);
     if (remain == 0) return error.Timeout;
     var done = std.atomic.Value(bool).init(false);
@@ -183,6 +247,18 @@ pub fn probe(io: Io, host: []const u8, port: u16, method_name: []const u8, passw
     var server_salt: [32]u8 = undefined;
     try r.interface.readSliceAll(server_salt[0..method.saltLen()]);
 
+    var server_subkey: [32]u8 = undefined;
+    @memset(&server_subkey, 0);
+    hkdfSha1(master[0..method.keyLen()], server_salt[0..method.saltLen()], server_subkey[0..method.keyLen()]);
+    var server_ctx: AeadCtx = .{
+        .method = method,
+        .key = server_subkey,
+    };
+
+    // First decrypted payload proves the tunnel carries remote data (parity with Trojan/VLESS).
+    var discard: [max_chunk_payload]u8 = undefined;
+    _ = try readOpenChunk(&server_ctx, &r.interface, &discard);
+
     return netutil.elapsedMs(start, io);
 }
 
@@ -193,16 +269,40 @@ test "evpBytesToKey chacha length" {
     try std.testing.expect(key[0] != 0 or key[31] != 0);
 }
 
-test "aead seal roundtrip length chunk" {
-    var ctx: AeadCtx = .{
+test "aead seal/open chunk roundtrip" {
+    var seal_ctx: AeadCtx = .{
         .method = .chacha20_ietf_poly1305,
         .key = [_]u8{0x11} ** 32,
     };
-    var len_be: [2]u8 = .{ 0x00, 0x07 };
-    var ct: [2]u8 = undefined;
-    var tag: [16]u8 = undefined;
-    ctx.seal(&ct, &tag, &len_be);
-    try std.testing.expect(!std.mem.eql(u8, &ct, &len_be));
+    const plain = "HTTP/1.1 200";
+    var sealed: [128]u8 = undefined;
+    const n = try sealChunk(&seal_ctx, &sealed, plain);
+
+    var open_ctx: AeadCtx = .{
+        .method = .chacha20_ietf_poly1305,
+        .key = [_]u8{0x11} ** 32,
+    };
+    var out: [64]u8 = undefined;
+    const got = try openChunk(&open_ctx, sealed[0..n], &out);
+    try std.testing.expectEqualStrings(plain, out[0..got]);
+}
+
+test "aead open rejects bad tag" {
+    var seal_ctx: AeadCtx = .{
+        .method = .aes_128_gcm,
+        .key = [_]u8{0x22} ** 32,
+    };
+    const plain = "ok";
+    var sealed: [64]u8 = undefined;
+    const n = try sealChunk(&seal_ctx, &sealed, plain);
+    sealed[n - 1] ^= 0xff;
+
+    var open_ctx: AeadCtx = .{
+        .method = .aes_128_gcm,
+        .key = [_]u8{0x22} ** 32,
+    };
+    var out: [16]u8 = undefined;
+    try std.testing.expectError(error.AuthenticationFailed, openChunk(&open_ctx, sealed[0..n], &out));
 }
 
 test "method from name" {
