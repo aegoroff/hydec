@@ -57,11 +57,6 @@ pub const Proxy = struct {
     pub fn getParam(self: Proxy, key: []const u8) ?[]const u8 {
         return util.getQueryParam(self.query, key);
     }
-
-    pub fn ipString(self: Proxy, buf: []u8) []const u8 {
-        // Prefer host if it looks like IPv4; otherwise return host as-is.
-        return std.fmt.bufPrint(buf, "{s}", .{self.host}) catch self.host;
-    }
 };
 
 fn startsWithScheme(line: []const u8, scheme: []const u8) bool {
@@ -238,7 +233,8 @@ fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     // Legacy: entire rest is base64(method:password@host:port)
     const decoded = try decodeUserinfo(gpa, rest0);
     defer gpa.free(decoded);
-    const at = std.mem.indexOfScalar(u8, decoded, '@') orelse return error.InvalidProxyUri;
+    // Last '@' separates userinfo from host — passwords may contain '@'.
+    const at = std.mem.lastIndexOfScalar(u8, decoded, '@') orelse return error.InvalidProxyUri;
     const userinfo = decoded[0..at];
     const hostport = decoded[at + 1 ..];
     const hp = try util.splitHostPortOrDefault(hostport, 8388);
@@ -335,6 +331,19 @@ test "parse ss legacy owns host" {
     try std.testing.expectEqualStrings("192.0.2.10", p.host);
     try std.testing.expectEqual(@as(u16, 2060), p.port);
     try std.testing.expectEqualStrings("chacha20-ietf-poly1305", p.method.?);
+}
+
+test "parse ss legacy password with at-sign" {
+    const gpa = std.testing.allocator;
+    // base64(chacha20-ietf-poly1305:pass@word@192.0.2.10:2060)
+    const line =
+        \\ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpwYXNzQHdvcmRAMTkyLjAuMi4xMDoyMDYw#tag
+    ;
+    var p = try parse(gpa, line);
+    defer p.deinit(gpa);
+    try std.testing.expect(p.owns_host);
+    try std.testing.expectEqualStrings("192.0.2.10", p.host);
+    try std.testing.expectEqualStrings("pass@word", p.password.?);
 }
 
 test "parse trojan ws" {

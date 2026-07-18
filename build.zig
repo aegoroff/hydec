@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
 
     const version_opt = b.option([]const u8, "version", "The version of the app") orelse "0.1.0-dev";
     options.addOption([]const u8, "version", version_opt);
+    options.addOption([]const u8, "cpu_arch", @tagName(target.result.cpu.arch));
 
     const exe = b.addExecutable(.{
         .name = "hydec",

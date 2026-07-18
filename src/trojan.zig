@@ -178,21 +178,22 @@ pub fn probe(
     }
 
     // Warmup: drain first HTTP response so the second request is clean.
-    var http_buf: [4096]u8 = undefined;
+    const http_buf = try gpa.alloc(u8, 16384);
+    defer gpa.free(http_buf);
     var http_len: usize = 0;
+    const frame_buf = try gpa.alloc(u8, 16384);
+    defer gpa.free(frame_buf);
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         if (transport_ws) {
-            var frame_buf: [2048]u8 = undefined;
-            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, &frame_buf) catch |err| return classifyErr(err, fired.load(.acquire));
+            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| return classifyErr(err, fired.load(.acquire));
             if (http_len + n > http_buf.len) return error.BufferTooSmall;
             @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
             http_len += n;
         } else {
-            var chunk: [512]u8 = undefined;
-            const n = tls_reader.readSliceShort(&chunk) catch |err| return classifyErr(err, fired.load(.acquire));
+            const n = tls_reader.readSliceShort(frame_buf) catch |err| return classifyErr(err, fired.load(.acquire));
             if (n == 0) return classifyErr(error.EndOfStream, fired.load(.acquire));
             if (http_len + n > http_buf.len) return error.BufferTooSmall;
-            @memcpy(http_buf[http_len..][0..n], chunk[0..n]);
+            @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
             http_len += n;
         }
     }
@@ -204,8 +205,7 @@ pub fn probe(
             const e = classifyErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };
-        var frame_buf: [2048]u8 = undefined;
-        _ = ws.readBinaryFrame(tls_reader, tls_writer, io, &frame_buf) catch |err| {
+        _ = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
             const e = classifyErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };

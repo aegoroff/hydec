@@ -20,7 +20,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    const parsed = cli.parse(gpa, init.minimal.args) catch |err| switch (err) {
+    const parsed = cli.parse(gpa, io, init.minimal.args) catch |err| switch (err) {
         error.MissingRequiredArgument => {
             std.log.err("missing required argument", .{});
             std.process.exit(2);
@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     switch (parsed) {
         .help => return,
         .version => {
-            try cli.printVersion();
+            try cli.printVersion(io);
             return;
         },
         .run => |opts| {
@@ -85,13 +85,15 @@ fn runBest(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     try subscription.iterLines(decoded, Ctx.on, &ctx);
 
     var stats: probe.Stats = .{};
-    const best = try probe.findBest(gpa, io, lines.items, opts.verbose, opts.timeout_secs, &stats);
+    var best = try probe.findBest(gpa, io, lines.items, opts.verbose, opts.timeout_secs, &stats);
+    defer if (best) |*b| b.deinit(gpa);
 
-    std.log.info("Tested: {d}, passed: {d}, skipped vmess: {d}, skipped other: {d}", .{
+    std.log.info("Tested: {d}, passed: {d}, skipped vmess: {d}, skipped other: {d}, parse failed: {d}", .{
         stats.tested,
         stats.passed,
         stats.skipped_vmess,
         stats.skipped_other,
+        stats.parse_failed,
     });
 
     if (best) |b| {

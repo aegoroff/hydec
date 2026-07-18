@@ -287,7 +287,8 @@ pub fn probe(
 
     const chunk_buf = try gpa.alloc(u8, max_chunk_payload);
     defer gpa.free(chunk_buf);
-    var http_buf: [4096]u8 = undefined;
+    const http_buf = try gpa.alloc(u8, max_chunk_payload);
+    defer gpa.free(http_buf);
     var http_len: usize = 0;
 
     // Warmup: drain first HTTP response so the second request is clean.

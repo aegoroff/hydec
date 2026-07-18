@@ -1,7 +1,8 @@
 const std = @import("std");
 const zig_cli = @import("zig_cli");
-const builtin = @import("builtin");
 const build_options = @import("build_options");
+
+const Io = std.Io;
 
 pub const Command = enum { best, ping };
 
@@ -228,9 +229,9 @@ fn writePadding(writer: *std.Io.Writer, used: usize, column: usize) !void {
     }
 }
 
-fn printHelp(cmd: *zig_cli.BaseCommand, usage_name: []const u8) !void {
+fn printHelp(io: Io, cmd: *zig_cli.BaseCommand, usage_name: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    var file_writer = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
+    var file_writer = std.Io.File.stdout().writerStreaming(io, &buf);
     const out = &file_writer.interface;
 
     const help_left = "  -h, --help";
@@ -305,9 +306,9 @@ fn printHelp(cmd: *zig_cli.BaseCommand, usage_name: []const u8) !void {
     try out.flush();
 }
 
-pub fn printVersion() !void {
+pub fn printVersion(io: Io) !void {
     var buf: [256]u8 = undefined;
-    var file_writer = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
+    var file_writer = std.Io.File.stdout().writerStreaming(io, &buf);
     try file_writer.interface.print("hydec {s}\n", .{build_options.version});
     try file_writer.interface.flush();
 }
@@ -325,14 +326,13 @@ fn normalizeOptionsFor(root: *zig_cli.BaseCommand, args: []const []const u8) []c
     return root.options.items;
 }
 
-pub fn parse(gpa: std.mem.Allocator, args: std.process.Args) !ParseResult {
-    const query = std.Target.Query.fromTarget(&builtin.target);
+pub fn parse(gpa: std.mem.Allocator, io: Io, args: std.process.Args) !ParseResult {
     const description = try std.fmt.allocPrint(
         gpa,
         \\Probe proxies from a subscription or a single URI ({s})
         \\Copyright (C) 2026. MIT License.
     ,
-        .{@tagName(query.cpu_arch.?)},
+        .{build_options.cpu_arch},
     );
     defer gpa.free(description);
 
@@ -352,11 +352,11 @@ pub fn parse(gpa: std.mem.Allocator, args: std.process.Args) !ParseResult {
             if (root.findSubcommand(arg_slice[0])) |sub| {
                 const usage = try std.fmt.allocPrint(gpa, "hydec {s}", .{sub.name});
                 defer gpa.free(usage);
-                try printHelp(sub, usage);
+                try printHelp(io, sub, usage);
                 return .help;
             }
         }
-        try printHelp(root, "hydec");
+        try printHelp(io, root, "hydec");
         return .help;
     }
     if (wantsVersion(arg_slice)) {
@@ -369,7 +369,11 @@ pub fn parse(gpa: std.mem.Allocator, args: std.process.Args) !ParseResult {
 
     capture = .{ .gpa = gpa };
     var parser = zig_cli.Parser.init(gpa);
-    try parser.parse(root, arg_slice);
+    parser.parse(root, arg_slice) catch |err| {
+        if (capture.options) |opts| gpa.free(opts.uri);
+        capture.options = null;
+        return err;
+    };
     const opts = capture.options orelse return error.MissingRequiredArgument;
     return .{ .run = opts };
 }

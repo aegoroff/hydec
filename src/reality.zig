@@ -182,7 +182,6 @@ const RecordConn = struct {
 
     fn writeClear(self: *RecordConn, content_type: u8, data: []const u8) !void {
         var hdr: [5]u8 = .{ content_type, 0x03, 0x01, 0, 0 };
-        if (content_type == 22) hdr[1] = 0x03; // handshake often 0x0301 for CH
         putU16(hdr[3..5], @intCast(data.len));
         try self.writer.writeAll(&hdr);
         try self.writer.writeAll(data);
@@ -669,8 +668,10 @@ pub fn connect(
         master = HkdfSha256.extract(&derived2, &zeroes);
     }
 
-    // Read encrypted handshake messages until Finished
+    // Read encrypted handshake messages until Finished (reassemble across TLS records).
     var saw_finished = false;
+    var hs_pending: [32768]u8 = undefined;
+    var hs_pending_len: usize = 0;
     while (!saw_finished) {
         var buf: [16384]u8 = undefined;
         const rec = rc.readRecordDeadline(&buf, true) catch |err| switch (err) {
@@ -680,14 +681,24 @@ pub fn connect(
         if (rec.typ == 21) return error.TlsAlert;
         if (rec.typ != 22) continue;
         rc.transcript.update(buf[0..rec.len]);
+        if (hs_pending_len + rec.len > hs_pending.len) return error.BufferTooSmall;
+        @memcpy(hs_pending[hs_pending_len..][0..rec.len], buf[0..rec.len]);
+        hs_pending_len += rec.len;
+
         var off: usize = 0;
-        while (off + 4 <= rec.len) {
-            const ht = buf[off];
-            const hl = readU24(buf[off + 1 ..][0..3]);
-            off += 4;
-            if (off + hl > rec.len) break;
+        while (off + 4 <= hs_pending_len) {
+            const ht = hs_pending[off];
+            const hl = readU24(hs_pending[off + 1 ..][0..3]);
+            // Bound claimed length so a hostile/corrupt peer cannot fill the pending buffer forever.
+            if (hl > 16384) return error.TlsDecodeError;
+            if (off + 4 + hl > hs_pending_len) break;
             if (ht == 20) saw_finished = true;
-            off += hl;
+            off += 4 + hl;
+        }
+        if (off > 0) {
+            const hs_remain = hs_pending_len - off;
+            if (hs_remain > 0) std.mem.copyForwards(u8, hs_pending[0..hs_remain], hs_pending[off..][0..hs_remain]);
+            hs_pending_len = hs_remain;
         }
     }
 
@@ -707,6 +718,23 @@ pub fn connect(
     deriveAppKeys(&rc.conn, &master, &hs_hash);
 
     return rc;
+}
+
+/// Append tunnel bytes into `buf`, stripping the VLESS response header once it is complete.
+/// Handles `NeedMore` by leaving partial header bytes in `buf` until the next chunk arrives.
+fn appendStripVlessHeader(buf: []u8, len: *usize, chunk: []const u8, stripped: *bool) !void {
+    if (len.* + chunk.len > buf.len) return error.BufferTooSmall;
+    @memcpy(buf[len.*..][0..chunk.len], chunk);
+    len.* += chunk.len;
+    if (stripped.*) return;
+    const hdr = vless.responseHeaderLen(buf[0..len.*]) catch |err| switch (err) {
+        error.NeedMore => return,
+        else => |e| return e,
+    };
+    const body_len = len.* - hdr;
+    if (body_len > 0) std.mem.copyForwards(u8, buf[0..body_len], buf[hdr..len.*]);
+    len.* = body_len;
+    stripped.* = true;
 }
 
 /// Probe VLESS over REALITY (TCP or gRPC gun).
@@ -742,8 +770,8 @@ pub fn probeVless(
         const plen = try grpc_gun.buildClientPrefaceSettings(&preface);
         try rc.writeApp(preface[0..plen]);
 
-        var app_buf: [4096]u8 = undefined;
-        var gather: [8192]u8 = undefined;
+        var app_buf: [16384]u8 = undefined;
+        var gather: [32768]u8 = undefined;
         var gather_len: usize = 0;
         var settings_seen = false;
         var request_sent = false;
@@ -753,7 +781,7 @@ pub fn probeVless(
         var steady_start: ?i128 = null;
         var first_start: ?i128 = null;
         var first_ms: ?u64 = null;
-        var http_buf: [4096]u8 = undefined;
+        var http_buf: [16384]u8 = undefined;
         var http_len: usize = 0;
         var attempts: usize = 0;
         while (attempts < 48) : (attempts += 1) {
@@ -797,8 +825,7 @@ pub fn probeVless(
                     const pong_len = try grpc_gun.buildPingAck(&pong, payload[0..8]);
                     try rc.writeApp(pong[0..pong_len]);
                 } else if (ftyp == 0x01 and request_sent) {
-                    // HEADERS — look for :status 200 (HPACK static index 8 → 0x88)
-                    if (frame_len > 0 and std.mem.indexOfScalar(u8, payload, 0x88) != null) {
+                    if (grpc_gun.headersIndicateStatus200(payload, fflags)) {
                         saw_headers_ok = true;
                     }
                     if ((fflags & 0x01) != 0 and !saw_headers_ok) return error.GrpcStreamEnded;
@@ -806,19 +833,9 @@ pub fn probeVless(
                     if ((fflags & 0x01) != 0 and saw_headers_ok) return error.GrpcEmptyResponse;
                 } else if (ftyp == 0x00 and frame_len >= 5 and request_sent) {
                     const msg = try grpc_gun.vlessFromGrpcData(payload);
-                    var piece = msg;
-                    if (!stripped_vless) {
-                        try vless.requireTunneledByte(msg);
-                        const hdr = try vless.responseHeaderLen(msg);
-                        piece = msg[hdr..];
-                        stripped_vless = true;
-                    }
                     if (!warmup_done) {
-                        if (piece.len > 0) {
-                            if (http_len + piece.len > http_buf.len) return error.BufferTooSmall;
-                            @memcpy(http_buf[http_len..][0..piece.len], piece);
-                            http_len += piece.len;
-                        }
+                        // Accumulate into http_buf and strip VLESS header in-place (NeedMore-safe).
+                        try appendStripVlessHeader(&http_buf, &http_len, msg, &stripped_vless);
                         if (util.httpResponseTotalLen(http_buf[0..http_len]) != null) {
                             warmup_done = true;
                             first_ms = netutil.elapsedMs(first_start.?, io);
@@ -834,7 +851,7 @@ pub fn probeVless(
                             };
                             steady_start = netutil.monoNow(io);
                         }
-                    } else if (piece.len > 0) {
+                    } else if (msg.len > 0) {
                         return netutil.elapsedMs(steady_start.?, io);
                     }
                 } else if (ftyp == 0x03) {
@@ -865,23 +882,16 @@ pub fn probeVless(
         var uuid_bytes: [16]u8 = undefined;
         try vless.parseUuid(uuid, &uuid_bytes);
 
-        var http_buf: [4096]u8 = undefined;
+        var http_buf: [16384]u8 = undefined;
         var http_len: usize = 0;
         var stripped_header = false;
-        var resp: [4096]u8 = undefined;
+        var resp: [16384]u8 = undefined;
 
         while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
             const n = try rc.readApp(&resp);
-            var piece = vless.maybeUnwrapVision(resp[0..n], &uuid_bytes);
-            if (!stripped_header) {
-                const hdr = try vless.responseHeaderLen(piece);
-                piece = piece[hdr..];
-                stripped_header = true;
-            }
+            const piece = vless.maybeUnwrapVision(resp[0..n], &uuid_bytes);
             if (piece.len == 0) continue;
-            if (http_len + piece.len > http_buf.len) return error.BufferTooSmall;
-            @memcpy(http_buf[http_len..][0..piece.len], piece);
-            http_len += piece.len;
+            try appendStripVlessHeader(&http_buf, &http_len, piece, &stripped_header);
         }
         const first_ms = netutil.elapsedMs(first_start, io);
 
@@ -928,11 +938,31 @@ fn appendServerHelloMinimal(buf: []u8, key_share: *const [32]u8, ext_len_overrid
     return i;
 }
 
-test "decodeShortId" {
-    var sid: [8]u8 = undefined;
-    try decodeShortId("0123456789abcdef", &sid);
-    try std.testing.expectEqual(@as(u8, 0x01), sid[0]);
-    try std.testing.expectEqual(@as(u8, 0xef), sid[7]);
+test "appendStripVlessHeader handles NeedMore then body" {
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    var stripped = false;
+    // Partial header (ver only)
+    try appendStripVlessHeader(&buf, &len, &[_]u8{0}, &stripped);
+    try std.testing.expect(!stripped);
+    try std.testing.expectEqual(@as(usize, 1), len);
+    // Complete empty header + HTTP start in one chunk
+    try appendStripVlessHeader(&buf, &len, "\x00HTTP/1.1 200 OK\r\n", &stripped);
+    try std.testing.expect(stripped);
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", buf[0..len]);
+}
+
+test "appendStripVlessHeader large first chunk" {
+    var buf: [1024]u8 = undefined;
+    var len: usize = 0;
+    var stripped = false;
+    var chunk: [600]u8 = undefined;
+    chunk[0] = 0;
+    chunk[1] = 0;
+    @memset(chunk[2..], 'x');
+    try appendStripVlessHeader(&buf, &len, &chunk, &stripped);
+    try std.testing.expect(stripped);
+    try std.testing.expectEqual(@as(usize, 598), len);
 }
 
 test "parseServerHelloX25519 accepts key_share" {

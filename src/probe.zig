@@ -9,7 +9,13 @@ const Io = std.Io;
 pub const Result = struct {
     latency_ms: u64,
     raw: []const u8,
-    host: []const u8,
+    /// Owned copy of the host; free with `deinit`.
+    host: []u8,
+
+    pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
+        gpa.free(self.host);
+        self.* = undefined;
+    }
 };
 
 pub const Stats = struct {
@@ -17,6 +23,7 @@ pub const Stats = struct {
     passed: usize = 0,
     skipped_vmess: usize = 0,
     skipped_other: usize = 0,
+    parse_failed: usize = 0,
 };
 
 const WorkItem = struct {
@@ -55,7 +62,7 @@ pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_
         .trojan => blk: {
             const sni = proxy.getParam("sni") orelse proxy.host;
             const path_enc = proxy.getParam("path") orelse "/";
-            const path = try util.urlDecode(gpa, path_enc);
+            const path = try util.urlDecodeStrict(gpa, path_enc);
             defer gpa.free(path);
             const host_hdr = proxy.getParam("host") orelse sni;
             break :blk try trojan.probe(
@@ -110,13 +117,15 @@ pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_
 fn considerBest(shared: *Shared, latency: u64, raw: []const u8, host: []const u8) void {
     shared.lock();
     defer shared.unlock();
-    if (shared.best == null or latency < shared.best.?.latency_ms) {
-        shared.best = .{
-            .latency_ms = latency,
-            .raw = raw,
-            .host = host,
-        };
-    }
+    if (shared.best != null and latency >= shared.best.?.latency_ms) return;
+    // Own a copy: proxy.deinit may free legacy-SS hosts before the caller reads Result.
+    const host_copy = shared.gpa.dupe(u8, host) catch return;
+    if (shared.best) |*old| shared.gpa.free(old.host);
+    shared.best = .{
+        .latency_ms = latency,
+        .raw = raw,
+        .host = host_copy,
+    };
 }
 
 /// Short hint for FAIL logs (why the probe likely failed).
@@ -226,7 +235,7 @@ fn collectGroups(
         }
 
         var proxy = proxy_uri.parse(gpa, line) catch |err| {
-            stats.tested += 1;
+            stats.parse_failed += 1;
             if (verbose) std.log.warn("parse fail: {s}: {}", .{ line, err });
             continue;
         };
@@ -265,6 +274,7 @@ pub fn findBest(
         .timeout_secs = timeout_secs,
         .stats = stats,
     };
+    errdefer if (shared.best) |*b| b.deinit(gpa);
 
     const lists = groups.values();
     const n = lists.len;
@@ -286,7 +296,9 @@ pub fn findBest(
         next += batch;
     }
 
-    return shared.best;
+    const best = shared.best;
+    shared.best = null;
+    return best;
 }
 
 test "collectGroups buckets by host" {

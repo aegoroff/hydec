@@ -108,7 +108,7 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
     }
     thread.join();
 
-    if (!tryTakeCleanup(ctx)) return error.Unexpected;
+    if (!tryTakeCleanup(ctx)) return error.FetchStateCorrupt;
 
     const err = ctx.err;
     const body = ctx.body;
@@ -116,7 +116,7 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
     destroyCtx(ctx);
 
     if (err) |e| return e;
-    return body orelse error.Unexpected;
+    return body orelse error.EmptySubscriptionBody;
 }
 
 fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {

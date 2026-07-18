@@ -115,35 +115,37 @@ fn openSocket(family: posix.sa_family_t, flags: u32) !posix.socket_t {
 }
 
 fn startConnect(sock: posix.socket_t, address: Io.net.IpAddress) !void {
-    const rc = switch (address) {
-        .ip4 => |ip4| blk: {
-            const sa = posix.sockaddr.in{
-                .port = std.mem.nativeToBig(u16, ip4.port),
-                .addr = @bitCast(ip4.bytes),
-            };
-            break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in));
-        },
-        .ip6 => |ip6| blk: {
-            const sa = posix.sockaddr.in6{
-                .port = std.mem.nativeToBig(u16, ip6.port),
-                .flowinfo = ip6.flow,
-                .addr = ip6.bytes,
-                .scope_id = ip6.interface.index,
-            };
-            break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in6));
-        },
-    };
-    switch (posix.errno(rc)) {
-        .SUCCESS => {},
-        .INTR => try startConnect(sock, address),
-        .INPROGRESS, .AGAIN => {},
-        .CONNREFUSED => return error.ConnectionRefused,
-        .NETUNREACH => return error.NetworkUnreachable,
-        .HOSTUNREACH => return error.HostUnreachable,
-        .TIMEDOUT => return error.Timeout,
-        .ADDRNOTAVAIL => return error.AddressNotAvailable,
-        .ACCES, .PERM => return error.AccessDenied,
-        else => return error.Unexpected,
+    while (true) {
+        const rc = switch (address) {
+            .ip4 => |ip4| blk: {
+                const sa = posix.sockaddr.in{
+                    .port = std.mem.nativeToBig(u16, ip4.port),
+                    .addr = @bitCast(ip4.bytes),
+                };
+                break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in));
+            },
+            .ip6 => |ip6| blk: {
+                const sa = posix.sockaddr.in6{
+                    .port = std.mem.nativeToBig(u16, ip6.port),
+                    .flowinfo = ip6.flow,
+                    .addr = ip6.bytes,
+                    .scope_id = ip6.interface.index,
+                };
+                break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in6));
+            },
+        };
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .INPROGRESS, .AGAIN => return,
+            .CONNREFUSED => return error.ConnectionRefused,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .TIMEDOUT => return error.Timeout,
+            .ADDRNOTAVAIL => return error.AddressNotAvailable,
+            .ACCES, .PERM => return error.AccessDenied,
+            else => return error.Unexpected,
+        }
     }
 }
 

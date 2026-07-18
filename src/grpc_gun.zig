@@ -96,16 +96,6 @@ fn writeLiteralHeader(out: []u8, name: []const u8, value: []const u8) error{Buff
     return i;
 }
 
-fn writeLiteralIndexedName(out: []u8, index: u8, value: []const u8) error{BufferTooSmall}!usize {
-    // Literal Header Field without Indexing — Indexed Name (0000xxxx)
-    if (index == 0 or index >= 15) return error.BufferTooSmall;
-    if (out.len < 1 + 1 + value.len) return error.BufferTooSmall;
-    out[0] = index;
-    out[1] = @intCast(value.len);
-    @memcpy(out[2..][0..value.len], value);
-    return 2 + value.len;
-}
-
 pub fn buildClientPrefaceSettings(out: []u8) error{BufferTooSmall}!usize {
     const preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     // ENABLE_PUSH=0 — required by many gRPC/gun peers
@@ -144,6 +134,24 @@ pub fn buildGunHeaders(out: []u8, service_name: []const u8, authority: []const u
     writeFrameHeader(out[0..9], @intCast(hp), 0x01, 0x04, 1);
     @memcpy(out[9..][0..hp], hpack[0..hp]);
     return 9 + hp;
+}
+
+/// True if an HTTP/2 HEADERS block starts with indexed `:status: 200` (static table index 8 → 0x88).
+/// Skips PADDED / PRIORITY framing so a mid-value 0x88 cannot false-positive.
+pub fn headersIndicateStatus200(payload: []const u8, flags: u8) bool {
+    var p = payload;
+    if ((flags & 0x08) != 0) { // PADDED
+        if (p.len < 1) return false;
+        const pad: usize = p[0];
+        p = p[1..];
+        if (p.len < pad) return false;
+        p = p[0 .. p.len - pad];
+    }
+    if ((flags & 0x20) != 0) { // PRIORITY
+        if (p.len < 5) return false;
+        p = p[5..];
+    }
+    return p.len >= 1 and p[0] == 0x88;
 }
 
 pub fn buildGunRequest(out: []u8, service_name: []const u8, authority: []const u8, vless_payload: []const u8) !usize {
@@ -220,4 +228,14 @@ test "preface starts correctly" {
     var out: [128]u8 = undefined;
     const n = try buildClientPrefaceSettings(&out);
     try std.testing.expect(std.mem.startsWith(u8, out[0..n], "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
+}
+
+test "headersIndicateStatus200 skips padding" {
+    // PADDED + indexed :status 200
+    const payload = [_]u8{ 2, 0x88, 0xaa, 0xbb };
+    try std.testing.expect(headersIndicateStatus200(&payload, 0x08));
+    // 0x88 buried in value must not match without leading indexed field
+    const noise = [_]u8{ 0x00, 0x88 };
+    try std.testing.expect(!headersIndicateStatus200(&noise, 0));
+    try std.testing.expect(headersIndicateStatus200(&[_]u8{0x88}, 0));
 }
