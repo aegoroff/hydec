@@ -60,11 +60,13 @@ fn writeVarint(out: []u8, v: usize) usize {
 
 fn readVarint(buf: []const u8) error{InvalidVarint}!struct { usize, usize } {
     var result: usize = 0;
-    var shift: u6 = 0;
+    var shift: u8 = 0;
     var i: usize = 0;
-    while (i < buf.len and i < 10) : (i += 1) {
+    while (i < buf.len) : (i += 1) {
+        if (i >= 10) return error.InvalidVarint;
         const b = buf[i];
-        result |= @as(usize, b & 0x7f) << shift;
+        if (shift >= @bitSizeOf(usize)) return error.InvalidVarint;
+        result |= @as(usize, b & 0x7f) << @intCast(shift);
         if ((b & 0x80) == 0) return .{ result, i + 1 };
         shift += 7;
     }
@@ -238,4 +240,9 @@ test "headersIndicateStatus200 skips padding" {
     const noise = [_]u8{ 0x00, 0x88 };
     try std.testing.expect(!headersIndicateStatus200(&noise, 0));
     try std.testing.expect(headersIndicateStatus200(&[_]u8{0x88}, 0));
+}
+
+test "readVarint rejects overlong continuation" {
+    const crafted = [_]u8{0xff} ** 10;
+    try std.testing.expectError(error.InvalidVarint, readVarint(&crafted));
 }

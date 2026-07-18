@@ -92,6 +92,8 @@ pub fn performUpgrade(
         if (n == 0) return error.UnexpectedEndOfStream;
         hdr_len += n;
         if (std.mem.indexOf(u8, hdr[0..hdr_len], "\r\n\r\n")) |_| break;
+    } else {
+        return error.WebSocketHeadersTooLarge;
     }
     try validateUpgradeResponse(hdr[0..hdr_len], key_b64);
 }
@@ -155,6 +157,9 @@ pub fn readBinaryFrame(reader: *Io.Reader, writer: *Io.Writer, io: Io, out: []u8
             try reader.readSliceAll(&ext);
             len = std.mem.readInt(u16, &ext, .big);
         } else if (len == 127) {
+            // Drain the 8-byte extended length so the stream stays aligned if the caller retries.
+            var ext: [8]u8 = undefined;
+            try reader.readSliceAll(&ext);
             return error.PayloadTooLarge;
         }
         var mask: [4]u8 = .{ 0, 0, 0, 0 };

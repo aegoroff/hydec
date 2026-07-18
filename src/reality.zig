@@ -33,6 +33,19 @@ fn readU24(buf: []const u8) u24 {
     return (@as(u24, buf[0]) << 16) | (@as(u24, buf[1]) << 8) | buf[2];
 }
 
+/// Post-handshake TLS 1.3 messages (typ 22). NewSessionTicket is ignorable;
+/// KeyUpdate would require traffic-secret rotation we do not keep — fail closed.
+fn rejectPostHandshakeKeyUpdate(plaintext: []const u8) !void {
+    var off: usize = 0;
+    while (off + 4 <= plaintext.len) {
+        const ht = plaintext[off];
+        const hl = readU24(plaintext[off + 1 ..][0..3]);
+        if (off + 4 + hl > plaintext.len) break;
+        if (ht == 24) return error.TlsKeyUpdateUnsupported;
+        off += 4 + hl;
+    }
+}
+
 pub fn decodePublicKey(pbk_b64: []const u8, out: *[32]u8) !void {
     // sing-box uses RawURLEncoding (no padding)
     var cleaned: [64]u8 = undefined;
@@ -254,7 +267,10 @@ const RecordConn = struct {
                     if (dest.ptr != out.ptr) @memcpy(out[0..rec.len], dest[0..rec.len]);
                     return rec.len;
                 },
-                22 => continue, // NewSessionTicket / KeyUpdate
+                22 => {
+                    try rejectPostHandshakeKeyUpdate(dest[0..rec.len]);
+                    continue; // NewSessionTicket etc.
+                },
                 20 => continue, // unexpected CCS
                 21 => return error.TlsAlert,
                 else => return error.TlsUnexpectedMessage,
@@ -550,7 +566,10 @@ pub const RealityConn = struct {
                     if (dest.ptr != out.ptr) @memcpy(out[0..rec.len], dest[0..rec.len]);
                     return rec.len;
                 },
-                22 => continue, // NewSessionTicket / KeyUpdate
+                22 => {
+                    try rejectPostHandshakeKeyUpdate(dest[0..rec.len]);
+                    continue; // NewSessionTicket etc.
+                },
                 20 => continue,
                 21 => return error.TlsAlert,
                 else => return error.TlsUnexpectedMessage,

@@ -60,6 +60,8 @@ const AeadCtx = struct {
     key: [32]u8,
     nonce: [12]u8 = [_]u8{0} ** 12,
 
+    /// SIP004 / shadowsocks.org AEAD: increment as unsigned little-endian (byte 0 first).
+    /// Matches libsodium `sodium_increment` used by shadowsocks-libev, rust, go, sing-box.
     fn bumpNonce(self: *AeadCtx) void {
         var i: usize = 0;
         while (i < self.nonce.len) : (i += 1) {
@@ -342,6 +344,20 @@ test "aead seal/open chunk roundtrip" {
     var out: [64]u8 = undefined;
     const got = try openChunk(&open_ctx, sealed[0..n], &out);
     try std.testing.expectEqualStrings(plain, out[0..got]);
+}
+
+test "bumpNonce is little-endian per SIP004" {
+    var ctx: AeadCtx = .{
+        .method = .aes_128_gcm,
+        .key = [_]u8{0} ** 32,
+    };
+    ctx.bumpNonce();
+    try std.testing.expectEqual(@as(u8, 1), ctx.nonce[0]);
+    try std.testing.expectEqual(@as(u8, 0), ctx.nonce[11]);
+    ctx.nonce[0] = 0xff;
+    ctx.bumpNonce();
+    try std.testing.expectEqual(@as(u8, 0), ctx.nonce[0]);
+    try std.testing.expectEqual(@as(u8, 1), ctx.nonce[1]);
 }
 
 test "aead open rejects bad tag" {
