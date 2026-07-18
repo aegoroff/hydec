@@ -660,16 +660,12 @@ pub fn connect(
     const server_share = try parseServerHelloX25519(sh_body);
     const shared = try X25519.scalarmult(kp.secret_key, server_share);
 
-    // Hash(ClientHello || ServerHello) — recompute explicitly
-    var hello_hasher = Sha256.init(.{});
-    hello_hasher.update(hello_raw[0..hello_len]);
-    hello_hasher.update(sh_buf[0..sh_rec.len]);
+    // Snapshot transcript for hello_hash; keep rc.transcript for later HS messages.
     var hello_hash: [32]u8 = undefined;
-    hello_hasher.final(&hello_hash);
-    // Keep running transcript in sync
-    rc.transcript = Sha256.init(.{});
-    rc.transcript.update(hello_raw[0..hello_len]);
-    rc.transcript.update(sh_buf[0..sh_rec.len]);
+    {
+        var hello_hasher = rc.transcript;
+        hello_hasher.final(&hello_hash);
+    }
 
     var client_fin_key: [32]u8 = undefined;
     var master: [32]u8 = undefined;
