@@ -895,30 +895,34 @@ pub fn probeVless(
         }
         const first_ms = netutil.elapsedMs(first_start, io);
 
+        // Second request is raw: client already sent Vision PaddingEnd on the first write.
+        // Downlink may still be mid-Vision (Continue / NeedMore) — drain until we get
+        // application bytes, same as SS/Trojan needing any non-empty second read.
         const steady_start = netutil.monoNow(io);
         rc.writeApp(util.probe_http) catch |err| {
             return if (util.isPeerClosed(err)) first_ms else err;
         };
-        const n = rc.readApp(&resp) catch |err| {
-            return if (util.isPeerClosed(err)) first_ms else err;
-        };
-        if (n == 0) return first_ms;
-        if (stream_len + n > stream.len) return error.BufferTooSmall;
-        @memcpy(stream[stream_len..][0..n], resp[0..n]);
-        stream_len += n;
         const http_before = http_len;
-        try drainVlessVisionStream(
-            &stream,
-            &stream_len,
-            &http_buf,
-            &http_len,
-            &uuid_bytes,
-            &stripped_header,
-            &vision_raw,
-            &vision_state,
-        );
-        if (http_len > http_before) return netutil.elapsedMs(steady_start, io);
-        return first_ms;
+        while (http_len == http_before) {
+            const n = rc.readApp(&resp) catch |err| {
+                return if (util.isPeerClosed(err)) first_ms else err;
+            };
+            if (n == 0) return first_ms;
+            if (stream_len + n > stream.len) return error.BufferTooSmall;
+            @memcpy(stream[stream_len..][0..n], resp[0..n]);
+            stream_len += n;
+            try drainVlessVisionStream(
+                &stream,
+                &stream_len,
+                &http_buf,
+                &http_len,
+                &uuid_bytes,
+                &stripped_header,
+                &vision_raw,
+                &vision_state,
+            );
+        }
+        return netutil.elapsedMs(steady_start, io);
     }
 }
 
@@ -1170,7 +1174,13 @@ test "drainVlessVisionStream incomplete Vision does not grow http" {
     try std.testing.expect(!vision_raw);
     try std.testing.expectEqual(@as(usize, 0), http_len);
     try std.testing.expect(stream_len > 0);
-    _ = vn;
+
+    // Steady-style: feed the rest; http should grow only once the frame is complete.
+    @memcpy(stream[stream_len..][0 .. vn - (partial - 2)], vision[partial - 2 .. vn]);
+    stream_len += vn - (partial - 2);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try std.testing.expect(http_len > 0);
+    try std.testing.expect(vision_raw);
 }
 
 test "parseServerHelloX25519 accepts key_share" {
