@@ -119,33 +119,18 @@ const AeadCtx = struct {
 /// Shadowsocks AEAD max payload length (SIP004).
 const max_chunk_payload: u16 = 0x3FFF;
 
-fn sealChunk(ctx: *AeadCtx, out: []u8, plaintext: []const u8) error{BufferTooSmall}!usize {
+fn sealChunk(ctx: *AeadCtx, out: []u8, plaintext: []const u8) error{ BufferTooSmall, InvalidSsChunk }!usize {
     // [len_ct(2)][len_tag(16)][payload_ct][payload_tag(16)]
+    if (plaintext.len == 0 or plaintext.len > max_chunk_payload) return error.InvalidSsChunk;
     const need = 2 + 16 + plaintext.len + 16;
     if (out.len < need) return error.BufferTooSmall;
 
     var len_be: [2]u8 = undefined;
     std.mem.writeInt(u16, &len_be, @intCast(plaintext.len), .big);
 
-    var len_ct: [2]u8 = undefined;
-    var len_tag: [16]u8 = undefined;
-    ctx.seal(&len_ct, &len_tag, &len_be);
-
-    var payload_ct: [512]u8 = undefined;
-    if (plaintext.len > payload_ct.len) return error.BufferTooSmall;
-    var payload_tag: [16]u8 = undefined;
-    ctx.seal(payload_ct[0..plaintext.len], &payload_tag, plaintext);
-
-    var off: usize = 0;
-    @memcpy(out[off..][0..2], &len_ct);
-    off += 2;
-    @memcpy(out[off..][0..16], &len_tag);
-    off += 16;
-    @memcpy(out[off..][0..plaintext.len], payload_ct[0..plaintext.len]);
-    off += plaintext.len;
-    @memcpy(out[off..][0..16], &payload_tag);
-    off += 16;
-    return off;
+    ctx.seal(out[0..2], out[2..][0..16], &len_be);
+    ctx.seal(out[18..][0..plaintext.len], out[18 + plaintext.len ..][0..16], plaintext);
+    return need;
 }
 
 /// Decrypt length header and validate SIP004 payload size against `out_capacity`.
@@ -333,6 +318,26 @@ test "aead seal/open chunk roundtrip" {
     var out: [64]u8 = undefined;
     const got = try openChunk(&open_ctx, sealed[0..n], &out);
     try std.testing.expectEqualStrings(plain, out[0..got]);
+}
+
+test "aead sealChunk accepts payload larger than 512" {
+    var seal_ctx: AeadCtx = .{
+        .method = .chacha20_ietf_poly1305,
+        .key = [_]u8{0x33} ** 32,
+    };
+    var plain: [600]u8 = undefined;
+    @memset(&plain, 0xab);
+    var sealed: [2 + 16 + 600 + 16]u8 = undefined;
+    const n = try sealChunk(&seal_ctx, &sealed, &plain);
+
+    var open_ctx: AeadCtx = .{
+        .method = .chacha20_ietf_poly1305,
+        .key = [_]u8{0x33} ** 32,
+    };
+    var out: [600]u8 = undefined;
+    const got = try openChunk(&open_ctx, sealed[0..n], &out);
+    try std.testing.expectEqual(@as(usize, 600), got);
+    try std.testing.expectEqualSlices(u8, &plain, out[0..got]);
 }
 
 test "bumpNonce is little-endian per SIP004" {
