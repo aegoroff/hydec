@@ -156,30 +156,6 @@ pub fn headersIndicateStatus200(payload: []const u8, flags: u8) bool {
     return p.len >= 1 and p[0] == 0x88;
 }
 
-pub fn buildGunRequest(out: []u8, service_name: []const u8, authority: []const u8, vless_payload: []const u8) !usize {
-    var n: usize = 0;
-    n += try buildGunHeaders(out[n..], service_name, authority);
-    var hunk: [320]u8 = undefined;
-    const hunk_len = try wrapHunk(&hunk, vless_payload);
-    var grpc_msg: [384]u8 = undefined;
-    const glen = try wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
-    n += try buildDataFrame(out[n..], 1, grpc_msg[0..glen], false);
-    return n;
-}
-
-/// Build a single application-data blob: preface+SETTINGS+HEADERS+DATA (gun).
-pub fn buildGunClientFlight(
-    out: []u8,
-    service_name: []const u8,
-    authority: []const u8,
-    vless_payload: []const u8,
-) !usize {
-    var n: usize = 0;
-    n += try buildClientPrefaceSettings(out[n..]);
-    n += try buildGunRequest(out[n..], service_name, authority, vless_payload);
-    return n;
-}
-
 pub fn buildDataFrame(out: []u8, stream_id: u31, payload: []const u8, end_stream: bool) error{BufferTooSmall}!usize {
     if (out.len < 9 + payload.len) return error.BufferTooSmall;
     const flags: u8 = if (end_stream) 0x01 else 0;

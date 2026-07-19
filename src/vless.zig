@@ -68,13 +68,6 @@ pub fn responseHeaderLen(buf: []const u8) error{ NeedMore, InvalidVlessResponse 
     return total;
 }
 
-/// Success requires a valid response header plus ≥1 byte of tunneled payload
-/// (parity with Trojan TCP and Shadowsocks AEAD open).
-pub fn requireTunneledByte(buf: []const u8) error{ NeedMore, InvalidVlessResponse, EmptyTunnelResponse }!void {
-    const hdr = try responseHeaderLen(buf);
-    if (buf.len <= hdr) return error.EmptyTunnelResponse;
-}
-
 const probe_http = util.probe_http;
 
 /// Encode a VLESS probe: TCP CONNECT to probe host:80 + HTTP GET (matches ss probe).
@@ -141,10 +134,4 @@ test "encodeRequestDomain with flow addon" {
     try std.testing.expectEqual(@as(usize, 1 + 16 + 1 + (1 + 1 + flow.len) + 1 + 2 + 1 + 1 + 5), n);
     try std.testing.expectEqual(@as(u8, @intCast(1 + 1 + flow.len)), buf[17]);
     try std.testing.expectEqual(@as(u8, 0x0a), buf[18]);
-}
-
-test "requireTunneledByte needs payload after header" {
-    try std.testing.expectError(error.EmptyTunnelResponse, requireTunneledByte(&[_]u8{ 0, 0 }));
-    try requireTunneledByte(&[_]u8{ 0, 0, 'H' });
-    try std.testing.expectError(error.NeedMore, requireTunneledByte(&[_]u8{0}));
 }

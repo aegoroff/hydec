@@ -253,31 +253,6 @@ const RecordConn = struct {
             return .{ .typ = content_type, .len = length };
         }
     }
-
-    /// Skip post-handshake messages (NewSessionTicket, KeyUpdate) until application_data.
-    pub fn readApp(self: *RecordConn, out: []u8) !usize {
-        var scratch: [16640]u8 = undefined;
-        var attempts: usize = 0;
-        while (attempts < 16) : (attempts += 1) {
-            const dest = if (out.len >= scratch.len) out else scratch[0..];
-            const rec = try self.readRecord(dest, false);
-            switch (rec.typ) {
-                23 => {
-                    if (rec.len > out.len) return error.BufferTooSmall;
-                    if (dest.ptr != out.ptr) @memcpy(out[0..rec.len], dest[0..rec.len]);
-                    return rec.len;
-                },
-                22 => {
-                    try rejectPostHandshakeKeyUpdate(dest[0..rec.len]);
-                    continue; // NewSessionTicket etc.
-                },
-                20 => continue, // unexpected CCS
-                21 => return error.TlsAlert,
-                else => return error.TlsUnexpectedMessage,
-            }
-        }
-        return error.TlsUnexpectedMessage;
-    }
 };
 
 fn hkdfExpandLabel(comptime len: usize, secret: *const [32]u8, label: []const u8, context: []const u8) [len]u8 {

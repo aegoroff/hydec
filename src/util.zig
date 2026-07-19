@@ -103,9 +103,6 @@ pub fn splitHostPortOrDefault(address: []const u8, default_port: u16) error{Inva
     return splitHostPort(address);
 }
 
-pub const probe_ip = [_]u8{ 1, 1, 1, 1 };
-pub const probe_port: u16 = 443;
-
 /// SOCKS5 ATYP domain for a fixed well-known host (reachable from most VPS).
 pub const probe_domain = "cp.cloudflare.com";
 pub const probe_http_port: u16 = 80;
@@ -179,13 +176,6 @@ pub fn isPeerClosed(err: anyerror) bool {
         => true,
         else => false,
     };
-}
-
-pub fn writeSocksAddrIp4(buf: []u8, ip: *const [4]u8, port: u16) usize {
-    buf[0] = 0x01; // ATYP IPv4
-    @memcpy(buf[1..5], ip);
-    std.mem.writeInt(u16, buf[5..7], port, .big);
-    return 7;
 }
 
 pub fn writeSocksAddrDomain(buf: []u8, domain: []const u8, port: u16) error{BufferTooSmall}!usize {
