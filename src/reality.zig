@@ -567,11 +567,18 @@ pub fn connect(
     // sealSessionId already updated hello_raw session id bytes.
 
     const dial_start = netutil.monoNow(io);
+    // Absolute read deadline from dial_start so poll matches DeadlineShutdown
+    // (remainingTimeoutNs below). Post-connect deadlineNs would be later by
+    // dial_duration and could allow ~2× timeout if the watchdog were disarmed.
+    const read_deadline_ns: ?i128 = if (timeout_secs == 0)
+        null
+    else
+        dial_start + @as(i128, timeout_secs) * std.time.ns_per_s;
     rc.* = .{
         .stream = try netutil.connectHostPort(io, host, port, timeout_secs),
         .io = io,
         .open = true,
-        .read_deadline_ns = netutil.deadlineNs(io, timeout_secs),
+        .read_deadline_ns = read_deadline_ns,
     };
     errdefer rc.deinit();
 
