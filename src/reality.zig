@@ -1120,9 +1120,22 @@ fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u
         if (http_len >= http_buf.len) return error.BufferTooSmall;
         const n = tls_client.reader.readSliceShort(http_buf[http_len..]) catch |err| {
             if (pipe.err) |e| return e;
+            // Same policy as SS/Trojan: only HTTP/1.0 close-delimited may finish on peer-close.
+            if (util.isPeerClosed(err) and util.httpCloseDelimitedReady(http_buf[0..http_len])) {
+                if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag))
+                    return error.ProbeResponseMismatch;
+                return http_len;
+            }
             return err;
         };
-        if (n == 0) break;
+        if (n == 0) {
+            if (util.httpCloseDelimitedReady(http_buf[0..http_len])) {
+                if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag))
+                    return error.ProbeResponseMismatch;
+                return http_len;
+            }
+            return error.EndOfStream;
+        }
         http_len += n;
         if (util.httpResponseTotalLen(http_buf[0..http_len]) != null and
             !util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag))
@@ -1130,9 +1143,6 @@ fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u
             return error.ProbeResponseMismatch;
         }
     }
-    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag))
-        return error.ProbeResponseMismatch;
-    return http_len;
 }
 
 /// Move bytes from `stream` into `http` after stripping the VLESS response header

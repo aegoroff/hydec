@@ -177,7 +177,7 @@ pub fn probe(
         if (transport_ws) {
             const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
                 const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
                 return e;
             };
             if (http_len + n > http_buf.len) return error.BufferTooSmall;
@@ -186,12 +186,12 @@ pub fn probe(
         } else {
             const n = tls_reader.readSliceShort(frame_buf) catch |err| {
                 const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
                 return e;
             };
             if (n == 0) {
                 const e = netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
-                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
                 return e;
             }
             if (http_len + n > http_buf.len) return error.BufferTooSmall;
@@ -221,7 +221,7 @@ pub fn probe(
         if (transport_ws) {
             const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
                 const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
                 return e;
             };
             if (http_len + n > http_buf.len) return error.BufferTooSmall;
@@ -230,12 +230,12 @@ pub fn probe(
         } else {
             const n = tls_reader.readSliceShort(frame_buf) catch |err| {
                 const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
                 return e;
             };
             if (n == 0) {
                 const e = netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
-                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
                 return e;
             }
             if (http_len + n > http_buf.len) return error.BufferTooSmall;

@@ -162,10 +162,30 @@ pub fn httpHeadersComplete(buf: []const u8) bool {
     return std.mem.indexOf(u8, buf, "\r\n\r\n") != null;
 }
 
+/// True when headers are complete and the body is HTTP/1.0 close-delimited
+/// (no `Content-Length` / `Transfer-Encoding: chunked`). Peer close then ends the response.
+/// Do not use bare `httpHeadersComplete` for that — truncated CL/chunked bodies must fail.
+pub fn httpCloseDelimitedReady(buf: []const u8) bool {
+    const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return false;
+    const headers = buf[0..sep];
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    const status = lines.next() orelse return false;
+    if (!std.mem.startsWith(u8, status, "HTTP/1.0")) return false;
+    while (lines.next()) |line| {
+        if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
+            const v = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
+            if (std.ascii.indexOfIgnoreCase(v, "chunked") != null) return false;
+        } else if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// If `buf` holds a complete HTTP/1.x response, return its total size; otherwise `null`.
 /// Supports `Content-Length`, `Transfer-Encoding: chunked`, and HTTP/1.1 empty body
 /// when neither is present (RFC 7230 §3.3.3). HTTP/1.0 without framing stays
-/// incomplete until the peer closes (see warmup loops + `isPeerClosed`).
+/// incomplete until the peer closes (see warmup loops + `httpCloseDelimitedReady`).
 pub fn httpResponseTotalLen(buf: []const u8) ?usize {
     const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
     const headers = buf[0..sep];
@@ -348,6 +368,20 @@ test "httpResponseTotalLen HTTP/1.1 empty body without framing" {
     // HTTP/1.0 without CL/chunked stays open until peer close.
     try std.testing.expect(httpResponseTotalLen("HTTP/1.0 200 OK\r\n\r\n") == null);
     try std.testing.expect(httpHeadersComplete("HTTP/1.0 200 OK\r\n\r\n"));
+}
+
+test "httpCloseDelimitedReady only HTTP/1.0 without framing" {
+    try std.testing.expect(httpCloseDelimitedReady("HTTP/1.0 200 OK\r\n\r\nbody"));
+    try std.testing.expect(httpCloseDelimitedReady("HTTP/1.0 200 OK\r\nServer: x\r\n\r\n"));
+    // Incomplete headers.
+    try std.testing.expect(!httpCloseDelimitedReady("HTTP/1.0 200 OK\r\n"));
+    // HTTP/1.1 empty body is length-complete via httpResponseTotalLen, not close-delimited.
+    try std.testing.expect(!httpCloseDelimitedReady("HTTP/1.1 200 OK\r\n\r\n"));
+    // Framed bodies must not treat peer-close as completion while still short.
+    try std.testing.expect(!httpCloseDelimitedReady("HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nab"));
+    try std.testing.expect(!httpCloseDelimitedReady(
+        "HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+    ));
 }
 
 test "httpResponseTotalLen chunked body" {

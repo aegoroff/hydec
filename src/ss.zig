@@ -265,8 +265,8 @@ pub fn probe(
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-            // HTTP/1.0 close-delimited: headers + peer close completes the response.
-            if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+            // HTTP/1.0 close-delimited only — truncated CL/chunked must fail.
+            if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
             return e;
         };
         if (http_len + n > http_buf.len) return error.BufferTooSmall;
@@ -290,8 +290,7 @@ pub fn probe(
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-            // HTTP/1.0 close-delimited steady body.
-            if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+            if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
             return e;
         };
         if (http_len + n > http_buf.len) return error.BufferTooSmall;
