@@ -73,9 +73,10 @@ build-all:
     just arch=aarch64 os=macos abi=none ver={{ ver }} optimize={{ optimize }} cpu=apple_m1 release
     just arch=x86_64 os=windows abi=gnu ver={{ ver }} optimize={{ optimize }} cpu=core2 release
 
-# OpenWrt 25.12+ unsigned .apk (MVP: x86_64 + aarch64_generic)
+# OpenWrt 25.12+ unsigned .apk (MVP: x86_64 + both common aarch64 package arches)
 # Sanitizes ver= to X.Y.Z-rN (e.g. 0.1.0-dev -> 0.1.0-r1); refuses non-sanitizable.
 # Example: just ver=0.1.0 openwrt-apk   → hydec-0.1.0-r1-*.apk
+# aarch64: same musl binary, two OpenWrt package arches (see /etc/apk/arch on device).
 zig_arch := "x86_64"
 openwrt_arch := "x86_64"
 zig_cpu := if zig_arch == "x86_64" { "core2" } else { "" }
@@ -84,6 +85,7 @@ openwrt-apk:
     #!/usr/bin/env bash
     set -euo pipefail
     just ver={{ ver }} optimize={{ optimize }} zig_arch=x86_64 openwrt_arch=x86_64 openwrt-apk-one
+    just ver={{ ver }} optimize={{ optimize }} zig_arch=aarch64 openwrt_arch=aarch64_cortex-a53 openwrt-apk-one
     just ver={{ ver }} optimize={{ optimize }} zig_arch=aarch64 openwrt_arch=aarch64_generic openwrt-apk-one
 
 openwrt-apk-one:
