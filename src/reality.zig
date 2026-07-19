@@ -724,6 +724,18 @@ fn appendStripVlessHeader(buf: []u8, len: *usize, chunk: []const u8, stripped: *
     stripped.* = true;
 }
 
+/// Feed one gRPC/VLESS payload chunk into the HTTP probe buffer.
+/// Returns true when a complete Cloudflare `/cdn-cgi/trace` response is present.
+/// When `require_uag` is set, the body must also echo that User-Agent (`uag=`).
+fn grpcProbeHttpReady(buf: []u8, len: *usize, chunk: []const u8, stripped: *bool, require_uag: ?[]const u8) !bool {
+    try appendStripVlessHeader(buf, len, chunk, stripped);
+    if (util.httpResponseTotalLen(buf[0..len.*]) == null) return false;
+    if (require_uag) |uag| {
+        if (!util.looksLikeCloudflareTraceUag(buf[0..len.*], uag)) return error.ProbeResponseMismatch;
+    } else if (!util.looksLikeCloudflareTrace(buf[0..len.*])) return error.ProbeResponseMismatch;
+    return true;
+}
+
 /// Probe VLESS over REALITY (TCP Vision or gRPC gun).
 /// Warmup proves the tunnel; returned latency is the second (steady-state) request.
 pub fn probeVless(
@@ -818,21 +830,26 @@ pub fn probeVless(
                 } else if (ftyp == 0x00 and frame_len >= 5 and request_sent) {
                     const msg = try grpc_gun.vlessFromGrpcData(payload);
                     if (!warmup_done) {
-                        // Accumulate into http_buf and strip VLESS header in-place (NeedMore-safe).
-                        try appendStripVlessHeader(&http_buf, &http_len, msg, &stripped_vless);
-                        if (util.httpResponseTotalLen(http_buf[0..http_len]) != null) {
-                            if (!util.looksLikeCloudflareTrace(http_buf[0..http_len])) return error.ProbeResponseMismatch;
+                        if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_warmup)) {
                             warmup_done = true;
+                            // Fresh buffer for the keep-alive request; VLESS header already stripped.
+                            http_len = 0;
                             var hunk: [256]u8 = undefined;
-                            const hunk_len = try grpc_gun.wrapHunk(&hunk, util.probe_http);
+                            const hunk_len = try grpc_gun.wrapHunk(&hunk, util.probe_http_steady);
                             var grpc_msg: [320]u8 = undefined;
                             const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
                             var data_frame: [384]u8 = undefined;
                             const dlen = try grpc_gun.buildDataFrame(&data_frame, 1, grpc_msg[0..glen], false);
                             try rc.writeApp(data_frame[0..dlen]);
                             steady_start = netutil.monoNow(io);
+                            // Drop the rest of this gather batch — any further frames were already
+                            // in-flight from the warmup response. Treating them as the keep-alive
+                            // reply false-OKs peers that never answer the second request.
+                            gather_len = 0;
+                            off = 0;
+                            break;
                         }
-                    } else if (msg.len > 0) {
+                    } else if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_steady)) {
                         return netutil.elapsedMs(steady_start.?, io);
                     }
                 } else if (ftyp == 0x03) {
@@ -1210,6 +1227,48 @@ test "appendStripVlessHeader handles NeedMore then body" {
     try appendStripVlessHeader(&buf, &len, "\x00HTTP/1.1 200 OK\r\n", &stripped);
     try std.testing.expect(stripped);
     try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", buf[0..len]);
+}
+
+test "grpcProbeHttpReady rejects non-Cloudflare HTTP" {
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    var stripped = false;
+    const bad = "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expectError(error.ProbeResponseMismatch, grpcProbeHttpReady(&buf, &len, bad, &stripped, null));
+}
+
+test "grpcProbeHttpReady accepts Cloudflare trace" {
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    var stripped = false;
+    const body = "fl=1\nh=cp.cloudflare.com\nvisit_scheme=http\nuag=hydec-warmup\n";
+    var chunk: [128]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(chunk[0..], "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body.len});
+    @memcpy(chunk[prefix.len..][0..body.len], body);
+    try std.testing.expect(try grpcProbeHttpReady(&buf, &len, chunk[0 .. prefix.len + body.len], &stripped, util.probe_ua_warmup));
+}
+
+test "grpcProbeHttpReady rejects wrong uag on steady" {
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    var stripped = false;
+    // Duplicate warmup body must not satisfy the steady-state UA check.
+    const body = "fl=1\nvisit_scheme=http\nuag=hydec-warmup\n";
+    var chunk: [128]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(chunk[0..], "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body.len});
+    @memcpy(chunk[prefix.len..][0..body.len], body);
+    try std.testing.expectError(
+        error.ProbeResponseMismatch,
+        grpcProbeHttpReady(&buf, &len, chunk[0 .. prefix.len + body.len], &stripped, util.probe_ua_steady),
+    );
+}
+
+test "grpcProbeHttpReady needs more until complete" {
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    var stripped = false;
+    try std.testing.expect(!(try grpcProbeHttpReady(&buf, &len, "\x00\x00HTTP/1.1 200 OK\r\n", &stripped, null)));
+    try std.testing.expect(stripped);
 }
 
 test "appendStripVlessHeader large first chunk" {

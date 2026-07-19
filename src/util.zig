@@ -144,9 +144,17 @@ pub const probe_domain = "cp.cloudflare.com";
 pub const probe_http_port: u16 = 80;
 pub const probe_tls_port: u16 = 443;
 
+/// Distinct UAs so Cloudflare `/cdn-cgi/trace` echoes them in `uag=` — proves the
+/// steady-state reply is not a duplicate of the warmup response.
+pub const probe_ua_warmup = "hydec-warmup";
+pub const probe_ua_steady = "hydec-steady";
+
 /// Keep-alive so the tunnel stays open for a second (steady-state) request.
 pub const probe_http =
-    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nConnection: keep-alive\r\n\r\n";
+    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nUser-Agent: " ++ probe_ua_warmup ++ "\r\nConnection: keep-alive\r\n\r\n";
+
+pub const probe_http_steady =
+    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nUser-Agent: " ++ probe_ua_steady ++ "\r\nConnection: keep-alive\r\n\r\n";
 
 /// True if `buf` contains a complete HTTP header block (`\r\n\r\n`).
 pub fn httpHeadersComplete(buf: []const u8) bool {
@@ -218,6 +226,14 @@ pub fn looksLikeCloudflareTrace(buf: []const u8) bool {
     return std.mem.indexOf(u8, buf, "visit_scheme=") != null;
 }
 
+/// Like `looksLikeCloudflareTrace`, but also requires the echoed `uag=` line.
+pub fn looksLikeCloudflareTraceUag(buf: []const u8, uag: []const u8) bool {
+    if (!looksLikeCloudflareTrace(buf)) return false;
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "uag={s}", .{uag}) catch return false;
+    return std.mem.indexOf(u8, buf, needle) != null;
+}
+
 /// True when the peer closed the tunnel (keep-alive second request often hits this).
 pub fn isPeerClosed(err: anyerror) bool {
     return switch (err) {
@@ -247,6 +263,13 @@ test "looksLikeCloudflareTrace" {
     try std.testing.expect(looksLikeCloudflareTrace("fl=1\nh=cp.cloudflare.com\nvisit_scheme=http\n"));
     try std.testing.expect(!looksLikeCloudflareTrace("HTTP/1.1 400 Bad Request\r\n\r\n"));
     try std.testing.expect(!looksLikeCloudflareTrace("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
+}
+
+test "looksLikeCloudflareTraceUag matches echoed UA" {
+    const body = "fl=1\nvisit_scheme=http\nuag=hydec-steady\n";
+    try std.testing.expect(looksLikeCloudflareTraceUag(body, probe_ua_steady));
+    try std.testing.expect(!looksLikeCloudflareTraceUag(body, probe_ua_warmup));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("fl=1\nvisit_scheme=http\nuag=curl\n", probe_ua_steady));
 }
 
 test "urlDecodeStrict keeps plus" {
