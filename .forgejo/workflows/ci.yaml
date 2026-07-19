@@ -116,7 +116,7 @@ jobs:
           while IFS= read -r -d '' f; do
             arch="$(basename "$(dirname "$f")")"
             base="$(basename "$f" .apk)"
-            mv -v "$f" "release/${base}.${arch}.apk"
+            mv -v "$f" "release/${base}-${arch}.apk"
           done < <(find release -type f -name '*.apk' -print0)
           ls -la release/
 
