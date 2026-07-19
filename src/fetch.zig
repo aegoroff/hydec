@@ -101,13 +101,12 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
                 thread.join();
                 return takeResultAfterAbandon(ctx);
             }
-            // Hand cleanup to the worker, then recheck: it may have finished
-            // between the done check and this flag.
+            // Hand cleanup to the worker and detach. Do not re-read ctx after
+            // this store: the worker may destroy ctx as soon as it sees the flag
+            // (UAF if we join/takeResultAfterAbandon on freed memory). Rare
+            // leak if the worker finished between the grace check and this
+            // store without seeing the flag — preferred over UAF.
             ctx.worker_owns_cleanup.store(true, .release);
-            if (ctx.done.load(.acquire)) {
-                thread.join();
-                return takeResultAfterAbandon(ctx);
-            }
             // std.http has no cancel; worker destroys FetchCtx when it exits.
             thread.detach();
             return error.Timeout;
