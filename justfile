@@ -74,7 +74,8 @@ build-all:
     just arch=x86_64 os=windows abi=gnu ver={{ ver }} optimize={{ optimize }} cpu=core2 release
 
 # OpenWrt 25.12+ unsigned .apk (MVP: x86_64 + aarch64_generic)
-# Example: just ver=0.1.0 openwrt-apk
+# Sanitizes ver= to X.Y.Z-rN (e.g. 0.1.0-dev -> 0.1.0-r1); refuses non-sanitizable.
+# Example: just ver=0.1.0 openwrt-apk   → hydec-0.1.0-r1-*.apk
 zig_arch := "x86_64"
 openwrt_arch := "x86_64"
 zig_cpu := if zig_arch == "x86_64" { "core2" } else { "" }
@@ -88,6 +89,7 @@ openwrt-apk:
 openwrt-apk-one:
     #!/usr/bin/env bash
     set -euo pipefail
+    apk_ver="$(./packaging/openwrt-apk/build-apk.sh --sanitize-version "{{ ver }}")"
     cpu_args=()
     if [[ -n "{{ zig_cpu }}" ]]; then
       cpu_args=(-Dcpu={{ zig_cpu }})
@@ -96,10 +98,10 @@ openwrt-apk-one:
       -Doptimize={{ optimize }} \
       "${cpu_args[@]}" \
       -Dtarget={{ zig_arch }}-linux-musl \
-      -Dversion={{ ver }} \
+      -Dversion="$apk_ver" \
       --summary all \
       --prefix-exe-dir bin-{{ zig_arch }}-linux-musl
     ./packaging/openwrt-apk/build-apk.sh \
       --bin zig-out/bin-{{ zig_arch }}-linux-musl/hydec \
       --arch {{ openwrt_arch }} \
-      --version {{ ver }}
+      --version "$apk_ver"

@@ -16,16 +16,29 @@ URL="${URL:-https://git.egoroff.spb.ru/egr/hydec}"
 
 usage() {
   cat <<'EOF'
-Usage: build-apk.sh --bin PATH --arch ARCH --version VERSION [options]
+Usage:
+  build-apk.sh --bin PATH --arch ARCH --version VERSION [options]
+  build-apk.sh --sanitize-version VERSION
 
-Required:
+Any --version is accepted if it can be rewritten to X.Y.Z-rN; only that
+sanitized form is compiled into the binary and written into the .apk.
+Inputs that cannot become -rN are rejected (no _git* packages).
+
+  0.1.0-dev  -> 0.1.0-r1
+  0.1.0      -> 0.1.0-r1
+  0.1.0-r2   -> 0.1.0-r2 (unchanged)
+  weird-tag  -> error (do not build)
+
+Required (package mode):
   --bin PATH         Path to stripped hydec binary (static musl)
   --arch ARCH        OpenWrt package arch (e.g. x86_64, aarch64_generic)
-  --version VERSION  APK version (e.g. 0.1.0-r1). Use -rN release suffix.
+  --version VERSION  Input version (sanitized before packaging)
 
 Options:
   --out DIR          Output directory (default: zig-out/apk)
   --name NAME        Package name (default: hydec)
+  --sanitize-version VERSION
+                     Print sanitized apk version and exit
   -h, --help         Show this help
 
 Requires: apk-tools 3.x (apk mkpkg), fakeroot
@@ -34,7 +47,7 @@ Example:
   ./packaging/openwrt-apk/build-apk.sh \
     --bin zig-out/bin-x86_64-linux-musl/hydec \
     --arch x86_64 \
-    --version 0.1.0-r1
+    --version 0.1.0
 EOF
 }
 
@@ -43,27 +56,26 @@ die() {
   exit 1
 }
 
-# Map hydec -Dversion strings to apk-tools-valid versions.
-# 0.1.0-dev -> 0.1.0_git0; 0.1.0 -> 0.1.0-r1; already -rN / _gitN kept.
+# Map hydec version strings to apk-valid OpenWrt release form (X.Y.Z-rN only).
+# Never emits _git*; if the input cannot become -rN, fail (do not package).
 sanitize_apk_version() {
   local v="$1"
+  if [[ -z "$v" ]]; then
+    die "empty version"
+  fi
+  # Already release-shaped.
   if [[ "$v" =~ ^[0-9]+(\.[0-9]+)*-r[0-9]+$ ]]; then
     printf '%s\n' "$v"
     return
   fi
-  if [[ "$v" =~ ^[0-9]+(\.[0-9]+)*_git[0-9]+$ ]]; then
-    printf '%s\n' "$v"
-    return
-  fi
-  if [[ "$v" == *-dev ]]; then
-    printf '%s_git0\n' "${v%-dev}"
-    return
-  fi
+  # Strip -dev / _gitN noise, then require a plain numeric version.
+  v="${v%-dev}"
+  v="${v%%_git*}"
   if [[ "$v" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
     printf '%s-r1\n' "$v"
     return
   fi
-  die "version '$v' is not apk-valid; use e.g. 0.1.0-r1 or 0.1.0_git0"
+  die "version '$1' cannot be sanitized to X.Y.Z-rN (refusing to build)"
 }
 
 resolve_apk() {
@@ -78,6 +90,12 @@ resolve_apk() {
   fi
   command -v "$bin"
 }
+
+if [[ "${1:-}" == "--sanitize-version" ]]; then
+  [[ -n "${2:-}" ]] || die "--sanitize-version requires a VERSION"
+  sanitize_apk_version "$2"
+  exit 0
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -100,6 +118,9 @@ while [[ $# -gt 0 ]]; do
     --name)
       PKG_NAME="${2:-}"
       shift 2
+      ;;
+    --sanitize-version)
+      die "--sanitize-version must be the first argument"
       ;;
     -h | --help)
       usage

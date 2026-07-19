@@ -10,6 +10,15 @@ SDK-free packaging: cross-compile static musl `hydec`, wrap with `apk mkpkg`.
 
 ## Build
 
+Any `ver=` is sanitized to `X.Y.Z-rN` before compile/package. Only that form
+is shipped. `_git*` is never produced; unsanitizable inputs fail the build.
+
+| Input `ver=` | Artifact version |
+|--------------|------------------|
+| `0.1.0` | `0.1.0-r1` |
+| `0.1.0-dev` | `0.1.0-r1` |
+| `0.1.0-r2` | `0.1.0-r2` (unchanged) |
+
 ```bash
 # both MVP arches → zig-out/apk/
 just ver=0.1.0 openwrt-apk
