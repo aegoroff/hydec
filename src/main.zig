@@ -124,7 +124,7 @@ fn runPing(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     };
     defer proxy.deinit(gpa);
 
-    const latency = probe.probeOne(gpa, io, proxy, opts.timeout_secs) catch |err| {
+    const latency = probe.probeAverage(gpa, io, proxy, opts.timeout_secs) catch |err| {
         if (proxy.name) |n| {
             std.log.warn("FAIL: {s} ({s}): {s} ({})", .{ n, proxy.host, probe.failHint(err), err });
         } else {

@@ -54,6 +54,9 @@ const Shared = struct {
     }
 };
 
+/// How many successful probes are required for `ping` / `best` (fail-fast on first error).
+pub const probe_attempts: usize = 3;
+
 pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_secs: u32) !u64 {
     return switch (proxy.kind) {
         .shadowsocks => blk: {
@@ -123,6 +126,24 @@ pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_
     };
 }
 
+/// Rounded mean of `samples` (at least one). Used by `probeAverage` and tests.
+pub fn averageMs(samples: []const u64) u64 {
+    std.debug.assert(samples.len > 0);
+    var sum: u64 = 0;
+    for (samples) |s| sum += s;
+    return (sum + samples.len / 2) / samples.len;
+}
+
+/// Run `probe_attempts` full probes; stop on the first failure.
+/// On success returns the rounded average latency in ms.
+pub fn probeAverage(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_secs: u32) !u64 {
+    var samples: [probe_attempts]u64 = undefined;
+    for (&samples) |*slot| {
+        slot.* = try probeOne(gpa, io, proxy, timeout_secs);
+    }
+    return averageMs(&samples);
+}
+
 fn considerBest(shared: *Shared, latency: u64, raw: []const u8, host: []const u8) void {
     shared.lock();
     defer shared.unlock();
@@ -184,7 +205,8 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
             }
         }
 
-        const latency = probeOne(shared.gpa, shared.io, proxy, shared.timeout_secs) catch |err| {
+        // Three probes, fail-fast; ranking uses the average of all three.
+        const latency = probeAverage(shared.gpa, shared.io, proxy, shared.timeout_secs) catch |err| {
             if (shared.verbose) {
                 if (proxy.name) |n| {
                     std.log.warn("FAIL: {s} ({s}): {s} ({})", .{ n, proxy.host, failHint(err), err });
@@ -324,6 +346,15 @@ pub fn findBest(
     shared.best = null;
     if (best == null and shared.best_oom) return error.OutOfMemory;
     return best;
+}
+
+test "averageMs rounds half up via integer bias" {
+    try std.testing.expectEqual(@as(u64, 10), averageMs(&.{ 10, 10, 10 }));
+    try std.testing.expectEqual(@as(u64, 30), averageMs(&.{ 20, 30, 40 }));
+    // (10+10+11 + 1) / 3 = 32/3 = 10
+    try std.testing.expectEqual(@as(u64, 10), averageMs(&.{ 10, 10, 11 }));
+    // (10+11+11 + 1) / 3 = 33/3 = 11
+    try std.testing.expectEqual(@as(u64, 11), averageMs(&.{ 10, 11, 11 }));
 }
 
 test "collectGroups buckets by host" {
