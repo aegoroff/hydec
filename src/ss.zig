@@ -7,7 +7,7 @@ const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
-pub const Method = enum {
+const Method = enum {
     aes_128_gcm,
     aes_256_gcm,
     chacha20_ietf_poly1305,
@@ -32,7 +32,7 @@ pub const Method = enum {
 };
 
 /// OpenSSL EVP_BytesToKey with MD5, count=1.
-pub fn evpBytesToKey(password: []const u8, key_len: usize, out: []u8) void {
+fn evpBytesToKey(password: []const u8, key_len: usize, out: []u8) void {
     std.debug.assert(out.len >= key_len);
     var produced: usize = 0;
     var prev: [16]u8 = undefined;

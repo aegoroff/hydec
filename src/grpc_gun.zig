@@ -9,7 +9,7 @@ pub fn wrapGrpc(out: []u8, message: []const u8) error{BufferTooSmall}!usize {
     return 5 + message.len;
 }
 
-pub fn unwrapGrpc(frame: []const u8) error{InvalidGrpcFrame}![]const u8 {
+fn unwrapGrpc(frame: []const u8) error{InvalidGrpcFrame}![]const u8 {
     if (frame.len < 5) return error.InvalidGrpcFrame;
     const len = std.mem.readInt(u32, frame[1..5], .big);
     if (5 + len > frame.len) return error.InvalidGrpcFrame;
@@ -27,7 +27,7 @@ pub fn wrapHunk(out: []u8, data: []const u8) error{BufferTooSmall}!usize {
     return 1 + n + data.len;
 }
 
-pub fn unwrapHunk(msg: []const u8) error{InvalidHunk}![]const u8 {
+fn unwrapHunk(msg: []const u8) error{InvalidHunk}![]const u8 {
     if (msg.len < 2 or msg[0] != 0x0a) return error.InvalidHunk;
     var pos: usize = 1;
     const len, const varint_bytes = readVarint(msg[pos..]) catch return error.InvalidHunk;

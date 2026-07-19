@@ -1,5 +1,4 @@
 const std = @import("std");
-const util = @import("util.zig");
 const Io = std.Io;
 
 const ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -259,9 +258,4 @@ test "readBinaryFrame BufferTooSmall drains payload" {
     const n = try readBinaryFrame(&reader, &writer, io, &out);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
-}
-
-test "ws module loads" {
-    _ = util;
-    try std.testing.expect(true);
 }

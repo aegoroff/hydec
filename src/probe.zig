@@ -6,7 +6,7 @@ const trojan = @import("trojan.zig");
 const reality = @import("reality.zig");
 const Io = std.Io;
 
-pub const Result = struct {
+const Result = struct {
     latency_ms: u64,
     raw: []const u8,
     /// Owned copy of the host; free with `deinit`.

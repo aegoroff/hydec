@@ -46,7 +46,7 @@ fn rejectPostHandshakeKeyUpdate(plaintext: []const u8) !void {
     }
 }
 
-pub fn decodePublicKey(pbk_b64: []const u8, out: *[32]u8) !void {
+fn decodePublicKey(pbk_b64: []const u8, out: *[32]u8) !void {
     // sing-box uses RawURLEncoding (no padding)
     var cleaned: [64]u8 = undefined;
     const normalized = util.normalizeBase64Url(&cleaned, pbk_b64, false) catch return error.InvalidPublicKey;
@@ -57,7 +57,7 @@ pub fn decodePublicKey(pbk_b64: []const u8, out: *[32]u8) !void {
     @memcpy(out, tmp[0..32]);
 }
 
-pub fn decodeShortId(sid_hex: []const u8, out: *[8]u8) !void {
+fn decodeShortId(sid_hex: []const u8, out: *[8]u8) !void {
     @memset(out, 0);
     if (sid_hex.len == 0) return;
     if (sid_hex.len > 16 or sid_hex.len % 2 != 0) return error.InvalidShortId;
@@ -69,7 +69,7 @@ pub fn decodeShortId(sid_hex: []const u8, out: *[8]u8) !void {
 
 /// Derive REALITY auth key and encrypt session_id in-place (32 bytes).
 /// AAD is the ClientHello with the 32-byte session_id field zeroed (xray/sing-box).
-pub fn sealSessionId(
+fn sealSessionId(
     session_id: *[32]u8,
     hello_raw: []u8,
     client_random: *const [32]u8,
@@ -443,7 +443,7 @@ fn buildClientHello(
     return 4 + hs_len;
 }
 
-pub const RealityConn = struct {
+const RealityConn = struct {
     stream: Io.net.Stream,
     io: Io,
     sock_rbuf: [tls.Client.min_buffer_len]u8 = undefined,
@@ -463,7 +463,7 @@ pub const RealityConn = struct {
         return self.deadline_fired.load(.acquire);
     }
 
-    pub fn deinit(self: *RealityConn) void {
+    fn deinit(self: *RealityConn) void {
         if (self.deadline_guard) |*g| {
             g.disarm();
             self.deadline_guard = null;
@@ -474,7 +474,7 @@ pub const RealityConn = struct {
         }
     }
 
-    pub fn writeApp(self: *RealityConn, data: []const u8) !void {
+    fn writeApp(self: *RealityConn, data: []const u8) !void {
         self.conn.writeRecord(23, data, false) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
     }
 
@@ -501,7 +501,7 @@ pub const RealityConn = struct {
         return self.conn.readRecord(out, handshake_keys) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
     }
 
-    pub fn readApp(self: *RealityConn, out: []u8) !usize {
+    fn readApp(self: *RealityConn, out: []u8) !usize {
         var scratch: [16640]u8 = undefined;
         var attempts: usize = 0;
         while (attempts < 16) : (attempts += 1) {
@@ -529,7 +529,7 @@ pub const RealityConn = struct {
 /// Handshake into caller-owned `rc`. Out-parameter is required: RealityConn is
 /// self-referential (sock buffers, DeadlineShutdown atomics) and must not move
 /// after arming — returning by value would rely on RLO alone.
-pub fn connect(
+fn connect(
     rc: *RealityConn,
     io: Io,
     host: []const u8,
@@ -748,7 +748,7 @@ pub fn probeVless(
 
     var vless_buf: [1024]u8 = undefined;
     if (grpc) {
-        const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid, "");
+        const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid);
         var auth_buf: [256]u8 = undefined;
         const authority = try grpc_gun.formatAuthority(&auth_buf, sni_use, port, authority_param);
 
@@ -1288,7 +1288,7 @@ test "drainVlessVisionStream continues without UUID then End" {
     var first: [256]u8 = undefined;
     const n1 = try vless.appendVisionFrame(&first, vless.vision_cmd_continue, &uuid, part1, 8);
     var cont: [256]u8 = undefined;
-    const n2 = try vless.appendVisionPaddingContinue(&cont, part2);
+    const n2 = try vless.appendVisionFrame(&cont, vless.vision_cmd_continue, null, part2, 16);
     var endf: [64]u8 = undefined;
     const n3 = try vless.appendVisionFrame(&endf, vless.vision_cmd_end, null, "", 8);
 

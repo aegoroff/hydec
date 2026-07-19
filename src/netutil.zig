@@ -271,7 +271,7 @@ fn clearNonblock(sock: posix.socket_t) !void {
 }
 
 /// Disable Nagle — required for timely HTTP/2 preface/SETTINGS exchange.
-pub fn setTcpNoDelay(stream: Io.net.Stream) void {
+fn setTcpNoDelay(stream: Io.net.Stream) void {
     if (builtin.os.tag == .windows) return;
     const one: c_int = 1;
     std.posix.setsockopt(

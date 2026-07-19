@@ -313,7 +313,7 @@ pub fn printVersion(io: Io) !void {
     try file_writer.interface.flush();
 }
 
-pub const ParseResult = union(enum) {
+const ParseResult = union(enum) {
     help,
     version,
     run: Options,

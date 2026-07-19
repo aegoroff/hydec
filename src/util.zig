@@ -1,17 +1,14 @@
 const std = @import("std");
 
-/// Decode percent-encoding. When `plus_as_space`, `+` becomes space (query-string style).
-pub fn urlDecodeOpts(gpa: std.mem.Allocator, input: []const u8, plus_as_space: bool) ![]u8 {
+/// Decode percent-encoding without treating `+` as space (RFC 3986 fragment/userinfo).
+pub fn urlDecodeStrict(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
 
     var i: usize = 0;
     while (i < input.len) {
         const c = input[i];
-        if (plus_as_space and c == '+') {
-            try out.append(gpa, ' ');
-            i += 1;
-        } else if (c == '%' and i + 2 < input.len) {
+        if (c == '%' and i + 2 < input.len) {
             const hi = std.fmt.parseInt(u8, input[i + 1 ..][0..1], 16) catch {
                 try out.append(gpa, c);
                 i += 1;
@@ -30,16 +27,6 @@ pub fn urlDecodeOpts(gpa: std.mem.Allocator, input: []const u8, plus_as_space: b
         }
     }
     return try out.toOwnedSlice(gpa);
-}
-
-/// Decode percent-encoding (`%XX` and `+` → space). Caller owns result.
-pub fn urlDecode(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
-    return urlDecodeOpts(gpa, input, true);
-}
-
-/// Decode percent-encoding without treating `+` as space (RFC 3986 fragment/userinfo).
-pub fn urlDecodeStrict(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
-    return urlDecodeOpts(gpa, input, false);
 }
 
 /// Map URL-safe / unpadded base64 into the standard alphabet with `=` padding.
@@ -104,13 +91,13 @@ pub fn queryParamTruthy(query: []const u8, key: []const u8) bool {
     return false;
 }
 
-pub const HostPort = struct {
+const HostPort = struct {
     host: []const u8,
     port: u16,
 };
 
 /// Split `host:port`, `[ipv6]:port`. Bare IPv6 without brackets → error.
-pub fn splitHostPort(address: []const u8) error{InvalidAddress}!HostPort {
+fn splitHostPort(address: []const u8) error{InvalidAddress}!HostPort {
     if (address.len == 0) return error.InvalidAddress;
 
     if (address[0] == '[') {
@@ -262,18 +249,11 @@ test "looksLikeCloudflareTrace" {
     try std.testing.expect(!looksLikeCloudflareTrace("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
 }
 
-test "urlDecode percent and plus" {
-    const gpa = std.testing.allocator;
-    const got = try urlDecode(gpa, "a%20b+c%2Fd");
-    defer gpa.free(got);
-    try std.testing.expectEqualStrings("a b c/d", got);
-}
-
 test "urlDecodeStrict keeps plus" {
     const gpa = std.testing.allocator;
-    const got = try urlDecodeStrict(gpa, "a%20b+c");
+    const got = try urlDecodeStrict(gpa, "a%20b+c%2Fd");
     defer gpa.free(got);
-    try std.testing.expectEqualStrings("a b+c", got);
+    try std.testing.expectEqualStrings("a b+c/d", got);
 }
 
 test "decodeBase64Url hello and url-safe" {
