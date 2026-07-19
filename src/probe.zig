@@ -143,7 +143,7 @@ pub fn failHint(err: anyerror) []const u8 {
         error.BrokenPipe,
         error.TlsConnectionTruncated,
         => "rejected/closed",
-        // REALITY/TLS alert record — peer rejected ClientHello (wrong pbk/sid/sni), not CA verify.
+        // REALITY/TLS alert — rejected ClientHello (wrong pbk/sid/sni/client ver) or dest fallback.
         error.TlsAlert, error.TlsUnexpectedMessage, error.TlsFinishedVerifyFailed => "handshake/alert",
         error.CertificateBundleLoadFailure => "tls/cert",
         error.ConnectionRefused,

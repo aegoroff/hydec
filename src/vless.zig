@@ -86,30 +86,57 @@ pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8, flow: []const u8) !u
     return n;
 }
 
-/// First Vision frame: UUID + command + contentLen + paddingLen + padding [+ content].
+/// Vision padding commands (xray / sing-box).
+pub const vision_cmd_continue: u8 = 0x00;
+pub const vision_cmd_end: u8 = 0x01;
+pub const vision_cmd_direct: u8 = 0x02;
+
+/// First Vision frame: UUID + command + contentLen + paddingLen + content + padding.
+/// Layout matches xray `XtlsPadding` / `XtlsUnpadding` (content before padding).
 /// command 0x01 = PaddingEnd (enough for a connectivity probe).
 pub fn appendVisionPaddingEnd(out: []u8, uuid: *const [16]u8, content: []const u8) error{BufferTooSmall}!usize {
     const padding_len: u16 = 64;
-    const need = 16 + 1 + 2 + 2 + padding_len + content.len;
+    const need = 16 + 1 + 2 + 2 + content.len + padding_len;
     if (out.len < need) return error.BufferTooSmall;
     @memcpy(out[0..16], uuid);
-    out[16] = 0x01; // CommandPaddingEnd
+    out[16] = vision_cmd_end;
     std.mem.writeInt(u16, out[17..19], @intCast(content.len), .big);
     std.mem.writeInt(u16, out[19..21], padding_len, .big);
-    @memset(out[21 .. 21 + padding_len], 0);
-    if (content.len > 0) @memcpy(out[21 + padding_len ..][0..content.len], content);
+    if (content.len > 0) @memcpy(out[21..][0..content.len], content);
+    @memset(out[21 + content.len ..][0..padding_len], 0);
     return need;
 }
 
-/// If buf looks like a Vision frame, return the content slice; else return buf.
+pub const VisionFrame = struct {
+    /// Total bytes consumed from the front of the buffer (header + content + padding).
+    consumed: usize,
+    content: []const u8,
+    /// PaddingEnd / PaddingDirect — further downlink is raw application data.
+    switch_to_raw: bool,
+};
+
+/// Parse one Vision frame at the front of `buf`.
+/// `NeedMore` if the header/payload is incomplete; `NotVision` if it does not start with `uuid`.
+pub fn consumeVisionFrame(buf: []const u8, uuid: *const [16]u8) error{ NeedMore, NotVision }!VisionFrame {
+    if (buf.len < 16) return error.NeedMore;
+    if (!std.mem.eql(u8, buf[0..16], uuid)) return error.NotVision;
+    if (buf.len < 21) return error.NeedMore;
+    const cmd = buf[16];
+    const content_len: usize = std.mem.readInt(u16, buf[17..19], .big);
+    const padding_len: usize = std.mem.readInt(u16, buf[19..21], .big);
+    const total = 21 + content_len + padding_len;
+    if (buf.len < total) return error.NeedMore;
+    return .{
+        .consumed = total,
+        .content = buf[21 .. 21 + content_len],
+        .switch_to_raw = cmd == vision_cmd_end or cmd == vision_cmd_direct,
+    };
+}
+
+/// If buf looks like a complete Vision frame, return the content slice; else return buf.
 pub fn maybeUnwrapVision(buf: []const u8, uuid: *const [16]u8) []const u8 {
-    if (buf.len < 21) return buf;
-    if (!std.mem.eql(u8, buf[0..16], uuid)) return buf;
-    const content_len = std.mem.readInt(u16, buf[17..19], .big);
-    const padding_len = std.mem.readInt(u16, buf[19..21], .big);
-    const content_off = 21 + @as(usize, padding_len);
-    if (content_off + content_len > buf.len) return buf;
-    return buf[content_off .. content_off + content_len];
+    const frame = consumeVisionFrame(buf, uuid) catch return buf;
+    return frame.content;
 }
 
 test "parseUuid" {
@@ -134,4 +161,27 @@ test "encodeRequestDomain with flow addon" {
     try std.testing.expectEqual(@as(usize, 1 + 16 + 1 + (1 + 1 + flow.len) + 1 + 2 + 1 + 1 + 5), n);
     try std.testing.expectEqual(@as(u8, @intCast(1 + 1 + flow.len)), buf[17]);
     try std.testing.expectEqual(@as(u8, 0x0a), buf[18]);
+}
+
+test "consumeVisionFrame NeedMore and content before padding" {
+    var uuid: [16]u8 = [_]u8{0xab} ** 16;
+    var frame_buf: [128]u8 = undefined;
+    const http = "HTTP/1.1 200 OK\r\n\r\n";
+    const n = try appendVisionPaddingEnd(&frame_buf, &uuid, http);
+
+    // Wire layout: header then content immediately (xray order).
+    try std.testing.expectEqualStrings(http, frame_buf[21 .. 21 + http.len]);
+    try std.testing.expectError(error.NeedMore, consumeVisionFrame(frame_buf[0..20], &uuid));
+
+    const frame = try consumeVisionFrame(frame_buf[0..n], &uuid);
+    try std.testing.expectEqual(n, frame.consumed);
+    try std.testing.expectEqualStrings(http, frame.content);
+    try std.testing.expect(frame.switch_to_raw);
+}
+
+test "consumeVisionFrame rejects non-uuid prefix" {
+    var uuid: [16]u8 = [_]u8{0xab} ** 16;
+    // VLESS empty response header + HTTP must not be mistaken for Vision.
+    const raw = "\x00\x00HTTP/1.1 200 OK\r\n\r\n";
+    try std.testing.expectError(error.NotVision, consumeVisionFrame(raw, &uuid));
 }

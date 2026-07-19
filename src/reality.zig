@@ -103,13 +103,18 @@ pub fn sealSessionId(
     @memcpy(hello_raw[39..][0..32], session_id);
 }
 
+/// Xray core version embedded in the REALITY session_id (bytes 0..2).
+/// xray-core ≥26.7.11 defaults inbound `minClientVer` to 26.3.27 when unset; reporting
+/// the old sing-box 1.8.1 triple fails auth and the peer falls through to the dest
+/// (often visible here as `TlsAlert` after we write VLESS).
+const reality_client_ver: [3]u8 = .{ 26, 7, 11 };
+
 fn fillSessionIdPlain(session_id: *[32]u8, short_id: *const [8]u8, unix_secs: u32) void {
     @memset(session_id, 0);
-    // Match sing-box / common REALITY clients (not xray core version triple).
-    session_id[0] = 1;
-    session_id[1] = 8;
-    session_id[2] = 1;
-    session_id[3] = 0;
+    session_id[0] = reality_client_ver[0];
+    session_id[1] = reality_client_ver[1];
+    session_id[2] = reality_client_ver[2];
+    session_id[3] = 0; // reserved
     std.mem.writeInt(u32, session_id[4..8], unix_secs, .big);
     @memcpy(session_id[8..16], short_id);
 }
@@ -408,8 +413,9 @@ fn buildClientHello(
         i += sni.len;
     }
 
-    if (alpn_h2) {
-        // application_layer_protocol_negotiation: h2, http/1.1 (chrome-like)
+    // Always advertise ALPN like chrome / gRPC path so TCP and gRPC ClientHellos match.
+    _ = alpn_h2;
+    {
         const p1 = "h2";
         const p2 = "http/1.1";
         const list_len: usize = (1 + p1.len) + (1 + p2.len);
@@ -852,14 +858,21 @@ pub fn probeVless(
             }
         }
     } else {
+        const use_vision = std.mem.indexOf(u8, flow, "vision") != null;
         const first_start = netutil.monoNow(io);
         try rc.writeApp(vless_buf[0..vless_len]);
         var uuid_bytes: [16]u8 = undefined;
         try vless.parseUuid(uuid, &uuid_bytes);
 
+        // Server writes the VLESS response header raw, then Vision-wraps the payload
+        // (or sends raw if no vision). Header and first Vision frame often share one
+        // TLS record — unwrap Vision only after stripping the header.
+        var stream: [16384]u8 = undefined;
+        var stream_len: usize = 0;
         var http_buf: [16384]u8 = undefined;
         var http_len: usize = 0;
         var stripped_header = false;
+        var vision_raw = !use_vision;
         var resp: [16384]u8 = undefined;
 
         while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
@@ -867,9 +880,19 @@ pub fn probeVless(
                 if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(err)) break;
                 return err;
             };
-            const piece = vless.maybeUnwrapVision(resp[0..n], &uuid_bytes);
-            if (piece.len == 0) continue;
-            try appendStripVlessHeader(&http_buf, &http_len, piece, &stripped_header);
+            if (stream_len + n > stream.len) return error.BufferTooSmall;
+            @memcpy(stream[stream_len..][0..n], resp[0..n]);
+            stream_len += n;
+
+            try drainVlessVisionStream(
+                &stream,
+                &stream_len,
+                &http_buf,
+                &http_len,
+                &uuid_bytes,
+                &stripped_header,
+                &vision_raw,
+            );
         }
         const first_ms = netutil.elapsedMs(first_start, io);
 
@@ -880,10 +903,66 @@ pub fn probeVless(
         const n = rc.readApp(&resp) catch |err| {
             return if (util.isPeerClosed(err)) first_ms else err;
         };
+        if (vision_raw) {
+            if (n == 0) return first_ms;
+            return netutil.elapsedMs(steady_start, io);
+        }
         const body = vless.maybeUnwrapVision(resp[0..n], &uuid_bytes);
         if (body.len == 0) return first_ms;
         return netutil.elapsedMs(steady_start, io);
     }
+}
+
+/// Move bytes from `stream` into `http` after stripping the VLESS response header
+/// and (when still in Vision mode) decoding Vision frames.
+fn drainVlessVisionStream(
+    stream: []u8,
+    stream_len: *usize,
+    http: []u8,
+    http_len: *usize,
+    uuid: *const [16]u8,
+    stripped: *bool,
+    vision_raw: *bool,
+) !void {
+    if (!stripped.*) {
+        const hdr = vless.responseHeaderLen(stream[0..stream_len.*]) catch |err| switch (err) {
+            error.NeedMore => return,
+            else => |e| return e,
+        };
+        shiftDown(stream, stream_len, hdr);
+        stripped.* = true;
+    }
+
+    while (stream_len.* > 0) {
+        if (!vision_raw.*) {
+            const frame = vless.consumeVisionFrame(stream[0..stream_len.*], uuid) catch |err| switch (err) {
+                error.NeedMore => return,
+                error.NotVision => {
+                    // Peer already switched to raw (or never wrapped this chunk).
+                    vision_raw.* = true;
+                    continue;
+                },
+            };
+            if (frame.content.len > 0) {
+                if (http_len.* + frame.content.len > http.len) return error.BufferTooSmall;
+                @memcpy(http[http_len.*..][0..frame.content.len], frame.content);
+                http_len.* += frame.content.len;
+            }
+            shiftDown(stream, stream_len, frame.consumed);
+            if (frame.switch_to_raw) vision_raw.* = true;
+        } else {
+            if (http_len.* + stream_len.* > http.len) return error.BufferTooSmall;
+            @memcpy(http[http_len.*..][0..stream_len.*], stream[0..stream_len.*]);
+            http_len.* += stream_len.*;
+            stream_len.* = 0;
+        }
+    }
+}
+
+fn shiftDown(buf: []u8, len: *usize, n: usize) void {
+    const remain = len.* - n;
+    if (remain > 0) std.mem.copyForwards(u8, buf[0..remain], buf[n..len.*]);
+    len.* = remain;
 }
 
 fn appendServerHelloMinimal(buf: []u8, key_share: *const [32]u8, ext_len_override: ?u16) !usize {
@@ -941,6 +1020,57 @@ test "appendStripVlessHeader large first chunk" {
     try appendStripVlessHeader(&buf, &len, &chunk, &stripped);
     try std.testing.expect(stripped);
     try std.testing.expectEqual(@as(usize, 598), len);
+}
+
+test "drainVlessVisionStream strips header before Vision unwrap" {
+    var uuid: [16]u8 = [_]u8{0xcd} ** 16;
+    const http = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    var vision: [256]u8 = undefined;
+    const vn = try vless.appendVisionPaddingEnd(&vision, &uuid, http);
+
+    var stream: [512]u8 = undefined;
+    stream[0] = 0;
+    stream[1] = 0;
+    @memcpy(stream[2..][0..vn], vision[0..vn]);
+    var stream_len: usize = 2 + vn;
+
+    var http_buf: [512]u8 = undefined;
+    var http_len: usize = 0;
+    var stripped = false;
+    var vision_raw = false;
+
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw);
+    try std.testing.expect(stripped);
+    try std.testing.expect(vision_raw);
+    try std.testing.expectEqual(@as(usize, 0), stream_len);
+    try std.testing.expectEqualStrings(http, http_buf[0..http_len]);
+}
+
+test "drainVlessVisionStream splits header then Vision across pushes" {
+    var uuid: [16]u8 = [_]u8{0xef} ** 16;
+    const http = "HTTP/1.1 200 OK\r\n\r\n";
+    var vision: [256]u8 = undefined;
+    const vn = try vless.appendVisionPaddingEnd(&vision, &uuid, http);
+
+    var stream: [512]u8 = undefined;
+    var stream_len: usize = 0;
+    var http_buf: [512]u8 = undefined;
+    var http_len: usize = 0;
+    var stripped = false;
+    var vision_raw = false;
+
+    stream[0] = 0;
+    stream_len = 1;
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw);
+    try std.testing.expect(!stripped);
+
+    stream[stream_len] = 0;
+    stream_len += 1;
+    @memcpy(stream[stream_len..][0..vn], vision[0..vn]);
+    stream_len += vn;
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw);
+    try std.testing.expect(stripped);
+    try std.testing.expectEqualStrings(http, http_buf[0..http_len]);
 }
 
 test "parseServerHelloX25519 accepts key_share" {
