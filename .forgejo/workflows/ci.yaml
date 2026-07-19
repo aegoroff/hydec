@@ -1,0 +1,147 @@
+name: CI Build
+
+concurrency:
+  group: ci-build
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - master
+      - develop
+    tags:
+      - "v*"
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: docker
+    container:
+      image: registry.egoroff.spb.ru/zigcross:0.16
+
+    steps:
+      - name: Query version
+        id: get_version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF#refs/tags/v}"
+          else
+            ver="0.0.0"
+          fi
+          echo "using version ${ver}"
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v3
+
+      - name: Trust mise config
+        run: mise trust
+
+      - name: Test
+        run: just ver=${{ steps.get_version.outputs.version }} test
+
+      - name: Build archives
+        run: just ver=${{ steps.get_version.outputs.version }} build-all
+
+      - name: Build OpenWrt apk packages
+        run: just ver=${{ steps.get_version.outputs.version }} openwrt-apk
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v3
+        with:
+          name: archives
+          path: zig-out/*.tar.gz
+
+      - name: Upload apk packages
+        uses: actions/upload-artifact@v3
+        with:
+          name: apk
+          path: zig-out/apk/*.apk
+
+  release:
+    name: Forgejo Release
+    needs: [build]
+    if: startsWith(forgejo.ref, 'refs/tags/v')
+    runs-on: docker
+    steps:
+      - name: Query version
+        id: get_version
+        shell: bash
+        run: |
+          ver="${GITHUB_REF#refs/tags/v}"
+          echo "using version ${ver}"
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: release
+
+      - name: Prepare release artifacts
+        run: |
+          find release -type f \( -name '*.tar.gz' -o -name '*.apk' \) -exec mv -v {} release/ \;
+          ls -la release/
+
+      - name: Check API access
+        run: |
+          curl -fsS -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            "${{ env.FORGEJO_API_URL }}/version"
+
+      - name: Install jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            apt-get update && apt-get install -y jq
+          fi
+
+      - name: Create Release via API
+        id: create_release
+        run: |
+          FORGEJO_URL="${{ env.FORGEJO_API_URL }}"
+          TOKEN="${{ secrets.FORGEJO_TOKEN }}"
+          REPO="${{ forgejo.repository }}"
+          VERSION="v${{ steps.get_version.outputs.version }}"
+
+          RESPONSE=$(curl -sS -X POST \
+            -H "Authorization: token $TOKEN" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "{
+              \"tag_name\": \"$VERSION\",
+              \"name\": \"$VERSION\",
+              \"body\": \"\",
+              \"draft\": false,
+              \"prerelease\": false
+            }" \
+            "$FORGEJO_URL/repos/$REPO/releases")
+
+          echo "Response: $RESPONSE"
+
+          RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+          if [ "$RELEASE_ID" = "null" ] || [ -z "$RELEASE_ID" ]; then
+            echo "Failed to create release. Response: $RESPONSE"
+            exit 1
+          fi
+
+          echo "Created release with ID: $RELEASE_ID"
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Assets
+        run: |
+          FORGEJO_URL="${{ env.FORGEJO_API_URL }}"
+          TOKEN="${{ secrets.FORGEJO_TOKEN }}"
+          REPO="${{ forgejo.repository }}"
+          RELEASE_ID="${{ steps.create_release.outputs.release_id }}"
+
+          shopt -s nullglob
+          for file in release/*.tar.gz release/*.apk; do
+            filename=$(basename "$file")
+            echo "Uploading $filename..."
+            curl -fsS -X POST \
+              -H "Authorization: token $TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              -H "Accept: application/json" \
+              --data-binary @"$file" \
+              "$FORGEJO_URL/repos/$REPO/releases/$RELEASE_ID/assets?name=$filename"
+            echo
+          done
