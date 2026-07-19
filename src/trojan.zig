@@ -84,33 +84,6 @@ fn tlsOptions(
     };
 }
 
-/// Classify an I/O error from the probe pipeline.
-///
-/// Genuine timeouts (`ConnectionTimedOut`, `Timeout`) always map to `Timeout`.
-/// `shutdown(2)`-induced EOF/reset errors map to `Timeout` only when our watchdog
-/// actually fired (`fired == true`); otherwise they are real server-side rejections
-/// (wrong password, dead upstream, TLS protocol error) and pass through unchanged
-/// so the caller can distinguish "slow" from "broken/auth-rejected".
-fn classifyErr(err: anyerror, fired: bool) anyerror {
-    return switch (err) {
-        error.ConnectionTimedOut,
-        error.Timeout,
-        => error.Timeout,
-        // Errors that shutdown(fd, SHUT.RDWR) typically produces on a blocked
-        // TLS/reader — only treat as timeout if we caused them.
-        error.EndOfStream,
-        error.UnexpectedEndOfStream,
-        error.BrokenPipe,
-        error.ConnectionResetByPeer,
-        error.TlsConnectionTruncated,
-        error.SocketNotConnected,
-        error.NotOpenForReading,
-        error.NotOpenForWriting,
-        => if (fired) error.Timeout else err,
-        else => err,
-    };
-}
-
 pub fn probe(
     gpa: std.mem.Allocator,
     io: Io,
@@ -155,7 +128,7 @@ pub fn probe(
         &stream_reader.interface,
         &stream_writer.interface,
         tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, bundle),
-    ) catch |err| return classifyErr(err, fired.load(.acquire));
+    ) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
 
     const tls_reader = &tls_client.reader;
     const tls_writer = &tls_client.writer;
@@ -163,7 +136,7 @@ pub fn probe(
     if (transport_ws) {
         const path = if (ws_path.len > 0) ws_path else "/";
         const host_hdr = if (ws_host.len > 0) ws_host else sni_use;
-        ws.performUpgrade(tls_reader, tls_writer, io, path, host_hdr) catch |err| return classifyErr(err, fired.load(.acquire));
+        ws.performUpgrade(tls_reader, tls_writer, io, path, host_hdr) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     }
 
     var req_buf: [256]u8 = undefined;
@@ -171,10 +144,10 @@ pub fn probe(
 
     const first_start = netutil.monoNow(io);
     if (transport_ws) {
-        ws.writeBinaryFrame(tls_writer, io, req_buf[0..req_len]) catch |err| return classifyErr(err, fired.load(.acquire));
+        ws.writeBinaryFrame(tls_writer, io, req_buf[0..req_len]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     } else {
-        tls_writer.writeAll(req_buf[0..req_len]) catch |err| return classifyErr(err, fired.load(.acquire));
-        tls_writer.flush() catch |err| return classifyErr(err, fired.load(.acquire));
+        tls_writer.writeAll(req_buf[0..req_len]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+        tls_writer.flush() catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     }
 
     // Warmup: drain first HTTP response so the second request is clean.
@@ -185,13 +158,13 @@ pub fn probe(
     defer gpa.free(frame_buf);
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         if (transport_ws) {
-            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| return classifyErr(err, fired.load(.acquire));
+            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
             if (http_len + n > http_buf.len) return error.BufferTooSmall;
             @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
             http_len += n;
         } else {
-            const n = tls_reader.readSliceShort(frame_buf) catch |err| return classifyErr(err, fired.load(.acquire));
-            if (n == 0) return classifyErr(error.EndOfStream, fired.load(.acquire));
+            const n = tls_reader.readSliceShort(frame_buf) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            if (n == 0) return netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
             if (http_len + n > http_buf.len) return error.BufferTooSmall;
             @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
             http_len += n;
@@ -202,25 +175,25 @@ pub fn probe(
     const steady_start = netutil.monoNow(io);
     if (transport_ws) {
         ws.writeBinaryFrame(tls_writer, io, util.probe_http) catch |err| {
-            const e = classifyErr(err, fired.load(.acquire));
+            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };
         _ = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
-            const e = classifyErr(err, fired.load(.acquire));
+            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };
     } else {
         tls_writer.writeAll(util.probe_http) catch |err| {
-            const e = classifyErr(err, fired.load(.acquire));
+            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };
         tls_writer.flush() catch |err| {
-            const e = classifyErr(err, fired.load(.acquire));
+            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };
         var one: [1]u8 = undefined;
         tls_reader.readSliceAll(&one) catch |err| {
-            const e = classifyErr(err, fired.load(.acquire));
+            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };
     }
@@ -267,33 +240,4 @@ test "buildRequest wire layout" {
     try std.testing.expectEqual(@as(u8, '\r'), buf[80]);
     try std.testing.expectEqual(@as(u8, '\n'), buf[81]);
     try std.testing.expectEqualStrings(util.probe_http, buf[82..n]);
-}
-
-test "classifyErr: genuine timeouts always map to Timeout" {
-    try std.testing.expect(classifyErr(error.ConnectionTimedOut, false) == error.Timeout);
-    try std.testing.expect(classifyErr(error.Timeout, false) == error.Timeout);
-    try std.testing.expect(classifyErr(error.ConnectionTimedOut, true) == error.Timeout);
-}
-
-test "classifyErr: shutdown-induced errors map to Timeout only when fired" {
-    // Not fired → real server-side close/reset, pass through unchanged.
-    try std.testing.expect(classifyErr(error.EndOfStream, false) == error.EndOfStream);
-    try std.testing.expect(classifyErr(error.UnexpectedEndOfStream, false) == error.UnexpectedEndOfStream);
-    try std.testing.expect(classifyErr(error.ConnectionResetByPeer, false) == error.ConnectionResetByPeer);
-    try std.testing.expect(classifyErr(error.TlsConnectionTruncated, false) == error.TlsConnectionTruncated);
-    try std.testing.expect(classifyErr(error.BrokenPipe, false) == error.BrokenPipe);
-    // Fired → our watchdog shut the socket, treat as timeout.
-    try std.testing.expect(classifyErr(error.EndOfStream, true) == error.Timeout);
-    try std.testing.expect(classifyErr(error.UnexpectedEndOfStream, true) == error.Timeout);
-    try std.testing.expect(classifyErr(error.ConnectionResetByPeer, true) == error.Timeout);
-    try std.testing.expect(classifyErr(error.TlsConnectionTruncated, true) == error.Timeout);
-    try std.testing.expect(classifyErr(error.BrokenPipe, true) == error.Timeout);
-}
-
-test "classifyErr: unrelated and protocol errors pass through regardless of fired" {
-    try std.testing.expect(classifyErr(error.OutOfMemory, false) == error.OutOfMemory);
-    try std.testing.expect(classifyErr(error.OutOfMemory, true) == error.OutOfMemory);
-    // TlsUnexpectedMessage is a real protocol failure, not shutdown-induced.
-    try std.testing.expect(classifyErr(error.TlsUnexpectedMessage, false) == error.TlsUnexpectedMessage);
-    try std.testing.expect(classifyErr(error.TlsUnexpectedMessage, true) == error.TlsUnexpectedMessage);
 }

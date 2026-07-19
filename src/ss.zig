@@ -196,24 +196,6 @@ fn readOpenChunk(gpa: std.mem.Allocator, ctx: *AeadCtx, reader: *Io.Reader, out:
     return payload_len;
 }
 
-/// Map shutdown-induced EOF/reset to Timeout when our DeadlineShutdown fired.
-fn classifyErr(err: anyerror, fired: bool) anyerror {
-    return switch (err) {
-        error.ConnectionTimedOut,
-        error.Timeout,
-        => error.Timeout,
-        error.EndOfStream,
-        error.UnexpectedEndOfStream,
-        error.BrokenPipe,
-        error.ConnectionResetByPeer,
-        error.SocketNotConnected,
-        error.NotOpenForReading,
-        error.NotOpenForWriting,
-        => if (fired) error.Timeout else err,
-        else => err,
-    };
-}
-
 /// Probe SS AEAD: dial, warmup HTTP, then time a second request (steady-state).
 pub fn probe(
     gpa: std.mem.Allocator,
@@ -275,9 +257,9 @@ pub fn probe(
     var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
 
-    netutil.waitReadableUntil(stream, io, deadline) catch |err| return classifyErr(err, fired.load(.acquire));
+    netutil.waitReadableUntil(stream, io, deadline) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     var server_salt: [32]u8 = undefined;
-    r.interface.readSliceAll(server_salt[0..method.saltLen()]) catch |err| return classifyErr(err, fired.load(.acquire));
+    r.interface.readSliceAll(server_salt[0..method.saltLen()]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
 
     var server_subkey: [32]u8 = undefined;
     @memset(&server_subkey, 0);
@@ -295,7 +277,7 @@ pub fn probe(
 
     // Warmup: drain first HTTP response so the second request is clean.
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-        const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| return classifyErr(err, fired.load(.acquire));
+        const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
         if (http_len + n > http_buf.len) return error.BufferTooSmall;
         @memcpy(http_buf[http_len..][0..n], chunk_buf[0..n]);
         http_len += n;
@@ -306,15 +288,15 @@ pub fn probe(
     var second: [512]u8 = undefined;
     const second_len = try sealChunk(&ctx, &second, util.probe_http);
     w.interface.writeAll(second[0..second_len]) catch |err| {
-        const e = classifyErr(err, fired.load(.acquire));
+        const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
         return if (util.isPeerClosed(e)) first_ms else e;
     };
     w.interface.flush() catch |err| {
-        const e = classifyErr(err, fired.load(.acquire));
+        const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
         return if (util.isPeerClosed(e)) first_ms else e;
     };
     _ = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
-        const e = classifyErr(err, fired.load(.acquire));
+        const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
         return if (util.isPeerClosed(e)) first_ms else e;
     };
 
@@ -380,10 +362,4 @@ test "aead open rejects bad tag" {
 
 test "method from name" {
     try std.testing.expect(Method.fromName("chacha20-ietf-poly1305") == .chacha20_ietf_poly1305);
-}
-
-test "classifyErr maps shutdown EOF to Timeout only when fired" {
-    try std.testing.expect(classifyErr(error.EndOfStream, true) == error.Timeout);
-    try std.testing.expect(classifyErr(error.EndOfStream, false) == error.EndOfStream);
-    try std.testing.expect(classifyErr(error.AuthenticationFailed, true) == error.AuthenticationFailed);
 }

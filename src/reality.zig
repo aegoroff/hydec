@@ -470,23 +470,6 @@ pub const RealityConn = struct {
     deadline_fired: std.atomic.Value(bool) = .init(false),
     deadline_guard: ?netutil.DeadlineShutdown = null,
 
-    fn classifyErr(err: anyerror, watchdog_fired: bool) anyerror {
-        return switch (err) {
-            error.ConnectionTimedOut,
-            error.Timeout,
-            => error.Timeout,
-            error.EndOfStream,
-            error.UnexpectedEndOfStream,
-            error.BrokenPipe,
-            error.ConnectionResetByPeer,
-            error.SocketNotConnected,
-            error.NotOpenForReading,
-            error.NotOpenForWriting,
-            => if (watchdog_fired) error.Timeout else err,
-            else => err,
-        };
-    }
-
     fn deadlineFired(self: *const RealityConn) bool {
         return self.deadline_fired.load(.acquire);
     }
@@ -503,15 +486,15 @@ pub const RealityConn = struct {
     }
 
     pub fn writeApp(self: *RealityConn, data: []const u8) !void {
-        self.conn.writeRecord(23, data, false) catch |err| return classifyErr(err, self.deadlineFired());
+        self.conn.writeRecord(23, data, false) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
     }
 
     fn writeClear(self: *RealityConn, content_type: u8, data: []const u8) !void {
-        self.conn.writeClear(content_type, data) catch |err| return classifyErr(err, self.deadlineFired());
+        self.conn.writeClear(content_type, data) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
     }
 
     fn writeHandshake(self: *RealityConn, data: []const u8) !void {
-        self.conn.writeRecord(22, data, true) catch |err| return classifyErr(err, self.deadlineFired());
+        self.conn.writeRecord(22, data, true) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
     }
 
     fn waitForReadable(self: *RealityConn) !void {
@@ -520,13 +503,13 @@ pub const RealityConn = struct {
         const r = self.conn.reader;
         if (r.seek >= r.end) {
             netutil.waitReadableUntil(self.stream, self.io, self.read_deadline_ns) catch |err|
-                return classifyErr(err, self.deadlineFired());
+                return netutil.classifyDeadlineErr(err, self.deadlineFired());
         }
     }
 
     fn readRecordDeadline(self: *RealityConn, out: []u8, handshake_keys: bool) !TlsRecord {
         try self.waitForReadable();
-        return self.conn.readRecord(out, handshake_keys) catch |err| return classifyErr(err, self.deadlineFired());
+        return self.conn.readRecord(out, handshake_keys) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
     }
 
     pub fn readApp(self: *RealityConn, out: []u8) !usize {
@@ -1004,12 +987,6 @@ test "buildClientHello rejects oversized SNI" {
         error.SniTooLong,
         buildClientHello(&out, long_sni, &random, &sid, &pubk, false),
     );
-}
-
-test "RealityConn.classifyErr maps watchdog EOF to Timeout" {
-    try std.testing.expectEqual(error.Timeout, RealityConn.classifyErr(error.EndOfStream, true));
-    try std.testing.expectEqual(error.EndOfStream, RealityConn.classifyErr(error.EndOfStream, false));
-    try std.testing.expectEqual(error.Timeout, RealityConn.classifyErr(error.Timeout, false));
 }
 
 test "decodePublicKey length" {

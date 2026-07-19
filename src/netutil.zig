@@ -402,3 +402,54 @@ pub fn remainingTimeoutNs(start_ns: i128, io: Io, timeout_secs: u32) u64 {
     if (elapsed >= budget) return 0;
     return @intCast(budget - elapsed);
 }
+
+/// Map I/O errors from a probe under `DeadlineShutdown`.
+///
+/// Genuine timeouts always become `Timeout`. `shutdown(2)`-induced EOF/reset
+/// map to `Timeout` only when the watchdog fired (`fired == true`); otherwise
+/// they pass through so callers can distinguish "slow" from "rejected".
+pub fn classifyDeadlineErr(err: anyerror, fired: bool) anyerror {
+    return switch (err) {
+        error.ConnectionTimedOut,
+        error.Timeout,
+        => error.Timeout,
+        error.EndOfStream,
+        error.UnexpectedEndOfStream,
+        error.BrokenPipe,
+        error.ConnectionResetByPeer,
+        error.TlsConnectionTruncated,
+        error.SocketNotConnected,
+        error.NotOpenForReading,
+        error.NotOpenForWriting,
+        => if (fired) error.Timeout else err,
+        else => err,
+    };
+}
+
+test "classifyDeadlineErr: genuine timeouts always map to Timeout" {
+    try std.testing.expect(classifyDeadlineErr(error.ConnectionTimedOut, false) == error.Timeout);
+    try std.testing.expect(classifyDeadlineErr(error.Timeout, false) == error.Timeout);
+    try std.testing.expect(classifyDeadlineErr(error.ConnectionTimedOut, true) == error.Timeout);
+}
+
+test "classifyDeadlineErr: shutdown-induced errors map to Timeout only when fired" {
+    try std.testing.expect(classifyDeadlineErr(error.EndOfStream, false) == error.EndOfStream);
+    try std.testing.expect(classifyDeadlineErr(error.UnexpectedEndOfStream, false) == error.UnexpectedEndOfStream);
+    try std.testing.expect(classifyDeadlineErr(error.ConnectionResetByPeer, false) == error.ConnectionResetByPeer);
+    try std.testing.expect(classifyDeadlineErr(error.TlsConnectionTruncated, false) == error.TlsConnectionTruncated);
+    try std.testing.expect(classifyDeadlineErr(error.BrokenPipe, false) == error.BrokenPipe);
+
+    try std.testing.expect(classifyDeadlineErr(error.EndOfStream, true) == error.Timeout);
+    try std.testing.expect(classifyDeadlineErr(error.UnexpectedEndOfStream, true) == error.Timeout);
+    try std.testing.expect(classifyDeadlineErr(error.ConnectionResetByPeer, true) == error.Timeout);
+    try std.testing.expect(classifyDeadlineErr(error.TlsConnectionTruncated, true) == error.Timeout);
+    try std.testing.expect(classifyDeadlineErr(error.BrokenPipe, true) == error.Timeout);
+}
+
+test "classifyDeadlineErr: unrelated and protocol errors pass through" {
+    try std.testing.expect(classifyDeadlineErr(error.OutOfMemory, false) == error.OutOfMemory);
+    try std.testing.expect(classifyDeadlineErr(error.OutOfMemory, true) == error.OutOfMemory);
+    try std.testing.expect(classifyDeadlineErr(error.TlsUnexpectedMessage, false) == error.TlsUnexpectedMessage);
+    try std.testing.expect(classifyDeadlineErr(error.TlsUnexpectedMessage, true) == error.TlsUnexpectedMessage);
+    try std.testing.expect(classifyDeadlineErr(error.AuthenticationFailed, true) == error.AuthenticationFailed);
+}
