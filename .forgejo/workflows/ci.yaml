@@ -4,6 +4,9 @@ concurrency:
   group: ci-build
   cancel-in-progress: true
 
+env:
+  GITCLIFF_VER: 2.11.0
+
 on:
   push:
     branches:
@@ -59,9 +62,36 @@ jobs:
           name: apk
           path: zig-out/apk/*.apk
 
+  generate-changelog:
+    name: Generate changelog
+    if: startsWith(forgejo.ref, 'refs/tags/v')
+    runs-on: docker
+    outputs:
+      release_body: ${{ steps.changelog.outputs.release_body }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        run: |
+          curl -fL \
+            https://github.com/orhun/git-cliff/releases/download/v${{ env.GITCLIFF_VER }}/git-cliff-${{ env.GITCLIFF_VER }}-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz
+          install git-cliff-${{ env.GITCLIFF_VER }}/git-cliff /usr/local/bin/git-cliff
+
+      - name: Generate a changelog
+        id: changelog
+        run: |
+          BODY="$(git cliff --latest --strip header --gitea-token ${{ secrets.FORGEJO_TOKEN }})"
+          echo "release_body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
   release:
     name: Forgejo Release
-    needs: [build]
+    needs: [build, generate-changelog]
     if: startsWith(forgejo.ref, 'refs/tags/v')
     runs-on: docker
     steps:
@@ -102,6 +132,8 @@ jobs:
           REPO="${{ forgejo.repository }}"
           VERSION="v${{ steps.get_version.outputs.version }}"
 
+          RELEASE_BODY=$(echo '${{ needs.generate-changelog.outputs.release_body }}' | jq -Rs .)
+
           RESPONSE=$(curl -sS -X POST \
             -H "Authorization: token $TOKEN" \
             -H "Content-Type: application/json" \
@@ -109,7 +141,7 @@ jobs:
             -d "{
               \"tag_name\": \"$VERSION\",
               \"name\": \"$VERSION\",
-              \"body\": \"\",
+              \"body\": $RELEASE_BODY,
               \"draft\": false,
               \"prerelease\": false
             }" \
