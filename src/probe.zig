@@ -150,9 +150,7 @@ pub fn failHint(err: anyerror) []const u8 {
         error.NetworkUnreachable,
         error.HostUnreachable,
         => "unreachable",
-        error.GrpcEmptyResponse,
-        error.GrpcNoData,
-        => "empty/no-data",
+        error.GrpcEmptyResponse => "empty/no-data",
         else => "error",
     };
 }
