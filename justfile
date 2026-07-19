@@ -72,3 +72,34 @@ build-all:
     just arch=x86_64 os=macos abi=none ver={{ ver }} optimize={{ optimize }} cpu=core2 release
     just arch=aarch64 os=macos abi=none ver={{ ver }} optimize={{ optimize }} cpu=apple_m1 release
     just arch=x86_64 os=windows abi=gnu ver={{ ver }} optimize={{ optimize }} cpu=core2 release
+
+# OpenWrt 25.12+ unsigned .apk (MVP: x86_64 + aarch64_generic)
+# Example: just ver=0.1.0 openwrt-apk
+zig_arch := "x86_64"
+openwrt_arch := "x86_64"
+zig_cpu := if zig_arch == "x86_64" { "core2" } else { "" }
+
+openwrt-apk:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just ver={{ ver }} optimize={{ optimize }} zig_arch=x86_64 openwrt_arch=x86_64 openwrt-apk-one
+    just ver={{ ver }} optimize={{ optimize }} zig_arch=aarch64 openwrt_arch=aarch64_generic openwrt-apk-one
+
+openwrt-apk-one:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cpu_args=()
+    if [[ -n "{{ zig_cpu }}" ]]; then
+      cpu_args=(-Dcpu={{ zig_cpu }})
+    fi
+    {{ zig }} build \
+      -Doptimize={{ optimize }} \
+      "${cpu_args[@]}" \
+      -Dtarget={{ zig_arch }}-linux-musl \
+      -Dversion={{ ver }} \
+      --summary all \
+      --prefix-exe-dir bin-{{ zig_arch }}-linux-musl
+    ./packaging/openwrt-apk/build-apk.sh \
+      --bin zig-out/bin-{{ zig_arch }}-linux-musl/hydec \
+      --arch {{ openwrt_arch }} \
+      --version {{ ver }}
