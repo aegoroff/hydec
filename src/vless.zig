@@ -87,22 +87,50 @@ pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8, flow: []const u8) !u
 }
 
 /// Vision padding commands (xray / sing-box).
+pub const vision_cmd_continue: u8 = 0x00;
 pub const vision_cmd_end: u8 = 0x01;
 pub const vision_cmd_direct: u8 = 0x02;
+
+/// Decoder state for xray `XtlsUnpadding`: UUID only on the first padded block;
+/// subsequent `CommandPaddingContinue` blocks use a 5-byte header.
+pub const VisionUnpadState = struct {
+    expect_uuid: bool = true,
+};
 
 /// First Vision frame: UUID + command + contentLen + paddingLen + content + padding.
 /// Layout matches xray `XtlsPadding` / `XtlsUnpadding` (content before padding).
 /// command 0x01 = PaddingEnd (enough for a connectivity probe).
 pub fn appendVisionPaddingEnd(out: []u8, uuid: *const [16]u8, content: []const u8) error{BufferTooSmall}!usize {
-    const padding_len: u16 = 64;
-    const need = 16 + 1 + 2 + 2 + content.len + padding_len;
+    return appendVisionFrame(out, vision_cmd_end, uuid, content, 64);
+}
+
+/// Continuation Vision frame (no UUID) — used by tests / multi-block peers.
+pub fn appendVisionPaddingContinue(out: []u8, content: []const u8) error{BufferTooSmall}!usize {
+    return appendVisionFrame(out, vision_cmd_continue, null, content, 16);
+}
+
+pub fn appendVisionFrame(
+    out: []u8,
+    cmd: u8,
+    uuid: ?*const [16]u8,
+    content: []const u8,
+    padding_len: u16,
+) error{BufferTooSmall}!usize {
+    const hdr: usize = if (uuid != null) 16 + 5 else 5;
+    const need = hdr + content.len + padding_len;
     if (out.len < need) return error.BufferTooSmall;
-    @memcpy(out[0..16], uuid);
-    out[16] = vision_cmd_end;
-    std.mem.writeInt(u16, out[17..19], @intCast(content.len), .big);
-    std.mem.writeInt(u16, out[19..21], padding_len, .big);
-    if (content.len > 0) @memcpy(out[21..][0..content.len], content);
-    @memset(out[21 + content.len ..][0..padding_len], 0);
+    var i: usize = 0;
+    if (uuid) |u| {
+        @memcpy(out[0..16], u);
+        i = 16;
+    }
+    out[i] = cmd;
+    std.mem.writeInt(u16, out[i + 1 ..][0..2], @intCast(content.len), .big);
+    std.mem.writeInt(u16, out[i + 3 ..][0..2], padding_len, .big);
+    i += 5;
+    if (content.len > 0) @memcpy(out[i..][0..content.len], content);
+    i += content.len;
+    @memset(out[i .. i + padding_len], 0);
     return need;
 }
 
@@ -115,27 +143,35 @@ pub const VisionFrame = struct {
 };
 
 /// Parse one Vision frame at the front of `buf`.
-/// `NeedMore` if the header/payload is incomplete; `NotVision` if it does not start with `uuid`.
-pub fn consumeVisionFrame(buf: []const u8, uuid: *const [16]u8) error{ NeedMore, NotVision }!VisionFrame {
-    if (buf.len < 16) return error.NeedMore;
-    if (!std.mem.eql(u8, buf[0..16], uuid)) return error.NotVision;
-    if (buf.len < 21) return error.NeedMore;
-    const cmd = buf[16];
-    const content_len: usize = std.mem.readInt(u16, buf[17..19], .big);
-    const padding_len: usize = std.mem.readInt(u16, buf[19..21], .big);
-    const total = 21 + content_len + padding_len;
+/// First block (`state.expect_uuid`): requires leading `uuid`. Later Continue blocks omit UUID.
+/// `NeedMore` if incomplete; `NotVision` only when expecting UUID and prefix does not match.
+pub fn consumeVisionFrame(
+    buf: []const u8,
+    uuid: *const [16]u8,
+    state: *VisionUnpadState,
+) error{ NeedMore, NotVision }!VisionFrame {
+    var hdr_off: usize = 0;
+    if (state.expect_uuid) {
+        if (buf.len < 16) return error.NeedMore;
+        if (!std.mem.eql(u8, buf[0..16], uuid)) return error.NotVision;
+        hdr_off = 16;
+    }
+    if (buf.len < hdr_off + 5) return error.NeedMore;
+    const cmd = buf[hdr_off];
+    const content_len: usize = std.mem.readInt(u16, buf[hdr_off + 1 ..][0..2], .big);
+    const padding_len: usize = std.mem.readInt(u16, buf[hdr_off + 3 ..][0..2], .big);
+    const content_off = hdr_off + 5;
+    const total = content_off + content_len + padding_len;
     if (buf.len < total) return error.NeedMore;
+
+    // Commit after a complete frame is available (matches xray clearing UserUUID).
+    state.expect_uuid = false;
+
     return .{
         .consumed = total,
-        .content = buf[21 .. 21 + content_len],
+        .content = buf[content_off .. content_off + content_len],
         .switch_to_raw = cmd == vision_cmd_end or cmd == vision_cmd_direct,
     };
-}
-
-/// If buf looks like a complete Vision frame, return the content slice; else return buf.
-pub fn maybeUnwrapVision(buf: []const u8, uuid: *const [16]u8) []const u8 {
-    const frame = consumeVisionFrame(buf, uuid) catch return buf;
-    return frame.content;
 }
 
 test "parseUuid" {
@@ -170,17 +206,44 @@ test "consumeVisionFrame NeedMore and content before padding" {
 
     // Wire layout: header then content immediately (xray order).
     try std.testing.expectEqualStrings(http, frame_buf[21 .. 21 + http.len]);
-    try std.testing.expectError(error.NeedMore, consumeVisionFrame(frame_buf[0..20], &uuid));
+    var state: VisionUnpadState = .{};
+    try std.testing.expectError(error.NeedMore, consumeVisionFrame(frame_buf[0..20], &uuid, &state));
+    try std.testing.expect(state.expect_uuid);
 
-    const frame = try consumeVisionFrame(frame_buf[0..n], &uuid);
+    const frame = try consumeVisionFrame(frame_buf[0..n], &uuid, &state);
     try std.testing.expectEqual(n, frame.consumed);
     try std.testing.expectEqualStrings(http, frame.content);
     try std.testing.expect(frame.switch_to_raw);
+    try std.testing.expect(!state.expect_uuid);
 }
 
 test "consumeVisionFrame rejects non-uuid prefix" {
     var uuid: [16]u8 = [_]u8{0xab} ** 16;
     // VLESS empty response header + HTTP must not be mistaken for Vision.
     const raw = "\x00\x00HTTP/1.1 200 OK\r\n\r\n";
-    try std.testing.expectError(error.NotVision, consumeVisionFrame(raw, &uuid));
+    var state: VisionUnpadState = .{};
+    try std.testing.expectError(error.NotVision, consumeVisionFrame(raw, &uuid, &state));
+}
+
+test "consumeVisionFrame continue block omits UUID" {
+    var uuid: [16]u8 = [_]u8{0xcd} ** 16;
+    const part1 = "HTTP/1.1 200 OK\r\n";
+    const part2 = "Content-Length: 0\r\n\r\n";
+
+    var first: [128]u8 = undefined;
+    // First block: UUID + Continue (not End).
+    const n1 = try appendVisionFrame(&first, vision_cmd_continue, &uuid, part1, 8);
+
+    var cont: [128]u8 = undefined;
+    const n2 = try appendVisionPaddingContinue(&cont, part2);
+
+    var state: VisionUnpadState = .{};
+    const f1 = try consumeVisionFrame(first[0..n1], &uuid, &state);
+    try std.testing.expectEqualStrings(part1, f1.content);
+    try std.testing.expect(!f1.switch_to_raw);
+    try std.testing.expect(!state.expect_uuid);
+
+    const f2 = try consumeVisionFrame(cont[0..n2], &uuid, &state);
+    try std.testing.expectEqualStrings(part2, f2.content);
+    try std.testing.expect(!f2.switch_to_raw);
 }

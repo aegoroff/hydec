@@ -870,6 +870,7 @@ pub fn probeVless(
         var http_len: usize = 0;
         var stripped_header = false;
         var vision_raw = !use_vision;
+        var vision_state: vless.VisionUnpadState = .{};
         var resp: [16384]u8 = undefined;
 
         while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
@@ -889,6 +890,7 @@ pub fn probeVless(
                 &uuid_bytes,
                 &stripped_header,
                 &vision_raw,
+                &vision_state,
             );
         }
         const first_ms = netutil.elapsedMs(first_start, io);
@@ -900,13 +902,23 @@ pub fn probeVless(
         const n = rc.readApp(&resp) catch |err| {
             return if (util.isPeerClosed(err)) first_ms else err;
         };
-        if (vision_raw) {
-            if (n == 0) return first_ms;
-            return netutil.elapsedMs(steady_start, io);
-        }
-        const body = vless.maybeUnwrapVision(resp[0..n], &uuid_bytes);
-        if (body.len == 0) return first_ms;
-        return netutil.elapsedMs(steady_start, io);
+        if (n == 0) return first_ms;
+        if (stream_len + n > stream.len) return error.BufferTooSmall;
+        @memcpy(stream[stream_len..][0..n], resp[0..n]);
+        stream_len += n;
+        const http_before = http_len;
+        try drainVlessVisionStream(
+            &stream,
+            &stream_len,
+            &http_buf,
+            &http_len,
+            &uuid_bytes,
+            &stripped_header,
+            &vision_raw,
+            &vision_state,
+        );
+        if (http_len > http_before) return netutil.elapsedMs(steady_start, io);
+        return first_ms;
     }
 }
 
@@ -920,6 +932,7 @@ fn drainVlessVisionStream(
     uuid: *const [16]u8,
     stripped: *bool,
     vision_raw: *bool,
+    vision_state: *vless.VisionUnpadState,
 ) !void {
     if (!stripped.*) {
         const hdr = vless.responseHeaderLen(stream[0..stream_len.*]) catch |err| switch (err) {
@@ -932,7 +945,7 @@ fn drainVlessVisionStream(
 
     while (stream_len.* > 0) {
         if (!vision_raw.*) {
-            const frame = vless.consumeVisionFrame(stream[0..stream_len.*], uuid) catch |err| switch (err) {
+            const frame = vless.consumeVisionFrame(stream[0..stream_len.*], uuid, vision_state) catch |err| switch (err) {
                 error.NeedMore => return,
                 error.NotVision => {
                     // Peer already switched to raw (or never wrapped this chunk).
@@ -1035,8 +1048,9 @@ test "drainVlessVisionStream strips header before Vision unwrap" {
     var http_len: usize = 0;
     var stripped = false;
     var vision_raw = false;
+    var vision_state: vless.VisionUnpadState = .{};
 
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
     try std.testing.expect(stripped);
     try std.testing.expect(vision_raw);
     try std.testing.expectEqual(@as(usize, 0), stream_len);
@@ -1055,19 +1069,108 @@ test "drainVlessVisionStream splits header then Vision across pushes" {
     var http_len: usize = 0;
     var stripped = false;
     var vision_raw = false;
+    var vision_state: vless.VisionUnpadState = .{};
 
     stream[0] = 0;
     stream_len = 1;
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
     try std.testing.expect(!stripped);
 
     stream[stream_len] = 0;
     stream_len += 1;
     @memcpy(stream[stream_len..][0..vn], vision[0..vn]);
     stream_len += vn;
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
     try std.testing.expect(stripped);
     try std.testing.expectEqualStrings(http, http_buf[0..http_len]);
+}
+
+test "drainVlessVisionStream continues without UUID then End" {
+    var uuid: [16]u8 = [_]u8{0x11} ** 16;
+    const part1 = "HTTP/1.1 200 OK\r\n";
+    const part2 = "Content-Length: 0\r\n\r\n";
+
+    var first: [256]u8 = undefined;
+    const n1 = try vless.appendVisionFrame(&first, vless.vision_cmd_continue, &uuid, part1, 8);
+    var cont: [256]u8 = undefined;
+    const n2 = try vless.appendVisionPaddingContinue(&cont, part2);
+    var endf: [64]u8 = undefined;
+    const n3 = try vless.appendVisionFrame(&endf, vless.vision_cmd_end, null, "", 8);
+
+    var stream: [1024]u8 = undefined;
+    stream[0] = 0;
+    stream[1] = 0;
+    @memcpy(stream[2..][0..n1], first[0..n1]);
+    @memcpy(stream[2 + n1 ..][0..n2], cont[0..n2]);
+    @memcpy(stream[2 + n1 + n2 ..][0..n3], endf[0..n3]);
+    var stream_len: usize = 2 + n1 + n2 + n3;
+
+    var http_buf: [512]u8 = undefined;
+    var http_len: usize = 0;
+    var stripped = false;
+    var vision_raw = false;
+    var vision_state: vless.VisionUnpadState = .{};
+
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try std.testing.expect(stripped);
+    try std.testing.expect(vision_raw);
+    try std.testing.expect(!vision_state.expect_uuid);
+    try std.testing.expectEqualStrings(part1 ++ part2, http_buf[0..http_len]);
+}
+
+test "drainVlessVisionStream steady raw after End grows http" {
+    var uuid: [16]u8 = [_]u8{0x22} ** 16;
+    const http = "HTTP/1.1 200 OK\r\n\r\n";
+    var vision: [256]u8 = undefined;
+    const vn = try vless.appendVisionPaddingEnd(&vision, &uuid, http);
+
+    var stream: [512]u8 = undefined;
+    stream[0] = 0;
+    stream[1] = 0;
+    @memcpy(stream[2..][0..vn], vision[0..vn]);
+    var stream_len: usize = 2 + vn;
+    var http_buf: [512]u8 = undefined;
+    var http_len: usize = 0;
+    var stripped = false;
+    var vision_raw = false;
+    var vision_state: vless.VisionUnpadState = .{};
+
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try std.testing.expect(vision_raw);
+    const before = http_len;
+
+    const more = "HTTP/1.1 200 OK\r\n\r\n";
+    @memcpy(stream[0..more.len], more);
+    stream_len = more.len;
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try std.testing.expect(http_len > before);
+    try std.testing.expectEqualStrings(http ++ more, http_buf[0..http_len]);
+}
+
+test "drainVlessVisionStream incomplete Vision does not grow http" {
+    var uuid: [16]u8 = [_]u8{0x33} ** 16;
+    var vision: [256]u8 = undefined;
+    const vn = try vless.appendVisionPaddingEnd(&vision, &uuid, "HTTP/1.1 200 OK\r\n\r\n");
+
+    var stream: [512]u8 = undefined;
+    stream[0] = 0;
+    stream[1] = 0;
+    // Only part of the Vision frame — decoder must wait (NeedMore).
+    const partial = 2 + 20;
+    @memcpy(stream[2..][0 .. partial - 2], vision[0 .. partial - 2]);
+    var stream_len: usize = partial;
+    var http_buf: [512]u8 = undefined;
+    var http_len: usize = 0;
+    var stripped = false;
+    var vision_raw = false;
+    var vision_state: vless.VisionUnpadState = .{};
+
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try std.testing.expect(stripped);
+    try std.testing.expect(!vision_raw);
+    try std.testing.expectEqual(@as(usize, 0), http_len);
+    try std.testing.expect(stream_len > 0);
+    _ = vn;
 }
 
 test "parseServerHelloX25519 accepts key_share" {
