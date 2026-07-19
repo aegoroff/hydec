@@ -58,6 +58,17 @@ fn ensureCaBundle(gpa: std.mem.Allocator, io: Io) !*Certificate.Bundle {
     return &ca_state.bundle;
 }
 
+/// Free the process-wide CA cache. Call once after all Trojan probes finish
+/// (DebugAllocator otherwise reports Bundle.rescan allocations as leaks).
+pub fn deinitCaBundle(gpa: std.mem.Allocator, io: Io) void {
+    ca_state.mutex.lockUncancelable(io);
+    defer ca_state.mutex.unlock(io);
+    if (!ca_state.loaded) return;
+    ca_state.bundle.deinit(gpa);
+    ca_state.bundle = .empty;
+    ca_state.loaded = false;
+}
+
 fn tlsOptions(
     gpa: std.mem.Allocator,
     io: Io,

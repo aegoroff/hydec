@@ -7,6 +7,7 @@ const fetch = @import("fetch.zig");
 const subscription = @import("subscription.zig");
 const proxy_uri = @import("proxy_uri.zig");
 const probe = @import("probe.zig");
+const trojan = @import("trojan.zig");
 
 const utf8_console = if (builtin.os.tag == .windows)
     @import("utf8_console.zig")
@@ -19,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
     utf8_console.setupConsole();
     const gpa = init.gpa;
     const io = init.io;
+    defer trojan.deinitCaBundle(gpa, io);
 
     const parsed = cli.parse(gpa, io, init.minimal.args) catch |err| switch (err) {
         error.MissingRequiredArgument => {
