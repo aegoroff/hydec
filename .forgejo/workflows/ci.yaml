@@ -28,7 +28,7 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             ver="${GITHUB_REF#refs/tags/v}"
           else
-            ver="0.0.0"
+            ver="0.0.${GITHUB_RUN_NUMBER}"
           fi
           echo "using version ${ver}"
           echo "version=${ver}" >> "$GITHUB_OUTPUT"
