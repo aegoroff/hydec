@@ -626,6 +626,7 @@ pub fn connect(
     }
 
     var client_fin_key: [32]u8 = undefined;
+    var server_fin_key: [32]u8 = undefined;
     var master: [32]u8 = undefined;
 
     {
@@ -637,6 +638,7 @@ pub fn connect(
         const client_hs = hkdfExpandLabel(32, &hs_secret, "c hs traffic", &hello_hash);
         const server_hs = hkdfExpandLabel(32, &hs_secret, "s hs traffic", &hello_hash);
         client_fin_key = hkdfExpandLabel(32, &client_hs, "finished", "");
+        server_fin_key = hkdfExpandLabel(32, &server_hs, "finished", "");
         rc.conn.hs_client_key = hkdfExpandLabel(16, &client_hs, "key", "");
         rc.conn.hs_server_key = hkdfExpandLabel(16, &server_hs, "key", "");
         rc.conn.hs_client_iv = hkdfExpandLabel(12, &client_hs, "iv", "");
@@ -645,7 +647,9 @@ pub fn connect(
         master = HkdfSha256.extract(&derived2, &zeroes);
     }
 
-    // Read encrypted handshake messages until Finished (reassemble across TLS records).
+    // Read encrypted handshake messages until Server Finished (reassemble across TLS records).
+    // Transcript is updated per handshake message so Finished verify_data can be checked
+    // against Hash(messages before Finished).
     var saw_finished = false;
     var hs_pending: [32768]u8 = undefined;
     var hs_pending_len: usize = 0;
@@ -657,7 +661,6 @@ pub fn connect(
         };
         if (rec.typ == 21) return error.TlsAlert;
         if (rec.typ != 22) continue;
-        rc.transcript.update(buf[0..rec.len]);
         if (hs_pending_len + rec.len > hs_pending.len) return error.BufferTooSmall;
         @memcpy(hs_pending[hs_pending_len..][0..rec.len], buf[0..rec.len]);
         hs_pending_len += rec.len;
@@ -669,7 +672,21 @@ pub fn connect(
             // Bound claimed length so a hostile/corrupt peer cannot fill the pending buffer forever.
             if (hl > 16384) return error.TlsDecodeError;
             if (off + 4 + hl > hs_pending_len) break;
-            if (ht == 20) saw_finished = true;
+            const msg = hs_pending[off .. off + 4 + hl];
+            if (ht == 20) {
+                if (hl != 32) return error.TlsDecodeError;
+                var pre_fin_hash: [32]u8 = undefined;
+                {
+                    var tc = rc.transcript;
+                    tc.final(&pre_fin_hash);
+                }
+                const expected = tls.hmac(HmacSha256, &pre_fin_hash, server_fin_key);
+                if (!std.mem.eql(u8, msg[4..], &expected)) return error.TlsFinishedVerifyFailed;
+                rc.transcript.update(msg);
+                saw_finished = true;
+            } else {
+                rc.transcript.update(msg);
+            }
             off += 4 + hl;
         }
         if (off > 0) {
@@ -759,8 +776,7 @@ pub fn probeVless(
         var first_ms: ?u64 = null;
         var http_buf: [16384]u8 = undefined;
         var http_len: usize = 0;
-        var attempts: usize = 0;
-        while (attempts < 48) : (attempts += 1) {
+        while (true) {
             const n = rc.readApp(app_buf[0..]) catch |err| {
                 if (warmup_done and first_ms != null and util.isPeerClosed(err)) return first_ms.?;
                 return err;
@@ -850,8 +866,6 @@ pub fn probeVless(
                 gather_len = remain;
             }
         }
-        if (first_ms) |ms| return ms;
-        return error.GrpcNoData;
     } else {
         const first_start = netutil.monoNow(io);
         try rc.writeApp(vless_buf[0..vless_len]);
@@ -864,7 +878,10 @@ pub fn probeVless(
         var resp: [16384]u8 = undefined;
 
         while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-            const n = try rc.readApp(&resp);
+            const n = rc.readApp(&resp) catch |err| {
+                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(err)) break;
+                return err;
+            };
             const piece = vless.maybeUnwrapVision(resp[0..n], &uuid_bytes);
             if (piece.len == 0) continue;
             try appendStripVlessHeader(&http_buf, &http_len, piece, &stripped_header);

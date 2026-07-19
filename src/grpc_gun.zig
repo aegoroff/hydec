@@ -138,8 +138,9 @@ pub fn buildGunHeaders(out: []u8, service_name: []const u8, authority: []const u
     return 9 + hp;
 }
 
-/// True if an HTTP/2 HEADERS block starts with indexed `:status: 200` (static table index 8 → 0x88).
-/// Skips PADDED / PRIORITY framing so a mid-value 0x88 cannot false-positive.
+/// True if an HTTP/2 HEADERS block indicates `:status: 200`.
+/// Accepts indexed static-table form (`0x88`) and literal forms with indexed or
+/// literal `:status` name and raw value `200`. Skips PADDED / PRIORITY framing.
 pub fn headersIndicateStatus200(payload: []const u8, flags: u8) bool {
     var p = payload;
     if ((flags & 0x08) != 0) { // PADDED
@@ -153,7 +154,85 @@ pub fn headersIndicateStatus200(payload: []const u8, flags: u8) bool {
         if (p.len < 5) return false;
         p = p[5..];
     }
-    return p.len >= 1 and p[0] == 0x88;
+    return hpackHasStatus200(p);
+}
+
+fn hpackHasStatus200(block: []const u8) bool {
+    var p = block;
+    while (p.len > 0) {
+        const b = p[0];
+        if ((b & 0x80) != 0) {
+            // Indexed header field representation.
+            const idx = b & 0x7f;
+            if (idx == 0) return false;
+            if (idx == 8) return true; // static :status 200
+            p = p[1..];
+            continue;
+        }
+        if ((b & 0xc0) == 0x40) {
+            // Literal with incremental indexing.
+            const name_idx = b & 0x3f;
+            p = p[1..];
+            const is_status = blk: {
+                if (name_idx == 8) break :blk true;
+                if (name_idx != 0) break :blk false;
+                break :blk hpackMatchLiteralName(&p, ":status") catch return false;
+            };
+            if (!is_status) {
+                if (!hpackSkipString(&p)) return false;
+                continue;
+            }
+            return hpackConsumeRawValue(&p, "200");
+        }
+        if ((b & 0xf0) == 0x00 or (b & 0xf0) == 0x10) {
+            // Without indexing / never indexed — 4-bit name index.
+            const name_idx = b & 0x0f;
+            p = p[1..];
+            const is_status = blk: {
+                if (name_idx == 8) break :blk true;
+                if (name_idx != 0) break :blk false;
+                break :blk hpackMatchLiteralName(&p, ":status") catch return false;
+            };
+            if (!is_status) {
+                if (!hpackSkipString(&p)) return false;
+                continue;
+            }
+            return hpackConsumeRawValue(&p, "200");
+        }
+        // Dynamic table size update (0x20) or unknown — stop.
+        return false;
+    }
+    return false;
+}
+
+fn hpackSkipString(p: *[]const u8) bool {
+    const s = p.*;
+    if (s.len < 1) return false;
+    const len: usize = s[0] & 0x7f;
+    if (len == 0x7f) return false; // overlong; status values are tiny
+    if (1 + len > s.len) return false;
+    p.* = s[1 + len ..];
+    return true;
+}
+
+fn hpackMatchLiteralName(p: *[]const u8, want: []const u8) error{InvalidHpack}!bool {
+    const s = p.*;
+    if (s.len < 1) return error.InvalidHpack;
+    if ((s[0] & 0x80) != 0) return error.InvalidHpack; // Huffman name unused for :status
+    const len: usize = s[0] & 0x7f;
+    if (len == 0x7f or 1 + len > s.len) return error.InvalidHpack;
+    const matched = std.mem.eql(u8, s[1 .. 1 + len], want);
+    p.* = s[1 + len ..];
+    return matched;
+}
+
+fn hpackConsumeRawValue(p: *[]const u8, want: []const u8) bool {
+    const s = p.*;
+    if (s.len < 1) return false;
+    if ((s[0] & 0x80) != 0) return false; // Huffman — uncommon for "200"
+    const len: usize = s[0] & 0x7f;
+    if (len == 0x7f or 1 + len > s.len) return false;
+    return std.mem.eql(u8, s[1 .. 1 + len], want);
 }
 
 pub fn buildDataFrame(out: []u8, stream_id: u31, payload: []const u8, end_stream: bool) error{BufferTooSmall}!usize {
@@ -212,10 +291,29 @@ test "headersIndicateStatus200 skips padding" {
     // PADDED + indexed :status 200
     const payload = [_]u8{ 2, 0x88, 0xaa, 0xbb };
     try std.testing.expect(headersIndicateStatus200(&payload, 0x08));
-    // 0x88 buried in value must not match without leading indexed field
+    // 0x88 buried in value must not match without a real :status field
     const noise = [_]u8{ 0x00, 0x88 };
     try std.testing.expect(!headersIndicateStatus200(&noise, 0));
     try std.testing.expect(headersIndicateStatus200(&[_]u8{0x88}, 0));
+}
+
+test "headersIndicateStatus200 accepts literal :status 200" {
+    // Literal without indexing, name index 8, raw "200"
+    const indexed_name = [_]u8{ 0x08, 0x03, '2', '0', '0' };
+    try std.testing.expect(headersIndicateStatus200(&indexed_name, 0));
+    // Incremental indexing, name index 8
+    const incr = [_]u8{ 0x48, 0x03, '2', '0', '0' };
+    try std.testing.expect(headersIndicateStatus200(&incr, 0));
+    // Literal name ":status" + "200" after an unrelated field
+    const lit_name = [_]u8{
+        0x00, 0x04, 'h', 'o', 's', 't', 0x01, 'x',
+        0x00, 0x07, ':', 's', 't', 'a', 't',  'u',
+        's',  0x03, '2', '0', '0',
+    };
+    try std.testing.expect(headersIndicateStatus200(&lit_name, 0));
+    // Wrong status
+    const not_ok = [_]u8{ 0x08, 0x03, '4', '0', '4' };
+    try std.testing.expect(!headersIndicateStatus200(&not_ok, 0));
 }
 
 test "readVarint rejects overlong continuation" {

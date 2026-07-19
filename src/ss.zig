@@ -277,7 +277,12 @@ pub fn probe(
 
     // Warmup: drain first HTTP response so the second request is clean.
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-        const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+        const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
+            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            // HTTP/1.0 close-delimited: headers + peer close completes the response.
+            if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+            return e;
+        };
         if (http_len + n > http_buf.len) return error.BufferTooSmall;
         @memcpy(http_buf[http_len..][0..n], chunk_buf[0..n]);
         http_len += n;

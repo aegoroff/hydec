@@ -158,13 +158,25 @@ pub fn probe(
     defer gpa.free(frame_buf);
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         if (transport_ws) {
-            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
+                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                return e;
+            };
             if (http_len + n > http_buf.len) return error.BufferTooSmall;
             @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
             http_len += n;
         } else {
-            const n = tls_reader.readSliceShort(frame_buf) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
-            if (n == 0) return netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
+            const n = tls_reader.readSliceShort(frame_buf) catch |err| {
+                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                return e;
+            };
+            if (n == 0) {
+                const e = netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
+                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                return e;
+            }
             if (http_len + n > http_buf.len) return error.BufferTooSmall;
             @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
             http_len += n;

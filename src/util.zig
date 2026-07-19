@@ -111,8 +111,15 @@ pub const probe_http_port: u16 = 80;
 pub const probe_http =
     "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nConnection: keep-alive\r\n\r\n";
 
+/// True if `buf` contains a complete HTTP header block (`\r\n\r\n`).
+pub fn httpHeadersComplete(buf: []const u8) bool {
+    return std.mem.indexOf(u8, buf, "\r\n\r\n") != null;
+}
+
 /// If `buf` holds a complete HTTP/1.x response, return its total size; otherwise `null`.
-/// Supports `Content-Length` and `Transfer-Encoding: chunked` (cdn-cgi/trace uses chunked).
+/// Supports `Content-Length`, `Transfer-Encoding: chunked`, and HTTP/1.1 empty body
+/// when neither is present (RFC 7230 §3.3.3). HTTP/1.0 without framing stays
+/// incomplete until the peer closes (see warmup loops + `isPeerClosed`).
 pub fn httpResponseTotalLen(buf: []const u8) ?usize {
     const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
     const headers = buf[0..sep];
@@ -121,7 +128,7 @@ pub fn httpResponseTotalLen(buf: []const u8) ?usize {
     var chunked = false;
     var content_len: ?usize = null;
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    _ = lines.next(); // status line
+    const status = lines.next() orelse return null;
     while (lines.next()) |line| {
         if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
             const v = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
@@ -134,9 +141,15 @@ pub fn httpResponseTotalLen(buf: []const u8) ?usize {
 
     if (chunked) return httpChunkedBodyEnd(buf, body_start);
 
-    const cl = content_len orelse return null;
-    if (buf.len < body_start + cl) return null;
-    return body_start + cl;
+    if (content_len) |cl| {
+        if (buf.len < body_start + cl) return null;
+        return body_start + cl;
+    }
+
+    // No Content-Length / chunked: HTTP/1.1+ means empty body. HTTP/1.0 is
+    // close-delimited — caller must accept via peer close after headers.
+    if (std.mem.startsWith(u8, status, "HTTP/1.0")) return null;
+    return body_start;
 }
 
 /// Parse chunked body starting at `body_start`; return end offset past the final chunk, or null.
@@ -233,7 +246,14 @@ test "httpResponseTotalLen needs Content-Length body" {
     try std.testing.expect(httpResponseTotalLen(partial) == null);
     const full = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
     try std.testing.expectEqual(@as(usize, full.len), httpResponseTotalLen(full).?);
-    try std.testing.expect(httpResponseTotalLen("HTTP/1.1 200 OK\r\n\r\n") == null);
+}
+
+test "httpResponseTotalLen HTTP/1.1 empty body without framing" {
+    const empty = "HTTP/1.1 200 OK\r\n\r\n";
+    try std.testing.expectEqual(@as(usize, empty.len), httpResponseTotalLen(empty).?);
+    // HTTP/1.0 without CL/chunked stays open until peer close.
+    try std.testing.expect(httpResponseTotalLen("HTTP/1.0 200 OK\r\n\r\n") == null);
+    try std.testing.expect(httpHeadersComplete("HTTP/1.0 200 OK\r\n\r\n"));
 }
 
 test "httpResponseTotalLen chunked body" {
