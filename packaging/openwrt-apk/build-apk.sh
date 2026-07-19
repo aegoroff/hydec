@@ -48,6 +48,7 @@ Example:
     --bin zig-out/bin-x86_64-linux-musl/hydec \
     --arch x86_64 \
     --version 0.1.0
+  # → zig-out/apk/x86_64/hydec-0.1.0-r1.apk
 EOF
 }
 
@@ -150,11 +151,14 @@ ROOTFS="$WORKDIR/root"
 mkdir -p "$ROOTFS/usr/bin"
 install -m 0755 "$BIN_PATH" "$ROOTFS/usr/bin/hydec"
 
-mkdir -p "$OUT_DIR"
-OUT_APK="$OUT_DIR/${PKG_NAME}-${PKG_VERSION}-${PKG_ARCH}.apk"
+mkdir -p "$OUT_DIR/$PKG_ARCH"
+# OpenWrt Image Builder indexes by name-version.apk only (no arch in filename).
+# See https://github.com/openwrt/openwrt/issues/23154
+OUT_APK="$OUT_DIR/$PKG_ARCH/${PKG_NAME}-${PKG_VERSION}.apk"
 
 # Unsigned package for OpenWrt 25.12+; install with:
 #   apk add --allow-untrusted ./hydec-….apk
+# Image Builder: file must be named name-version.apk (no arch in filename).
 # ca-bundle: system trust store for HTTPS subscription fetch / Trojan TLS.
 export APK_BIN ROOTFS OUT_APK PKG_NAME PKG_VERSION PKG_ARCH URL MAINTAINER
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}"

@@ -68,7 +68,7 @@ is shipped. `_git*` is never produced; unsanitizable inputs fail the build.
 | `0.1.0-r2` | `0.1.0-r2` (unchanged) |
 
 ```bash
-# x86_64 + aarch64_cortex-a53 + aarch64_generic → zig-out/apk/
+# → zig-out/apk/{x86_64,aarch64_cortex-a53,aarch64_generic}/hydec-0.1.0-r1.apk
 just ver=0.1.0 openwrt-apk
 
 # one arch
@@ -77,15 +77,31 @@ just ver=0.1.0 zig_arch=aarch64 openwrt_arch=aarch64_cortex-a53 openwrt-apk-one
 just ver=0.1.0 zig_arch=aarch64 openwrt_arch=aarch64_generic openwrt-apk-one
 ```
 
+Filenames are `name-version.apk` (arch is only in the directory / package metadata).
+OpenWrt Image Builder requires that exact form — an arch suffix in the filename
+causes `package mentioned in index not found`.
+
+## Image Builder
+
+For BPI-R4 / mediatek filogic use `aarch64_cortex-a53`:
+
+```bash
+cp zig-out/apk/aarch64_cortex-a53/hydec-0.1.0-r1.apk \
+  openwrt-imagebuilder-…/packages/hydec-0.1.0-r1.apk
+```
+
+If you downloaded a release asset named `hydec-0.1.0-r1.aarch64_cortex-a53.apk`,
+rename it to `hydec-0.1.0-r1.apk` in `packages/`.
+
 ## Install on device
 
 Match the `.apk` to `cat /etc/apk/arch` on the router (usually `aarch64_cortex-a53`):
 
 ```bash
-scp zig-out/apk/hydec-0.1.0-r1-aarch64_cortex-a53.apk root@router:/tmp/
+scp zig-out/apk/aarch64_cortex-a53/hydec-0.1.0-r1.apk root@router:/tmp/
 # If a previous failed apk add left a broken world pin:
 #   grep hydec /etc/apk/world && sed -i '/^hydec/d' /etc/apk/world
-ssh root@router 'apk add --allow-untrusted /tmp/hydec-0.1.0-r1-aarch64_cortex-a53.apk'
+ssh root@router 'apk add --allow-untrusted /tmp/hydec-0.1.0-r1.apk'
 hydec -V
 ```
 

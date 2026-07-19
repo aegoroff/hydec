@@ -75,7 +75,7 @@ build-all:
 
 # OpenWrt 25.12+ unsigned .apk (MVP: x86_64 + both common aarch64 package arches)
 # Sanitizes ver= to X.Y.Z-rN (e.g. 0.1.0-dev -> 0.1.0-r1); refuses non-sanitizable.
-# Example: just ver=0.1.0 openwrt-apk   → hydec-0.1.0-r1-*.apk
+# Example: just ver=0.1.0 openwrt-apk   → zig-out/apk/<arch>/hydec-0.1.0-r1.apk
 # aarch64: same musl binary, two OpenWrt package arches (see /etc/apk/arch on device).
 zig_arch := "x86_64"
 openwrt_arch := "x86_64"

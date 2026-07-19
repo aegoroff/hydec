@@ -60,7 +60,7 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: apk
-          path: zig-out/apk/*.apk
+          path: zig-out/apk/**/*.apk
 
   generate-changelog:
     name: Generate changelog
@@ -110,7 +110,14 @@ jobs:
 
       - name: Prepare release artifacts
         run: |
-          find release -type f \( -name '*.tar.gz' -o -name '*.apk' \) -exec mv -v {} release/ \;
+          find release -type f -name '*.tar.gz' -exec mv -v {} release/ \;
+          # Unique flat names for Forgejo assets; Image Builder needs name-version.apk
+          # (copy from zig-out/apk/<arch>/ or rename: drop .<arch> before the .apk).
+          while IFS= read -r -d '' f; do
+            arch="$(basename "$(dirname "$f")")"
+            base="$(basename "$f" .apk)"
+            mv -v "$f" "release/${base}.${arch}.apk"
+          done < <(find release -type f -name '*.apk' -print0)
           ls -la release/
 
       - name: Check API access
