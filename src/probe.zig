@@ -160,6 +160,7 @@ pub fn failHint(err: anyerror) []const u8 {
         error.GrpcEmptyResponse => "empty/no-data",
         error.ProbeResponseMismatch => "bad/response",
         error.ExpectedVisionPadding => "vision/framing",
+        error.InvalidSsChunk => "ss/chunk",
         error.UnsupportedVlessEncryption => "unsupported-encryption",
         else => "error",
     };
