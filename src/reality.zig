@@ -717,8 +717,8 @@ fn appendStripVlessHeader(buf: []u8, len: *usize, chunk: []const u8, stripped: *
     stripped.* = true;
 }
 
-/// Probe VLESS over REALITY (TCP or gRPC gun).
-/// Warmup HTTP proves the tunnel; returned latency is the second (steady-state) request.
+/// Probe VLESS over REALITY (TCP Vision or gRPC gun).
+/// Warmup proves the tunnel; returned latency is the second (steady-state) request.
 pub fn probeVless(
     io: Io,
     host: []const u8,
@@ -741,7 +741,7 @@ pub fn probeVless(
 
     var vless_buf: [1024]u8 = undefined;
     if (grpc) {
-        const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid, "", .http);
+        const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid, "");
         var auth_buf: [256]u8 = undefined;
         const authority = try grpc_gun.formatAuthority(&auth_buf, sni_use, port, authority_param);
 
@@ -1036,7 +1036,6 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
     io.random(&entropy);
     const now = Io.Clock.real.now(io);
 
-    const start = netutil.monoNow(io);
     var tls_client = tls.Client.init(
         &pipe.reader,
         &pipe.writer,
@@ -1054,6 +1053,20 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
         return err;
     };
 
+    // Warmup: full inner TLS + first /cdn-cgi/trace (also catches dead Vision post-SH).
+    try writeHttpGet(&tls_client, &pipe);
+    var http_buf: [8192]u8 = undefined;
+    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf);
+    if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
+
+    // Steady-state: second request RTT (matches SS / Trojan / gRPC).
+    const steady_start = netutil.monoNow(io);
+    try writeHttpGet(&tls_client, &pipe);
+    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf);
+    return netutil.elapsedMs(steady_start, io);
+}
+
+fn writeHttpGet(tls_client: *tls.Client, pipe: *VisionPipe) !void {
     tls_client.writer.writeAll(util.probe_http) catch |err| {
         if (pipe.err) |e| return e;
         return err;
@@ -1062,14 +1075,15 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
         if (pipe.err) |e| return e;
         return err;
     };
+}
 
-    var http_buf: [8192]u8 = undefined;
+fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8) !usize {
     var http_len: usize = 0;
     while (true) {
         if (util.looksLikeCloudflareTrace(http_buf[0..http_len]) and
             util.httpResponseTotalLen(http_buf[0..http_len]) != null)
         {
-            break;
+            return http_len;
         }
         if (http_len >= http_buf.len) return error.BufferTooSmall;
         const n = tls_client.reader.readSliceShort(http_buf[http_len..]) catch |err| {
@@ -1085,8 +1099,7 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
         }
     }
     if (!util.looksLikeCloudflareTrace(http_buf[0..http_len])) return error.ProbeResponseMismatch;
-    if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
-    return netutil.elapsedMs(start, io);
+    return http_len;
 }
 
 /// Move bytes from `stream` into `http` after stripping the VLESS response header

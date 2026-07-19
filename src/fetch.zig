@@ -14,9 +14,6 @@ const FetchCtx = struct {
     body: ?[]u8 = null,
     err: ?anyerror = null,
     done: std.atomic.Value(bool) = .init(false),
-    /// Set by fetchUrl on timeout; worker must not destroy ctx after this —
-    /// only publish done so the joiner can clean up (unless worker_owns_cleanup).
-    abandoned: std.atomic.Value(bool) = .init(false),
     /// Set just before detach: worker destroys ctx when it finishes.
     worker_owns_cleanup: std.atomic.Value(bool) = .init(false),
     /// Only one side destroys the context.
@@ -44,7 +41,6 @@ fn finishWorker(ctx: *FetchCtx) void {
 fn fetchWorker(ctx: *FetchCtx) void {
     const gpa = ctx.gpa;
     const body = fetchUrlInner(gpa, ctx.io, ctx.url) catch |e| {
-        // Keep err even when abandoned so a grace-period joiner can inspect it.
         ctx.err = e;
         finishWorker(ctx);
         return;
@@ -95,7 +91,6 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
     const budget: i128 = @as(i128, timeout_secs) * std.time.ns_per_s;
     while (!ctx.done.load(.acquire)) {
         if (netutil.monoNow(io) - start >= budget) {
-            ctx.abandoned.store(true, .release);
             // Brief grace so a nearly-finished worker can publish done before detach.
             const grace_deadline = netutil.monoNow(io) + 250 * std.time.ns_per_ms;
             while (!ctx.done.load(.acquire) and netutil.monoNow(io) < grace_deadline) {

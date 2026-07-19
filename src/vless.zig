@@ -70,32 +70,17 @@ pub fn responseHeaderLen(buf: []const u8) error{ NeedMore, InvalidVlessResponse 
 
 const probe_http = util.probe_http;
 
-pub const ProbePayload = enum { http, tls };
-
-/// Encode a VLESS probe request.
-/// - `.http`: CONNECT host:80 + GET /cdn-cgi/trace (gRPC / plain TCP).
-/// - `.tls`: CONNECT host:443 + TLS ClientHello (Vision/REALITY TCP — matches real clients).
-pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8, flow: []const u8, payload: ProbePayload) !usize {
+/// Encode a VLESS probe: TCP CONNECT to probe host:80 + HTTP GET (gRPC / plain).
+pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8, flow: []const u8) !usize {
     var uuid: [16]u8 = undefined;
     try parseUuid(uuid_text, &uuid);
-    const port: u16 = switch (payload) {
-        .http => util.probe_http_port,
-        .tls => util.probe_tls_port,
-    };
-    var n = try encodeRequestDomain(out, &uuid, util.probe_domain, port, flow);
-
-    var tls_buf: [512]u8 = undefined;
-    const content: []const u8 = switch (payload) {
-        .http => probe_http,
-        .tls => tls_buf[0..try util.writeProbeClientHello(&tls_buf, util.probe_domain)],
-    };
-
+    var n = try encodeRequestDomain(out, &uuid, util.probe_domain, util.probe_http_port, flow);
     if (std.mem.indexOf(u8, flow, "vision") != null) {
-        n += try appendVisionPaddingEnd(out[n..], &uuid, content);
+        n += try appendVisionPaddingEnd(out[n..], &uuid, probe_http);
     } else {
-        if (out.len < n + content.len) return error.BufferTooSmall;
-        @memcpy(out[n..][0..content.len], content);
-        n += content.len;
+        if (out.len < n + probe_http.len) return error.BufferTooSmall;
+        @memcpy(out[n..][0..probe_http.len], probe_http);
+        n += probe_http.len;
     }
     return n;
 }
