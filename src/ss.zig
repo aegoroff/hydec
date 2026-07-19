@@ -262,7 +262,7 @@ pub fn probe(
     defer gpa.free(http_buf);
     var http_len: usize = 0;
 
-    // Warmup: drain first HTTP response so the second request is clean.
+    // Warmup: drain first HTTP response; require echoed warmup UA (same as gRPC/Vision).
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
@@ -274,11 +274,13 @@ pub fn probe(
         @memcpy(http_buf[http_len..][0..n], chunk_buf[0..n]);
         http_len += n;
     }
+    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
+        return error.ProbeResponseMismatch;
     const first_ms = netutil.elapsedMs(first_start, io);
 
     const steady_start = netutil.monoNow(io);
     var second: [512]u8 = undefined;
-    const second_len = try sealChunk(&ctx, &second, util.probe_http);
+    const second_len = try sealChunk(&ctx, &second, util.probe_http_steady);
     w.interface.writeAll(second[0..second_len]) catch |err| {
         const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
         return if (util.isPeerClosed(e)) first_ms else e;
@@ -287,10 +289,22 @@ pub fn probe(
         const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
         return if (util.isPeerClosed(e)) first_ms else e;
     };
-    _ = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
-        const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-        return if (util.isPeerClosed(e)) first_ms else e;
-    };
+    http_len = 0;
+    while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
+        const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
+            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+            return if (util.isPeerClosed(e)) first_ms else e;
+        };
+        if (http_len + n > http_buf.len) return error.BufferTooSmall;
+        @memcpy(http_buf[http_len..][0..n], chunk_buf[0..n]);
+        http_len += n;
+    }
+    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady)) {
+        // Keep-alive peer close without a steady body: fall back to warmup RTT.
+        if (http_len == 0) return first_ms;
+        return error.ProbeResponseMismatch;
+    }
 
     return netutil.elapsedMs(steady_start, io);
 }

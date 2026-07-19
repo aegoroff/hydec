@@ -145,7 +145,7 @@ pub const probe_http_port: u16 = 80;
 pub const probe_tls_port: u16 = 443;
 
 /// Distinct UAs so Cloudflare `/cdn-cgi/trace` echoes them in `uag=` — proves the
-/// steady-state reply is not a duplicate of the warmup response.
+/// steady-state reply is not a duplicate of the warmup response (all probe paths).
 pub const probe_ua_warmup = "hydec-warmup";
 pub const probe_ua_steady = "hydec-steady";
 
@@ -153,6 +153,7 @@ pub const probe_ua_steady = "hydec-steady";
 pub const probe_http =
     "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nUser-Agent: " ++ probe_ua_warmup ++ "\r\nConnection: keep-alive\r\n\r\n";
 
+/// Second (steady-state) request — distinct UA from `probe_http`.
 pub const probe_http_steady =
     "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nUser-Agent: " ++ probe_ua_steady ++ "\r\nConnection: keep-alive\r\n\r\n";
 

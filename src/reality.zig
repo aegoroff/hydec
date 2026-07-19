@@ -1078,20 +1078,20 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
     };
 
     // Warmup: full inner TLS + first /cdn-cgi/trace (also catches dead Vision post-SH).
-    try writeHttpGet(&tls_client, &pipe);
+    try writeHttpGet(&tls_client, &pipe, util.probe_http);
     var http_buf: [8192]u8 = undefined;
-    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf);
+    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf, util.probe_ua_warmup);
     if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
 
     // Steady-state: second request RTT (matches SS / Trojan / gRPC).
     const steady_start = netutil.monoNow(io);
-    try writeHttpGet(&tls_client, &pipe);
-    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf);
+    try writeHttpGet(&tls_client, &pipe, util.probe_http_steady);
+    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf, util.probe_ua_steady);
     return netutil.elapsedMs(steady_start, io);
 }
 
-fn writeHttpGet(tls_client: *tls.Client, pipe: *VisionPipe) !void {
-    tls_client.writer.writeAll(util.probe_http) catch |err| {
+fn writeHttpGet(tls_client: *tls.Client, pipe: *VisionPipe, request: []const u8) !void {
+    tls_client.writer.writeAll(request) catch |err| {
         if (pipe.err) |e| return e;
         return err;
     };
@@ -1101,10 +1101,10 @@ fn writeHttpGet(tls_client: *tls.Client, pipe: *VisionPipe) !void {
     };
 }
 
-fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8) !usize {
+fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8, require_uag: []const u8) !usize {
     var http_len: usize = 0;
     while (true) {
-        if (util.looksLikeCloudflareTrace(http_buf[0..http_len]) and
+        if (util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag) and
             util.httpResponseTotalLen(http_buf[0..http_len]) != null)
         {
             return http_len;
@@ -1117,12 +1117,13 @@ fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u
         if (n == 0) break;
         http_len += n;
         if (util.httpResponseTotalLen(http_buf[0..http_len]) != null and
-            !util.looksLikeCloudflareTrace(http_buf[0..http_len]))
+            !util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag))
         {
             return error.ProbeResponseMismatch;
         }
     }
-    if (!util.looksLikeCloudflareTrace(http_buf[0..http_len])) return error.ProbeResponseMismatch;
+    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag))
+        return error.ProbeResponseMismatch;
     return http_len;
 }
 

@@ -168,7 +168,7 @@ pub fn probe(
         tls_writer.flush() catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     }
 
-    // Warmup: drain first HTTP response so the second request is clean.
+    // Warmup: drain first HTTP response; require echoed warmup UA (same as gRPC/SS/Vision).
     const http_buf = try gpa.alloc(u8, 16384);
     defer gpa.free(http_buf);
     var http_len: usize = 0;
@@ -200,20 +200,18 @@ pub fn probe(
             http_len += n;
         }
     }
+    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
+        return error.ProbeResponseMismatch;
     const first_ms = netutil.elapsedMs(first_start, io);
 
     const steady_start = netutil.monoNow(io);
     if (transport_ws) {
-        ws.writeBinaryFrame(tls_writer, io, util.probe_http) catch |err| {
-            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-            return if (util.isPeerClosed(e)) first_ms else e;
-        };
-        _ = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
+        ws.writeBinaryFrame(tls_writer, io, util.probe_http_steady) catch |err| {
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };
     } else {
-        tls_writer.writeAll(util.probe_http) catch |err| {
+        tls_writer.writeAll(util.probe_http_steady) catch |err| {
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };
@@ -221,11 +219,37 @@ pub fn probe(
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             return if (util.isPeerClosed(e)) first_ms else e;
         };
-        var one: [1]u8 = undefined;
-        tls_reader.readSliceAll(&one) catch |err| {
-            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-            return if (util.isPeerClosed(e)) first_ms else e;
-        };
+    }
+    http_len = 0;
+    while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
+        if (transport_ws) {
+            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
+                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                return if (util.isPeerClosed(e)) first_ms else e;
+            };
+            if (http_len + n > http_buf.len) return error.BufferTooSmall;
+            @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
+            http_len += n;
+        } else {
+            const n = tls_reader.readSliceShort(frame_buf) catch |err| {
+                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                return if (util.isPeerClosed(e)) first_ms else e;
+            };
+            if (n == 0) {
+                const e = netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
+                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
+                return if (util.isPeerClosed(e)) first_ms else e;
+            }
+            if (http_len + n > http_buf.len) return error.BufferTooSmall;
+            @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
+            http_len += n;
+        }
+    }
+    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady)) {
+        if (http_len == 0) return first_ms;
+        return error.ProbeResponseMismatch;
     }
 
     return netutil.elapsedMs(steady_start, io);
