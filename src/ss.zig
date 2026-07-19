@@ -240,7 +240,6 @@ pub fn probe(
     var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
 
-    const first_start = netutil.monoNow(io);
     w.interface.writeAll(packet[0..off]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     w.interface.flush() catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
 
@@ -276,35 +275,31 @@ pub fn probe(
     }
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
         return error.ProbeResponseMismatch;
-    const first_ms = netutil.elapsedMs(first_start, io);
 
+    // Steady-state: require a real keep-alive reply (same fail-closed policy as gRPC/Vision).
     const steady_start = netutil.monoNow(io);
     var second: [512]u8 = undefined;
     const second_len = try sealChunk(&ctx, &second, util.probe_http_steady);
     w.interface.writeAll(second[0..second_len]) catch |err| {
-        const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-        return if (util.isPeerClosed(e)) first_ms else e;
+        return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     };
     w.interface.flush() catch |err| {
-        const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-        return if (util.isPeerClosed(e)) first_ms else e;
+        return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     };
     http_len = 0;
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            // HTTP/1.0 close-delimited steady body.
             if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(e)) break;
-            return if (util.isPeerClosed(e)) first_ms else e;
+            return e;
         };
         if (http_len + n > http_buf.len) return error.BufferTooSmall;
         @memcpy(http_buf[http_len..][0..n], chunk_buf[0..n]);
         http_len += n;
     }
-    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady)) {
-        // Keep-alive peer close without a steady body: fall back to warmup RTT.
-        if (http_len == 0) return first_ms;
+    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
         return error.ProbeResponseMismatch;
-    }
 
     return netutil.elapsedMs(steady_start, io);
 }

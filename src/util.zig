@@ -235,7 +235,7 @@ pub fn looksLikeCloudflareTraceUag(buf: []const u8, uag: []const u8) bool {
     return std.mem.indexOf(u8, buf, needle) != null;
 }
 
-/// True when the peer closed the tunnel (keep-alive second request often hits this).
+/// True when the peer closed the tunnel (warmup may complete via close-delimited HTTP/1.0).
 pub fn isPeerClosed(err: anyerror) bool {
     return switch (err) {
         error.EndOfStream,

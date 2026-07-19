@@ -777,6 +777,10 @@ pub fn probeVless(
         var saw_headers_ok = false;
         var stripped_vless = false;
         var warmup_done = false;
+        // Byte offset in `gather`: DATA/HEADERS with frame start < this are warmup leftovers
+        // already buffered when the steady request was written. Ignoring them avoids false-OK;
+        // keeping them in `gather` preserves HTTP/2 frame alignment (unlike wiping the buffer).
+        var discard_data_before: usize = 0;
         var steady_start: ?i128 = null;
         var http_buf: [16384]u8 = undefined;
         var http_len: usize = 0;
@@ -798,6 +802,7 @@ pub fn probeVless(
                 if (off + 9 + frame_len > gather_len) break;
 
                 const payload = gather[off + 9 .. off + 9 + frame_len];
+                const inflight = warmup_done and off < discard_data_before;
 
                 if (ftyp == 0x04 and (fflags & 0x01) == 0 and !settings_seen) {
                     settings_seen = true;
@@ -820,6 +825,8 @@ pub fn probeVless(
                     var pong: [17]u8 = undefined;
                     const pong_len = try grpc_gun.buildPingAck(&pong, payload[0..8]);
                     try rc.writeApp(pong[0..pong_len]);
+                } else if (inflight and (ftyp == 0x00 or ftyp == 0x01)) {
+                    // Warmup leftover DATA / trailers — ack framing only.
                 } else if (ftyp == 0x01 and request_sent) {
                     if (grpc_gun.headersIndicateStatus200(payload, fflags)) {
                         saw_headers_ok = true;
@@ -842,12 +849,8 @@ pub fn probeVless(
                             const dlen = try grpc_gun.buildDataFrame(&data_frame, 1, grpc_msg[0..glen], false);
                             try rc.writeApp(data_frame[0..dlen]);
                             steady_start = netutil.monoNow(io);
-                            // Drop the rest of this gather batch — any further frames were already
-                            // in-flight from the warmup response. Treating them as the keep-alive
-                            // reply false-OKs peers that never answer the second request.
-                            gather_len = 0;
-                            off = 0;
-                            break;
+                            // Bytes already in `gather` cannot be a reply to the steady write.
+                            discard_data_before = gather_len;
                         }
                     } else if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_steady)) {
                         return netutil.elapsedMs(steady_start.?, io);
@@ -868,6 +871,11 @@ pub fn probeVless(
                 const remain = gather_len - off;
                 if (remain > 0) std.mem.copyForwards(u8, gather[0..remain], gather[off..][0..remain]);
                 gather_len = remain;
+                if (discard_data_before > off) {
+                    discard_data_before -= off;
+                } else {
+                    discard_data_before = 0;
+                }
             }
         }
     } else {
