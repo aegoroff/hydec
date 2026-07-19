@@ -15,9 +15,11 @@ const FetchCtx = struct {
     err: ?anyerror = null,
     done: std.atomic.Value(bool) = .init(false),
     /// Set by fetchUrl on timeout; worker must not destroy ctx after this —
-    /// only publish done (and free an orphan body) so the joiner can clean up.
+    /// only publish done so the joiner can clean up (unless worker_owns_cleanup).
     abandoned: std.atomic.Value(bool) = .init(false),
-    /// Only the joining caller destroys the context (worker never takes cleanup).
+    /// Set just before detach: worker destroys ctx when it finishes.
+    worker_owns_cleanup: std.atomic.Value(bool) = .init(false),
+    /// Only one side destroys the context.
     cleanup_taken: std.atomic.Value(bool) = .init(false),
 };
 
@@ -32,29 +34,25 @@ fn destroyCtx(ctx: *FetchCtx) void {
     gpa.destroy(ctx);
 }
 
+fn finishWorker(ctx: *FetchCtx) void {
+    ctx.done.store(true, .release);
+    if (ctx.worker_owns_cleanup.load(.acquire)) {
+        if (tryTakeCleanup(ctx)) destroyCtx(ctx);
+    }
+}
+
 fn fetchWorker(ctx: *FetchCtx) void {
     const gpa = ctx.gpa;
     const body = fetchUrlInner(gpa, ctx.io, ctx.url) catch |e| {
-        // Abandoned: publish done so the grace poller never touches freed memory.
-        // Caller joins and destroys; do not free ctx here.
-        if (ctx.abandoned.load(.acquire)) {
-            ctx.done.store(true, .release);
-            return;
-        }
+        // Keep err even when abandoned so a grace-period joiner can inspect it.
         ctx.err = e;
-        ctx.done.store(true, .release);
+        finishWorker(ctx);
         return;
     };
 
-    if (ctx.abandoned.load(.acquire)) {
-        // Body not needed on timeout; free before signaling done.
-        gpa.free(body);
-        ctx.done.store(true, .release);
-        return;
-    }
-
+    // Always store the body: a grace-period joiner may still return success.
     ctx.body = body;
-    ctx.done.store(true, .release);
+    finishWorker(ctx);
 }
 
 /// Download URL body with an overall wall-clock deadline.
@@ -80,6 +78,18 @@ pub fn fetchUrl(gpa: std.mem.Allocator, io: Io, url: []const u8, timeout_secs: u
     return fetchUrlWait(io, ctx, thread, timeout_secs);
 }
 
+/// After abandon + join: return body if the download finished, else Timeout.
+fn takeResultAfterAbandon(ctx: *FetchCtx) ![]u8 {
+    if (!tryTakeCleanup(ctx)) {
+        // Worker already destroyed under worker_owns_cleanup.
+        return error.Timeout;
+    }
+    const body = ctx.body;
+    ctx.body = null;
+    destroyCtx(ctx);
+    return body orelse error.Timeout;
+}
+
 fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) ![]u8 {
     const start = netutil.monoNow(io);
     const budget: i128 = @as(i128, timeout_secs) * std.time.ns_per_s;
@@ -93,13 +103,17 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
                 io.sleep(pause, .awake) catch {};
             }
             if (ctx.done.load(.acquire)) {
-                // Worker finished (possibly abandoned); always join + destroy here.
                 thread.join();
-                if (tryTakeCleanup(ctx)) destroyCtx(ctx);
-                return error.Timeout;
+                return takeResultAfterAbandon(ctx);
             }
-            // Detach as last resort: std.http has no cancel; process exit reclaims
-            // the thread and the still-live FetchCtx once the worker eventually exits.
+            // Hand cleanup to the worker, then recheck: it may have finished
+            // between the done check and this flag.
+            ctx.worker_owns_cleanup.store(true, .release);
+            if (ctx.done.load(.acquire)) {
+                thread.join();
+                return takeResultAfterAbandon(ctx);
+            }
+            // std.http has no cancel; worker destroys FetchCtx when it exits.
             thread.detach();
             return error.Timeout;
         }

@@ -94,6 +94,16 @@ pub fn getQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// True for bare flag, `1`, `true`, or `yes` (case-insensitive).
+pub fn queryParamTruthy(query: []const u8, key: []const u8) bool {
+    const v = getQueryParam(query, key) orelse return false;
+    if (v.len == 0) return true;
+    if (std.mem.eql(u8, v, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(v, "true")) return true;
+    if (std.ascii.eqlIgnoreCase(v, "yes")) return true;
+    return false;
+}
+
 pub const HostPort = struct {
     host: []const u8,
     port: u16,
@@ -274,6 +284,16 @@ test "decodeBase64Url skips whitespace" {
 test "getQueryParam" {
     try std.testing.expectEqualStrings("tcp", getQueryParam("type=tcp&sni=x", "type").?);
     try std.testing.expect(getQueryParam("type=tcp", "missing") == null);
+}
+
+test "queryParamTruthy" {
+    try std.testing.expect(queryParamTruthy("allowInsecure=1", "allowInsecure"));
+    try std.testing.expect(queryParamTruthy("allowInsecure=true", "allowInsecure"));
+    try std.testing.expect(queryParamTruthy("allowInsecure=YES", "allowInsecure"));
+    try std.testing.expect(queryParamTruthy("allowInsecure", "allowInsecure"));
+    try std.testing.expect(!queryParamTruthy("allowInsecure=0", "allowInsecure"));
+    try std.testing.expect(!queryParamTruthy("allowInsecure=false", "allowInsecure"));
+    try std.testing.expect(!queryParamTruthy("type=tcp", "allowInsecure"));
 }
 
 test "splitHostPort" {

@@ -77,16 +77,22 @@ fn tlsOptions(
     write_buf: []u8,
     entropy: *const [std.crypto.tls.Client.Options.entropy_len]u8,
     now: std.Io.Timestamp,
-    bundle: *Certificate.Bundle,
+    allow_insecure: bool,
+    bundle: ?*Certificate.Bundle,
 ) std.crypto.tls.Client.Options {
+    // Keep host.explicit so SNI is still sent; Zig couples SNI with hostname
+    // checks, so allowInsecure only skips the CA chain (common for self-signed).
     return .{
         .host = .{ .explicit = sni },
-        .ca = .{ .bundle = .{
-            .gpa = gpa,
-            .io = io,
-            .lock = &ca_state.rw,
-            .bundle = bundle,
-        } },
+        .ca = if (allow_insecure)
+            .no_verification
+        else
+            .{ .bundle = .{
+                .gpa = gpa,
+                .io = io,
+                .lock = &ca_state.rw,
+                .bundle = bundle.?,
+            } },
         .read_buffer = read_buf,
         .write_buffer = write_buf,
         .entropy = entropy,
@@ -105,6 +111,7 @@ pub fn probe(
     transport_ws: bool,
     ws_path: []const u8,
     ws_host: []const u8,
+    allow_insecure: bool,
     timeout_secs: u32,
 ) !u64 {
     const start = netutil.monoNow(io);
@@ -120,7 +127,7 @@ pub fn probe(
     var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
 
-    const bundle = try ensureCaBundle(gpa, io);
+    const bundle: ?*Certificate.Bundle = if (allow_insecure) null else try ensureCaBundle(gpa, io);
 
     var sock_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
     var sock_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
@@ -138,7 +145,7 @@ pub fn probe(
     var tls_client = std.crypto.tls.Client.init(
         &stream_reader.interface,
         &stream_writer.interface,
-        tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, bundle),
+        tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, allow_insecure, bundle),
     ) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
 
     const tls_reader = &tls_client.reader;

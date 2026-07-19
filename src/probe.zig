@@ -67,6 +67,9 @@ pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_
             const path = try util.urlDecodeStrict(gpa, path_enc);
             defer gpa.free(path);
             const host_hdr = proxy.getParam("host") orelse sni;
+            const allow_insecure = util.queryParamTruthy(proxy.query, "allowInsecure") or
+                util.queryParamTruthy(proxy.query, "allow_insecure") or
+                util.queryParamTruthy(proxy.query, "insecure");
             break :blk try trojan.probe(
                 gpa,
                 io,
@@ -77,6 +80,7 @@ pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_
                 proxy.transport == .ws,
                 path,
                 host_hdr,
+                allow_insecure,
                 timeout_secs,
             );
         },
@@ -203,6 +207,9 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
 }
 
 fn freeGroups(gpa: std.mem.Allocator, groups: *std.StringArrayHashMapUnmanaged(std.ArrayList(WorkItem))) void {
+    for (groups.keys()) |key| {
+        gpa.free(key);
+    }
     for (groups.values()) |*list| {
         for (list.items) |*item| {
             item.proxy.deinit(gpa);
@@ -243,8 +250,16 @@ fn collectGroups(
         };
         errdefer proxy.deinit(gpa);
 
-        const gop = try groups.getOrPut(gpa, proxy.host);
-        if (!gop.found_existing) {
+        // Own map keys: legacy SS hosts are freed in proxy.deinit.
+        var host_key: ?[]u8 = try gpa.dupe(u8, proxy.host);
+        errdefer if (host_key) |k| gpa.free(k);
+
+        const gop = try groups.getOrPut(gpa, host_key.?);
+        if (gop.found_existing) {
+            gpa.free(host_key.?);
+            host_key = null;
+        } else {
+            host_key = null; // owned by map
             gop.value_ptr.* = .empty;
         }
         try gop.value_ptr.append(gpa, .{
@@ -319,4 +334,22 @@ test "collectGroups buckets by host" {
     try std.testing.expectEqual(@as(usize, 2), groups.count());
     try std.testing.expectEqual(@as(usize, 2), groups.get("192.0.2.1").?.items.len);
     try std.testing.expectEqual(@as(usize, 1), groups.get("198.51.100.1").?.items.len);
+}
+
+test "collectGroups owns keys for legacy SS hosts" {
+    const gpa = std.testing.allocator;
+    // method:password@host:port base64url
+    const lines = [_][]const u8{
+        "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3JkQDE5Mi4wLjIuMTo4Mzg4#legacy-a",
+        "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3JkQDE5Mi4wLjIuMTo0NDM#legacy-b",
+    };
+    var stats: Stats = .{};
+    var groups = try collectGroups(gpa, &lines, &stats, false);
+    defer freeGroups(gpa, &groups);
+
+    try std.testing.expectEqual(@as(usize, 1), groups.count());
+    try std.testing.expectEqual(@as(usize, 2), groups.get("192.0.2.1").?.items.len);
+    for (groups.get("192.0.2.1").?.items) |item| {
+        try std.testing.expect(item.proxy.owns_host);
+    }
 }

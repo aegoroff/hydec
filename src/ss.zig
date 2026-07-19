@@ -246,16 +246,18 @@ pub fn probe(
     // Server only emits its salt once it has remote payload; push an HTTP request.
     off += try sealChunk(&ctx, packet[off..], util.probe_http);
 
-    const first_start = netutil.monoNow(io);
-    try w.interface.writeAll(packet[0..off]);
-    try w.interface.flush();
-
+    // Arm before the first write: a stuck peer / full window can block forever
+    // on a blocking socket if the watchdog is not yet running.
     const remain = netutil.remainingTimeoutNs(start, io, timeout_secs);
     if (remain == 0) return error.Timeout;
     var done = std.atomic.Value(bool).init(false);
     var fired = std.atomic.Value(bool).init(false);
     var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
+
+    const first_start = netutil.monoNow(io);
+    w.interface.writeAll(packet[0..off]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+    w.interface.flush() catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
 
     netutil.waitReadableUntil(stream, io, deadline) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     var server_salt: [32]u8 = undefined;
