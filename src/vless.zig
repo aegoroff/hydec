@@ -87,7 +87,6 @@ pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8, flow: []const u8) !u
 }
 
 /// Vision padding commands (xray / sing-box).
-pub const vision_cmd_continue: u8 = 0x00;
 pub const vision_cmd_end: u8 = 0x01;
 pub const vision_cmd_direct: u8 = 0x02;
 

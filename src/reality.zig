@@ -309,7 +309,6 @@ fn buildClientHello(
     client_random: *const [32]u8,
     session_id: *const [32]u8,
     x25519_pub: *const [32]u8,
-    alpn_h2: bool,
 ) !usize {
     var body: [2048]u8 = undefined;
     var i: usize = 0;
@@ -413,8 +412,7 @@ fn buildClientHello(
         i += sni.len;
     }
 
-    // Always advertise ALPN like chrome / gRPC path so TCP and gRPC ClientHellos match.
-    _ = alpn_h2;
+    // Always advertise ALPN like chrome so TCP and gRPC ClientHellos match.
     {
         const p1 = "h2";
         const p2 = "http/1.1";
@@ -539,7 +537,6 @@ pub fn connect(
     sni: []const u8,
     pbk_b64: []const u8,
     sid_hex: []const u8,
-    alpn_h2: bool,
     timeout_secs: u32,
 ) !void {
     var server_pub: [32]u8 = undefined;
@@ -561,7 +558,7 @@ pub fn connect(
     fillSessionIdPlain(&session_id, &short_id, unix_secs);
 
     var hello_raw: [2048]u8 = undefined;
-    const hello_len = try buildClientHello(&hello_raw, sni, &client_random, &session_id, &kp.public_key, alpn_h2);
+    const hello_len = try buildClientHello(&hello_raw, sni, &client_random, &session_id, &kp.public_key);
 
     // Seal session id (AAD = hello_raw)
     try sealSessionId(&session_id, hello_raw[0..hello_len], &client_random, &kp.secret_key, &server_pub);
@@ -739,7 +736,7 @@ pub fn probeVless(
     const sni_use = if (sni.len > 0) sni else host;
 
     var rc: RealityConn = undefined;
-    try connect(&rc, io, host, port, sni_use, pbk, sid, grpc, timeout_secs);
+    try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs);
     defer rc.deinit();
 
     var vless_buf: [512]u8 = undefined;
@@ -1102,7 +1099,7 @@ test "clientHello session id at offset 39" {
     const random = [_]u8{0x11} ** 32;
     const sid = [_]u8{0x22} ** 32;
     const pubk = [_]u8{0x33} ** 32;
-    const n = try buildClientHello(&out, "example.com", &random, &sid, &pubk, false);
+    const n = try buildClientHello(&out, "example.com", &random, &sid, &pubk);
     try std.testing.expect(n > 39 + 32);
     try std.testing.expectEqual(@as(u8, 1), out[0]); // client_hello
     try std.testing.expectEqual(@as(u8, 32), out[38]); // session id length
@@ -1117,7 +1114,7 @@ test "buildClientHello rejects oversized SNI" {
     const long_sni = "a" ** 256;
     try std.testing.expectError(
         error.SniTooLong,
-        buildClientHello(&out, long_sni, &random, &sid, &pubk, false),
+        buildClientHello(&out, long_sni, &random, &sid, &pubk),
     );
 }
 
