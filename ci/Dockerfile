@@ -46,6 +46,7 @@ RUN apt-get update \
         gzip \
         jq \
         libssl3t64 \
+        nodejs \
         tar \
         xz-utils \
         zlib1g \
@@ -73,6 +74,7 @@ RUN printf '%s\n' \
 RUN mise use -g zig@0.16.0 just@1.46.0 \
     && zig version \
     && just --version \
+    && node --version \
     && apk --version | grep -F 'apk-tools 3.' \
     && command -v fakeroot
 
