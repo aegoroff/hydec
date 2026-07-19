@@ -89,6 +89,9 @@ pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_
             if (proxy.transport == .other) return error.UnsupportedTransport;
             if (proxy.transport == .ws) return error.UnsupportedTransport;
 
+            const enc = proxy.getParam("encryption") orelse "none";
+            if (enc.len != 0 and !std.mem.eql(u8, enc, "none")) return error.UnsupportedVlessEncryption;
+
             const sni = proxy.getParam("sni") orelse proxy.host;
             const pbk = proxy.getParam("pbk") orelse return error.MissingRealityPublicKey;
             const sid = proxy.getParam("sid") orelse "";
@@ -155,6 +158,9 @@ pub fn failHint(err: anyerror) []const u8 {
         error.HostUnreachable,
         => "unreachable",
         error.GrpcEmptyResponse => "empty/no-data",
+        error.ProbeResponseMismatch => "bad/response",
+        error.ExpectedVisionPadding => "vision/framing",
+        error.UnsupportedVlessEncryption => "unsupported-encryption",
         else => "error",
     };
 }

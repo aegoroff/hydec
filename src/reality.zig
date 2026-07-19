@@ -739,10 +739,9 @@ pub fn probeVless(
     try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs);
     defer rc.deinit();
 
-    var vless_buf: [512]u8 = undefined;
-    const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid, if (grpc) "" else flow);
-
+    var vless_buf: [1024]u8 = undefined;
     if (grpc) {
+        const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid, "", .http);
         var auth_buf: [256]u8 = undefined;
         const authority = try grpc_gun.formatAuthority(&auth_buf, sni_use, port, authority_param);
 
@@ -760,13 +759,12 @@ pub fn probeVless(
         var stripped_vless = false;
         var warmup_done = false;
         var steady_start: ?i128 = null;
-        var first_start: ?i128 = null;
-        var first_ms: ?u64 = null;
         var http_buf: [16384]u8 = undefined;
         var http_len: usize = 0;
         while (true) {
             const n = rc.readApp(app_buf[0..]) catch |err| {
-                if (warmup_done and first_ms != null and util.isPeerClosed(err)) return first_ms.?;
+                // Do not treat peer-close after warmup as success — that hides dest-fallback
+                // and one-shot false positives.
                 return err;
             };
             if (gather_len + n > gather.len) return error.BufferTooSmall;
@@ -797,7 +795,6 @@ pub fn probeVless(
                     const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
                     // Keep the stream open — gun-lite is bidirectional; END_STREAM yields empty 200s.
                     fl += try grpc_gun.buildDataFrame(flight[fl..], 1, grpc_msg[0..glen], false);
-                    first_start = netutil.monoNow(io);
                     try rc.writeApp(flight[0..fl]);
                     request_sent = true;
                 } else if (ftyp == 0x06 and (fflags & 0x01) == 0 and frame_len == 8) {
@@ -817,18 +814,15 @@ pub fn probeVless(
                         // Accumulate into http_buf and strip VLESS header in-place (NeedMore-safe).
                         try appendStripVlessHeader(&http_buf, &http_len, msg, &stripped_vless);
                         if (util.httpResponseTotalLen(http_buf[0..http_len]) != null) {
+                            if (!util.looksLikeCloudflareTrace(http_buf[0..http_len])) return error.ProbeResponseMismatch;
                             warmup_done = true;
-                            first_ms = netutil.elapsedMs(first_start.?, io);
                             var hunk: [256]u8 = undefined;
                             const hunk_len = try grpc_gun.wrapHunk(&hunk, util.probe_http);
                             var grpc_msg: [320]u8 = undefined;
                             const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
                             var data_frame: [384]u8 = undefined;
                             const dlen = try grpc_gun.buildDataFrame(&data_frame, 1, grpc_msg[0..glen], false);
-                            rc.writeApp(data_frame[0..dlen]) catch |err| {
-                                if (util.isPeerClosed(err)) return first_ms.?;
-                                return err;
-                            };
+                            try rc.writeApp(data_frame[0..dlen]);
                             steady_start = netutil.monoNow(io);
                         }
                     } else if (msg.len > 0) {
@@ -839,10 +833,8 @@ pub fn probeVless(
                         const code = std.mem.readInt(u32, payload[0..4], .big);
                         std.log.warn("gRPC RST_STREAM error_code={d}", .{code});
                     }
-                    if (first_ms) |ms| return ms;
                     return error.GrpcRstStream;
                 } else if (ftyp == 0x07) {
-                    if (first_ms) |ms| return ms;
                     return error.GrpcGoAway;
                 }
 
@@ -855,75 +847,246 @@ pub fn probeVless(
             }
         }
     } else {
-        const use_vision = std.mem.indexOf(u8, flow, "vision") != null;
-        const first_start = netutil.monoNow(io);
-        try rc.writeApp(vless_buf[0..vless_len]);
-        var uuid_bytes: [16]u8 = undefined;
-        try vless.parseUuid(uuid, &uuid_bytes);
-
-        // Server writes the VLESS response header raw, then Vision-wraps the payload
-        // (or sends raw if no vision). Header and first Vision frame often share one
-        // TLS record — unwrap Vision only after stripping the header.
-        var stream: [16384]u8 = undefined;
-        var stream_len: usize = 0;
-        var http_buf: [16384]u8 = undefined;
-        var http_len: usize = 0;
-        var stripped_header = false;
-        var vision_raw = !use_vision;
-        var vision_state: vless.VisionUnpadState = .{};
-        var resp: [16384]u8 = undefined;
-
-        while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-            const n = rc.readApp(&resp) catch |err| {
-                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(err)) break;
-                return err;
-            };
-            if (stream_len + n > stream.len) return error.BufferTooSmall;
-            @memcpy(stream[stream_len..][0..n], resp[0..n]);
-            stream_len += n;
-
-            try drainVlessVisionStream(
-                &stream,
-                &stream_len,
-                &http_buf,
-                &http_len,
-                &uuid_bytes,
-                &stripped_header,
-                &vision_raw,
-                &vision_state,
-            );
-        }
-        const first_ms = netutil.elapsedMs(first_start, io);
-
-        // Second request is raw: client already sent Vision PaddingEnd on the first write.
-        // Downlink may still be mid-Vision (Continue / NeedMore) — drain until we get
-        // application bytes, same as SS/Trojan needing any non-empty second read.
-        const steady_start = netutil.monoNow(io);
-        rc.writeApp(util.probe_http) catch |err| {
-            return if (util.isPeerClosed(err)) first_ms else err;
-        };
-        const http_before = http_len;
-        while (http_len == http_before) {
-            const n = rc.readApp(&resp) catch |err| {
-                return if (util.isPeerClosed(err)) first_ms else err;
-            };
-            if (n == 0) return first_ms;
-            if (stream_len + n > stream.len) return error.BufferTooSmall;
-            @memcpy(stream[stream_len..][0..n], resp[0..n]);
-            stream_len += n;
-            try drainVlessVisionStream(
-                &stream,
-                &stream_len,
-                &http_buf,
-                &http_len,
-                &uuid_bytes,
-                &stripped_header,
-                &vision_raw,
-                &vision_state,
-            );
-        }
-        return netutil.elapsedMs(steady_start, io);
+        // TCP/Vision: full inner TLS + HTTP /cdn-cgi/trace. Stopping at ServerHello
+        // false-OKs nodes that deliver the first flight then break on raw post-Vision I/O.
+        return try probeVlessTcpHttps(&rc, io, uuid, flow);
     }
+}
+
+/// VLESS + optional Vision framing over an established REALITY connection, exposed as
+/// Io.Reader/Writer for `std.crypto.tls.Client` (inner HTTPS probe).
+const VisionPipe = struct {
+    rc: *RealityConn,
+    uuid: [16]u8,
+    vless_hdr: []const u8,
+    use_vision: bool,
+    first_sent: bool = false,
+    err: ?anyerror = null,
+
+    wire: [16384]u8 = undefined,
+    wire_len: usize = 0,
+    plain: [16384]u8 = undefined,
+    plain_len: usize = 0,
+    plain_off: usize = 0,
+    stripped: bool = false,
+    vision_raw: bool,
+    saw_vision: bool = false,
+    vision_state: vless.VisionUnpadState = .{},
+
+    wbuf: [tls.Client.min_buffer_len]u8 = undefined,
+    rbuf: [tls.Client.min_buffer_len]u8 = undefined,
+    writer: Io.Writer = undefined,
+    reader: Io.Reader = undefined,
+
+    fn initInterfaces(self: *VisionPipe) void {
+        self.writer = .{
+            .vtable = &.{ .drain = drain },
+            .buffer = &self.wbuf,
+        };
+        self.reader = .{
+            .vtable = &.{
+                .stream = streamImpl,
+                .readVec = readVec,
+            },
+            .buffer = &self.rbuf,
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn sendPlain(self: *VisionPipe, plain: []const u8) !void {
+        if (!self.first_sent) {
+            var pkt: [16384]u8 = undefined;
+            if (self.vless_hdr.len > pkt.len) return error.BufferTooSmall;
+            @memcpy(pkt[0..self.vless_hdr.len], self.vless_hdr);
+            var n = self.vless_hdr.len;
+            if (self.use_vision) {
+                n += try vless.appendVisionPaddingEnd(pkt[n..], &self.uuid, plain);
+            } else {
+                if (n + plain.len > pkt.len) return error.BufferTooSmall;
+                @memcpy(pkt[n..][0..plain.len], plain);
+                n += plain.len;
+            }
+            try self.rc.writeApp(pkt[0..n]);
+            self.first_sent = true;
+        } else {
+            try self.rc.writeApp(plain);
+        }
+    }
+
+    fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *VisionPipe = @alignCast(@fieldParentPtr("writer", io_w));
+        const buffered = io_w.buffered();
+        const data_len = Io.Writer.countSplat(data, splat);
+        const total = buffered.len + data_len;
+        var tmp: [16384]u8 = undefined;
+        if (total > tmp.len) {
+            self.err = error.BufferTooSmall;
+            return error.WriteFailed;
+        }
+        var off: usize = 0;
+        if (buffered.len > 0) {
+            @memcpy(tmp[0..buffered.len], buffered);
+            off = buffered.len;
+        }
+        if (data.len > 0) {
+            for (data[0 .. data.len - 1]) |bytes| {
+                @memcpy(tmp[off..][0..bytes.len], bytes);
+                off += bytes.len;
+            }
+            const pattern = data[data.len - 1];
+            var s: usize = 0;
+            while (s < splat) : (s += 1) {
+                @memcpy(tmp[off..][0..pattern.len], pattern);
+                off += pattern.len;
+            }
+        }
+        self.sendPlain(tmp[0..off]) catch |e| {
+            self.err = e;
+            return error.WriteFailed;
+        };
+        return io_w.consume(total);
+    }
+
+    fn fillPlain(self: *VisionPipe) Io.Reader.Error!void {
+        while (self.plain_off >= self.plain_len) {
+            self.plain_off = 0;
+            self.plain_len = 0;
+            var resp: [8192]u8 = undefined;
+            const n = self.rc.readApp(&resp) catch |err| {
+                self.err = err;
+                if (util.isPeerClosed(err)) return error.EndOfStream;
+                return error.ReadFailed;
+            };
+            if (n == 0) return error.EndOfStream;
+            if (self.wire_len + n > self.wire.len) {
+                self.err = error.BufferTooSmall;
+                return error.ReadFailed;
+            }
+            @memcpy(self.wire[self.wire_len..][0..n], resp[0..n]);
+            self.wire_len += n;
+            drainVlessVisionStream(
+                &self.wire,
+                &self.wire_len,
+                &self.plain,
+                &self.plain_len,
+                &self.uuid,
+                &self.stripped,
+                &self.vision_raw,
+                &self.saw_vision,
+                self.use_vision,
+                &self.vision_state,
+            ) catch |err| {
+                self.err = err;
+                return error.ReadFailed;
+            };
+        }
+    }
+
+    fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const dest = limit.slice(try io_w.writableSliceGreedy(1));
+        var data: [1][]u8 = .{dest};
+        const n = try readVec(io_r, &data);
+        io_w.advance(n);
+        return n;
+    }
+
+    fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
+        const self: *VisionPipe = @alignCast(@fieldParentPtr("reader", io_r));
+        _ = data;
+        try self.fillPlain();
+        if (self.plain_off >= self.plain_len) return error.EndOfStream;
+
+        // Compact reader buffer if fully consumed.
+        if (io_r.seek > 0 and io_r.seek == io_r.end) {
+            io_r.seek = 0;
+            io_r.end = 0;
+        }
+        const space = io_r.buffer.len - io_r.end;
+        if (space == 0) return 0;
+        const avail = self.plain[self.plain_off..self.plain_len];
+        const take = @min(avail.len, space);
+        @memcpy(io_r.buffer[io_r.end..][0..take], avail[0..take]);
+        io_r.end += take;
+        self.plain_off += take;
+        return 0;
+    }
+};
+
+fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []const u8) !u64 {
+    const use_vision = std.mem.indexOf(u8, flow, "vision") != null;
+    var uuid: [16]u8 = undefined;
+    try vless.parseUuid(uuid_text, &uuid);
+
+    var hdr_buf: [256]u8 = undefined;
+    const hdr_len = try vless.encodeRequestDomain(&hdr_buf, &uuid, util.probe_domain, util.probe_tls_port, flow);
+
+    var pipe: VisionPipe = .{
+        .rc = rc,
+        .uuid = uuid,
+        .vless_hdr = hdr_buf[0..hdr_len],
+        .use_vision = use_vision,
+        .vision_raw = !use_vision,
+    };
+    pipe.initInterfaces();
+
+    var tls_read_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var tls_write_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+    io.random(&entropy);
+    const now = Io.Clock.real.now(io);
+
+    const start = netutil.monoNow(io);
+    var tls_client = tls.Client.init(
+        &pipe.reader,
+        &pipe.writer,
+        .{
+            .host = .{ .explicit = util.probe_domain },
+            .ca = .no_verification,
+            .read_buffer = &tls_read_buf,
+            .write_buffer = &tls_write_buf,
+            .entropy = &entropy,
+            .realtime_now = now,
+            .allow_truncation_attacks = true,
+        },
+    ) catch |err| {
+        if (pipe.err) |e| return e;
+        return err;
+    };
+
+    tls_client.writer.writeAll(util.probe_http) catch |err| {
+        if (pipe.err) |e| return e;
+        return err;
+    };
+    tls_client.writer.flush() catch |err| {
+        if (pipe.err) |e| return e;
+        return err;
+    };
+
+    var http_buf: [8192]u8 = undefined;
+    var http_len: usize = 0;
+    while (true) {
+        if (util.looksLikeCloudflareTrace(http_buf[0..http_len]) and
+            util.httpResponseTotalLen(http_buf[0..http_len]) != null)
+        {
+            break;
+        }
+        if (http_len >= http_buf.len) return error.BufferTooSmall;
+        const n = tls_client.reader.readSliceShort(http_buf[http_len..]) catch |err| {
+            if (pipe.err) |e| return e;
+            return err;
+        };
+        if (n == 0) break;
+        http_len += n;
+        if (util.httpResponseTotalLen(http_buf[0..http_len]) != null and
+            !util.looksLikeCloudflareTrace(http_buf[0..http_len]))
+        {
+            return error.ProbeResponseMismatch;
+        }
+    }
+    if (!util.looksLikeCloudflareTrace(http_buf[0..http_len])) return error.ProbeResponseMismatch;
+    if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
+    return netutil.elapsedMs(start, io);
 }
 
 /// Move bytes from `stream` into `http` after stripping the VLESS response header
@@ -936,6 +1099,8 @@ fn drainVlessVisionStream(
     uuid: *const [16]u8,
     stripped: *bool,
     vision_raw: *bool,
+    saw_vision: *bool,
+    require_vision: bool,
     vision_state: *vless.VisionUnpadState,
 ) !void {
     if (!stripped.*) {
@@ -952,11 +1117,15 @@ fn drainVlessVisionStream(
             const frame = vless.consumeVisionFrame(stream[0..stream_len.*], uuid, vision_state) catch |err| switch (err) {
                 error.NeedMore => return,
                 error.NotVision => {
-                    // Peer already switched to raw (or never wrapped this chunk).
+                    // Raw HTTP after a Vision session is fine; raw before any Vision
+                    // frame while flow requires Vision is a false-positive risk
+                    // (REALITY dest / non-Vision peer).
+                    if (require_vision and !saw_vision.*) return error.ExpectedVisionPadding;
                     vision_raw.* = true;
                     continue;
                 },
             };
+            saw_vision.* = true;
             if (frame.content.len > 0) {
                 if (http_len.* + frame.content.len > http.len) return error.BufferTooSmall;
                 @memcpy(http[http_len.*..][0..frame.content.len], frame.content);
@@ -1052,9 +1221,10 @@ test "drainVlessVisionStream strips header before Vision unwrap" {
     var http_len: usize = 0;
     var stripped = false;
     var vision_raw = false;
+    var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
 
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
     try std.testing.expect(stripped);
     try std.testing.expect(vision_raw);
     try std.testing.expectEqual(@as(usize, 0), stream_len);
@@ -1073,18 +1243,19 @@ test "drainVlessVisionStream splits header then Vision across pushes" {
     var http_len: usize = 0;
     var stripped = false;
     var vision_raw = false;
+    var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
 
     stream[0] = 0;
     stream_len = 1;
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
     try std.testing.expect(!stripped);
 
     stream[stream_len] = 0;
     stream_len += 1;
     @memcpy(stream[stream_len..][0..vn], vision[0..vn]);
     stream_len += vn;
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
     try std.testing.expect(stripped);
     try std.testing.expectEqualStrings(http, http_buf[0..http_len]);
 }
@@ -1113,9 +1284,10 @@ test "drainVlessVisionStream continues without UUID then End" {
     var http_len: usize = 0;
     var stripped = false;
     var vision_raw = false;
+    var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
 
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
     try std.testing.expect(stripped);
     try std.testing.expect(vision_raw);
     try std.testing.expect(!vision_state.expect_uuid);
@@ -1137,16 +1309,17 @@ test "drainVlessVisionStream steady raw after End grows http" {
     var http_len: usize = 0;
     var stripped = false;
     var vision_raw = false;
+    var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
 
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
     try std.testing.expect(vision_raw);
     const before = http_len;
 
     const more = "HTTP/1.1 200 OK\r\n\r\n";
     @memcpy(stream[0..more.len], more);
     stream_len = more.len;
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
     try std.testing.expect(http_len > before);
     try std.testing.expectEqualStrings(http ++ more, http_buf[0..http_len]);
 }
@@ -1167,9 +1340,10 @@ test "drainVlessVisionStream incomplete Vision does not grow http" {
     var http_len: usize = 0;
     var stripped = false;
     var vision_raw = false;
+    var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
 
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
     try std.testing.expect(stripped);
     try std.testing.expect(!vision_raw);
     try std.testing.expectEqual(@as(usize, 0), http_len);
@@ -1178,9 +1352,28 @@ test "drainVlessVisionStream incomplete Vision does not grow http" {
     // Steady-style: feed the rest; http should grow only once the frame is complete.
     @memcpy(stream[stream_len..][0 .. vn - (partial - 2)], vision[partial - 2 .. vn]);
     stream_len += vn - (partial - 2);
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
     try std.testing.expect(http_len > 0);
     try std.testing.expect(vision_raw);
+}
+
+test "drainVlessVisionStream rejects raw HTTP when Vision required" {
+    var uuid: [16]u8 = [_]u8{0x44} ** 16;
+    const raw = "\x00\x00HTTP/1.1 200 OK\r\n\r\n";
+    var stream: [64]u8 = undefined;
+    @memcpy(stream[0..raw.len], raw);
+    var stream_len: usize = raw.len;
+    var http_buf: [64]u8 = undefined;
+    var http_len: usize = 0;
+    var stripped = false;
+    var vision_raw = false;
+    var saw_vision = false;
+    var vision_state: vless.VisionUnpadState = .{};
+
+    try std.testing.expectError(
+        error.ExpectedVisionPadding,
+        drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state),
+    );
 }
 
 test "parseServerHelloX25519 accepts key_share" {
