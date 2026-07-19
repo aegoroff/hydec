@@ -27,12 +27,13 @@ Non-interactive CLI with subcommands: `best` (subscription → fastest proxy) an
 1. Fetch subscription URL (HTTPS).
 2. Base64-decode body; iterate URI lines.
 3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**.
-4. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
+4. Each candidate: **3 probes**, fail-fast on first error; rank by **average** latency.
+5. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
 
 **Behavior (`ping`)**
 
 1. Parse one proxy URI from the CLI.
-2. Probe it; log `OK: …` or `FAIL: …` to **stderr**.
+2. Probe it **3 times** (stop on first failure); log `OK: …` or `FAIL: …` to **stderr**.
 3. Exit `0` on success, `1` on probe failure.
 
 ## Layout
@@ -44,7 +45,7 @@ Non-interactive CLI with subcommands: `best` (subscription → fastest proxy) an
 | `src/fetch.zig` | Download subscription |
 | `src/subscription.zig` | Base64 decode, line iteration |
 | `src/proxy_uri.zig` | URI parse (kind, host/port, query, `#name`) |
-| `src/probe.zig` | Group-by-host parallel `findBest`, `probeOne` |
+| `src/probe.zig` | Group-by-host parallel `findBest`, `probeOne` / `probeAverage` |
 | `src/ss.zig` / `trojan.zig` / `reality.zig` | Protocol probes |
 | `src/vless.zig` / `grpc_gun.zig` / `ws.zig` | Framing helpers |
 | `src/netutil.zig` | Timed connect, poll deadlines, TLS watchdog |
