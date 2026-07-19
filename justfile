@@ -17,7 +17,7 @@ triple := arch + "-" + os + "-" + abi
 prefix := "bin-" + arch + "-" + os + "-" + abi
 cpu_flag := if cpu != "" { "-Dcpu=" + cpu } else { "" }
 
-# Local ReleaseFast build (x86_64-linux-musl / core2)
+# Local ReleaseSmall build (x86_64-linux-musl / core2)
 build:
     {{ zig }} build -Doptimize={{ optimize }} -Dtarget={{ local_target }} -Dcpu={{ local_cpu }} -Dversion={{ ver }} --summary all
 
