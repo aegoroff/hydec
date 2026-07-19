@@ -1,29 +1,9 @@
 const std = @import("std");
+const util = @import("util.zig");
 
 /// Decode standard or URL-safe base64 (with optional padding / whitespace).
 pub fn decodeBase64(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
-    var cleaned: std.ArrayList(u8) = .empty;
-    defer cleaned.deinit(gpa);
-
-    for (input) |c| {
-        switch (c) {
-            ' ', '\t', '\n', '\r' => {},
-            '-' => try cleaned.append(gpa, '+'),
-            '_' => try cleaned.append(gpa, '/'),
-            else => try cleaned.append(gpa, c),
-        }
-    }
-
-    // Pad to multiple of 4
-    while (cleaned.items.len % 4 != 0) {
-        try cleaned.append(gpa, '=');
-    }
-
-    const max_len = try std.base64.standard.Decoder.calcSizeForSlice(cleaned.items);
-    const out = try gpa.alloc(u8, max_len);
-    errdefer gpa.free(out);
-    try std.base64.standard.Decoder.decode(out, cleaned.items);
-    return out;
+    return util.decodeBase64Url(gpa, input, true);
 }
 
 /// Split decoded subscription into non-empty trimmed lines. Lines are slices into `decoded`.

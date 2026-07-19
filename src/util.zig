@@ -42,6 +42,45 @@ pub fn urlDecodeStrict(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     return urlDecodeOpts(gpa, input, false);
 }
 
+/// Map URL-safe / unpadded base64 into the standard alphabet with `=` padding.
+/// Strips existing `=` (re-pads at the end). Optionally skips ASCII whitespace.
+/// Returns a prefix of `out`.
+pub fn normalizeBase64Url(out: []u8, input: []const u8, skip_whitespace: bool) error{BufferTooSmall}![]u8 {
+    var n: usize = 0;
+    for (input) |c| {
+        const mapped: ?u8 = switch (c) {
+            ' ', '\t', '\n', '\r' => if (skip_whitespace) null else c,
+            '=' => null,
+            '-' => '+',
+            '_' => '/',
+            else => c,
+        };
+        if (mapped) |b| {
+            if (n >= out.len) return error.BufferTooSmall;
+            out[n] = b;
+            n += 1;
+        }
+    }
+    while (n % 4 != 0) {
+        if (n >= out.len) return error.BufferTooSmall;
+        out[n] = '=';
+        n += 1;
+    }
+    return out[0..n];
+}
+
+/// Decode standard or URL-safe base64 (optional whitespace). Caller owns the result.
+pub fn decodeBase64Url(gpa: std.mem.Allocator, input: []const u8, skip_whitespace: bool) ![]u8 {
+    const tmp = try gpa.alloc(u8, input.len + 3);
+    defer gpa.free(tmp);
+    const normalized = try normalizeBase64Url(tmp, input, skip_whitespace);
+    const max_len = try std.base64.standard.Decoder.calcSizeForSlice(normalized);
+    const out = try gpa.alloc(u8, max_len);
+    errdefer gpa.free(out);
+    try std.base64.standard.Decoder.decode(out, normalized);
+    return out;
+}
+
 pub fn getQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
     var iter = std.mem.splitScalar(u8, query, '&');
     while (iter.next()) |pair| {
@@ -212,6 +251,24 @@ test "urlDecodeStrict keeps plus" {
     const got = try urlDecodeStrict(gpa, "a%20b+c");
     defer gpa.free(got);
     try std.testing.expectEqualStrings("a b+c", got);
+}
+
+test "decodeBase64Url hello and url-safe" {
+    const gpa = std.testing.allocator;
+    const hello = try decodeBase64Url(gpa, "aGVsbG8=", false);
+    defer gpa.free(hello);
+    try std.testing.expectEqualStrings("hello", hello);
+    // ">>>" as standard base64 is "Pj4+" / url-safe "Pj4-"
+    const gt = try decodeBase64Url(gpa, "Pj4-", false);
+    defer gpa.free(gt);
+    try std.testing.expectEqualStrings(">>>", gt);
+}
+
+test "decodeBase64Url skips whitespace" {
+    const gpa = std.testing.allocator;
+    const got = try decodeBase64Url(gpa, "aGVs\nbG8=", true);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("hello", got);
 }
 
 test "getQueryParam" {
