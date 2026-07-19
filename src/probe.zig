@@ -167,9 +167,9 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
 
         if (shared.verbose) {
             if (proxy.name) |n| {
-                std.log.info("Testing: {s} ({s}:{d})", .{ n, proxy.host, proxy.port });
+                std.log.debug("Testing: {s} ({s}:{d})", .{ n, proxy.host, proxy.port });
             } else {
-                std.log.info("Testing: {s}:{d}", .{ proxy.host, proxy.port });
+                std.log.debug("Testing: {s}:{d}", .{ proxy.host, proxy.port });
             }
         }
 
