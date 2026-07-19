@@ -1,4 +1,4 @@
-optimize := "ReleaseFast"
+optimize := "ReleaseSmall"
 default_version := "0.1.0-dev"
 
 # Target overrides (CI / release): just arch=aarch64 os=linux abi=musl ver=0.1.0 release
