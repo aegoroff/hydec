@@ -60,6 +60,27 @@ fn validateUpgradeResponse(hdr: []const u8, key_b64: []const u8) !void {
     if (!std.mem.eql(u8, accept, expected)) return error.WebSocketAcceptMismatch;
 }
 
+const max_upgrade_headers: usize = 2048;
+
+/// Consume the HTTP 101 upgrade response from `reader`, leaving any bytes past
+/// `\r\n\r\n` buffered for subsequent WebSocket frame reads.
+fn consumeUpgradeResponse(reader: *Io.Reader, key_b64: []const u8) !void {
+    while (true) {
+        const buffered = reader.buffered();
+        if (std.mem.indexOf(u8, buffered, "\r\n\r\n")) |end| {
+            const hdr_end = end + 4;
+            try validateUpgradeResponse(buffered[0..hdr_end], key_b64);
+            reader.toss(hdr_end);
+            return;
+        }
+        if (buffered.len >= max_upgrade_headers) return error.WebSocketHeadersTooLarge;
+        reader.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return error.UnexpectedEndOfStream,
+            else => |e| return e,
+        };
+    }
+}
+
 pub fn performUpgrade(
     reader: *Io.Reader,
     writer: *Io.Writer,
@@ -85,17 +106,7 @@ pub fn performUpgrade(
     try writer.writeAll(req);
     try writer.flush();
 
-    var hdr: [2048]u8 = undefined;
-    var hdr_len: usize = 0;
-    while (hdr_len < hdr.len) {
-        const n = try reader.readSliceShort(hdr[hdr_len..]);
-        if (n == 0) return error.UnexpectedEndOfStream;
-        hdr_len += n;
-        if (std.mem.indexOf(u8, hdr[0..hdr_len], "\r\n\r\n")) |_| break;
-    } else {
-        return error.WebSocketHeadersTooLarge;
-    }
-    try validateUpgradeResponse(hdr[0..hdr_len], key_b64);
+    try consumeUpgradeResponse(reader, key_b64);
 }
 
 fn writeControlFrame(writer: *Io.Writer, io: Io, opcode: u8, payload: []const u8) !void {
@@ -164,7 +175,11 @@ pub fn readBinaryFrame(reader: *Io.Reader, writer: *Io.Writer, io: Io, out: []u8
         }
         var mask: [4]u8 = .{ 0, 0, 0, 0 };
         if (masked) try reader.readSliceAll(&mask);
-        if (len > out.len) return error.BufferTooSmall;
+        if (len > out.len) {
+            // Drain payload so the stream stays aligned if the caller retries.
+            try reader.discardAll(len);
+            return error.BufferTooSmall;
+        }
         try reader.readSliceAll(out[0..len]);
         if (masked) {
             for (out[0..len], 0..) |*b, i| b.* ^= mask[i % 4];
@@ -211,6 +226,39 @@ test "validateUpgradeResponse requires accept" {
         "Sec-WebSocket-Accept: wrong\r\n" ++
         "\r\n";
     try std.testing.expectError(error.WebSocketAcceptMismatch, validateUpgradeResponse(bad, key));
+}
+
+test "consumeUpgradeResponse keeps post-header bytes" {
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const wire =
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "\r\n" ++
+        "LEFTOVER";
+    var reader: Io.Reader = .fixed(wire);
+    try consumeUpgradeResponse(&reader, key);
+    try std.testing.expectEqualStrings("LEFTOVER", reader.buffered());
+}
+
+test "readBinaryFrame BufferTooSmall drains payload" {
+    // Unmasked binary frames (server→client): oversized then 1-byte.
+    const wire = [_]u8{
+        0x82, 0x05, 'a', 'b', 'c', 'd', 'e', // len=5
+        0x82, 0x01, 'Z',
+    };
+    var reader: Io.Reader = .fixed(&wire);
+    var sink_buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&sink_buf);
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var small: [2]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, readBinaryFrame(&reader, &writer, io, &small));
+    var out: [8]u8 = undefined;
+    const n = try readBinaryFrame(&reader, &writer, io, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
 }
 
 test "ws module loads" {

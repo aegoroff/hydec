@@ -41,6 +41,8 @@ const Shared = struct {
     timeout_secs: u32,
     mutex: Io.Mutex = .init,
     best: ?Result = null,
+    /// Set when a successful probe could not be recorded as best (host dupe OOM).
+    best_oom: bool = false,
     stats: *Stats,
 
     fn lock(self: *Shared) void {
@@ -119,7 +121,10 @@ fn considerBest(shared: *Shared, latency: u64, raw: []const u8, host: []const u8
     defer shared.unlock();
     if (shared.best != null and latency >= shared.best.?.latency_ms) return;
     // Own a copy: proxy.deinit may free legacy-SS hosts before the caller reads Result.
-    const host_copy = shared.gpa.dupe(u8, host) catch return;
+    const host_copy = shared.gpa.dupe(u8, host) catch {
+        shared.best_oom = true;
+        return;
+    };
     if (shared.best) |*old| shared.gpa.free(old.host);
     shared.best = .{
         .latency_ms = latency,
@@ -298,6 +303,7 @@ pub fn findBest(
 
     const best = shared.best;
     shared.best = null;
+    if (best == null and shared.best_oom) return error.OutOfMemory;
     return best;
 }
 

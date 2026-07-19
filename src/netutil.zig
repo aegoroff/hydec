@@ -45,40 +45,85 @@ fn connectHostnameTimed(io: Io, host: []const u8, port: u16, timeout_secs: u32) 
         while (lookup_queue.getOneUncancelable(io)) |_| {} else |_| {}
     }
 
+    // Race DNS queue reads against the absolute deadline so a hung resolver
+    // cannot stall past timeout_secs (getOne alone has no timeout).
+    const DnsWait = union(enum) {
+        item: (Io.QueueClosedError || Io.Cancelable)!Io.net.HostName.LookupResult,
+        timed_out: void,
+    };
+    var wait_buf: [4]DnsWait = undefined;
+    var select = Io.Select(DnsWait).init(io, &wait_buf);
+    defer select.cancelDiscard();
+
+    if (deadline) |d| {
+        select.async(.timed_out, sleepUntilDeadline, .{ io, d });
+    }
+    select.async(.item, recvDnsOne, .{ &lookup_queue, io });
+
     var last_err: anyerror = error.UnknownHostName;
     var saw_address = false;
 
-    while (lookup_queue.getOne(io)) |dns_result| {
-        switch (dns_result) {
-            .canonical_name => {},
-            .address => |address| {
-                saw_address = true;
-                if (deadline) |d| {
-                    if (monoNow(io) >= d) return error.Timeout;
+    while (true) {
+        const winner = select.await() catch |err| switch (err) {
+            error.Canceled => return error.Timeout,
+        };
+        switch (winner) {
+            .timed_out => return error.Timeout,
+            .item => |get_result| {
+                const dns_result = get_result catch |err| switch (err) {
+                    error.Canceled => return error.Timeout,
+                    error.Closed => {
+                        if (saw_address) {
+                            // Addresses were tried; connect failures beat lookup status.
+                            lookup_future.await(io) catch {};
+                            return last_err;
+                        }
+                        // No addresses: surface the real DNS/lookup error (do not keep the
+                        // UnknownHostName placeholder when await carries NameServerFailure etc.).
+                        lookup_future.await(io) catch |lookup_err| return lookup_err;
+                        return error.NoAddressReturned;
+                    },
+                };
+                switch (dns_result) {
+                    .canonical_name => {},
+                    .address => |address| {
+                        saw_address = true;
+                        if (deadline) |d| {
+                            if (monoNow(io) >= d) return error.Timeout;
+                        }
+                        if (connectIpUntil(io, address, deadline)) |stream| {
+                            setTcpNoDelay(stream);
+                            return stream;
+                        } else |err| {
+                            last_err = err;
+                            if (err == error.Timeout) return error.Timeout;
+                        }
+                    },
                 }
-                if (connectIpUntil(io, address, deadline)) |stream| {
-                    setTcpNoDelay(stream);
-                    return stream;
-                } else |err| {
-                    last_err = err;
-                    if (err == error.Timeout) return error.Timeout;
-                }
+                select.async(.item, recvDnsOne, .{ &lookup_queue, io });
             },
         }
-    } else |err| switch (err) {
-        error.Canceled => return error.Timeout,
-        error.Closed => {
-            if (saw_address) {
-                // Addresses were tried; connect failures beat lookup status.
-                lookup_future.await(io) catch {};
-                return last_err;
-            }
-            // No addresses: surface the real DNS/lookup error (do not keep the
-            // UnknownHostName placeholder when await carries NameServerFailure etc.).
-            lookup_future.await(io) catch |lookup_err| return lookup_err;
-            return error.NoAddressReturned;
-        },
     }
+}
+
+fn recvDnsOne(
+    queue: *Io.Queue(Io.net.HostName.LookupResult),
+    io: Io,
+) (Io.QueueClosedError || Io.Cancelable)!Io.net.HostName.LookupResult {
+    return queue.getOne(io);
+}
+
+fn sleepUntilDeadline(io: Io, deadline_ns: i128) void {
+    const now = monoNow(io);
+    if (now >= deadline_ns) return;
+    const rem: Io.Duration = .fromNanoseconds(@intCast(deadline_ns - now));
+    io.sleep(rem, .awake) catch {};
+}
+
+test "sleepUntilDeadline is no-op when already past" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const past = monoNow(io) - std.time.ns_per_s;
+    sleepUntilDeadline(io, past);
 }
 
 fn connectIpTimed(io: Io, address: Io.net.IpAddress, timeout_secs: u32) !Io.net.Stream {
