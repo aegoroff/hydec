@@ -5,7 +5,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GITCLIFF_VER: 2.11.0
+  GITCLIFF_VER: 2.13.1
 
 on:
   push:
