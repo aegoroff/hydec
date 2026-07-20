@@ -170,6 +170,7 @@ pub fn failHint(err: anyerror) []const u8 {
         error.UnexpectedEndOfStream,
         error.BrokenPipe,
         error.TlsConnectionTruncated,
+        error.SocketUnconnected,
         => "rejected/closed",
         // REALITY/TLS alert — rejected ClientHello (wrong pbk/sid/sni/client ver) or dest fallback.
         error.TlsAlert, error.TlsUnexpectedMessage, error.TlsFinishedVerifyFailed => "handshake/alert",
@@ -177,12 +178,18 @@ pub fn failHint(err: anyerror) []const u8 {
         error.ConnectionRefused,
         error.NetworkUnreachable,
         error.HostUnreachable,
+        error.NetworkDown,
         => "unreachable",
         error.GrpcEmptyResponse => "empty/no-data",
         error.ProbeResponseMismatch => "bad/response",
         error.ExpectedVisionPadding => "vision/framing",
         error.InvalidSsChunk => "ss/chunk",
         error.UnsupportedVlessEncryption => "unsupported-encryption",
+        error.BufferTooSmall, error.RecordTooLarge => "buffer/overflow",
+        error.SystemResources => "sys/resources",
+        // Opaque Io wrappers — Reality/Vision should unwrap socket causes first.
+        error.WriteFailed => "write/failed",
+        error.ReadFailed => "read/failed",
         else => "error",
     };
 }
@@ -390,4 +397,12 @@ test "collectGroups owns keys for legacy SS hosts" {
     for (groups.get("192.0.2.1").?.items) |item| {
         try std.testing.expect(item.proxy.owns_host);
     }
+}
+
+test "failHint classifies write and buffer errors" {
+    try std.testing.expectEqualStrings("write/failed", failHint(error.WriteFailed));
+    try std.testing.expectEqualStrings("read/failed", failHint(error.ReadFailed));
+    try std.testing.expectEqualStrings("buffer/overflow", failHint(error.BufferTooSmall));
+    try std.testing.expectEqualStrings("rejected/closed", failHint(error.ConnectionResetByPeer));
+    try std.testing.expectEqualStrings("unreachable", failHint(error.NetworkDown));
 }

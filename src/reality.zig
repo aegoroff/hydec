@@ -478,21 +478,39 @@ const RealityConn = struct {
         }
     }
 
+    /// Zig `Io.Writer` collapses socket failures to `WriteFailed`; the cause is on `stream_writer.err`.
+    fn mapWriterErr(self: *const RealityConn, err: anyerror) anyerror {
+        const cause: anyerror = if (err == error.WriteFailed)
+            (self.stream_writer.err orelse err)
+        else
+            err;
+        return netutil.classifyDeadlineErr(cause, self.deadlineFired());
+    }
+
+    /// Zig `Io.Reader` collapses socket failures to `ReadFailed`; the cause is on `stream_reader.err`.
+    fn mapReaderErr(self: *const RealityConn, err: anyerror) anyerror {
+        const cause: anyerror = if (err == error.ReadFailed)
+            (self.stream_reader.err orelse err)
+        else
+            err;
+        return netutil.classifyDeadlineErr(cause, self.deadlineFired());
+    }
+
     fn writeApp(self: *RealityConn, data: []const u8) !void {
         if (self.xtls_raw_write) {
-            self.conn.writer.writeAll(data) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
-            self.conn.writer.flush() catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
+            self.conn.writer.writeAll(data) catch |err| return self.mapWriterErr(err);
+            self.conn.writer.flush() catch |err| return self.mapWriterErr(err);
             return;
         }
-        self.conn.writeRecord(23, data, false) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
+        self.conn.writeRecord(23, data, false) catch |err| return self.mapWriterErr(err);
     }
 
     fn writeClear(self: *RealityConn, content_type: u8, data: []const u8) !void {
-        self.conn.writeClear(content_type, data) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
+        self.conn.writeClear(content_type, data) catch |err| return self.mapWriterErr(err);
     }
 
     fn writeHandshake(self: *RealityConn, data: []const u8) !void {
-        self.conn.writeRecord(22, data, true) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
+        self.conn.writeRecord(22, data, true) catch |err| return self.mapWriterErr(err);
     }
 
     fn waitForReadable(self: *RealityConn) !void {
@@ -507,7 +525,7 @@ const RealityConn = struct {
 
     fn readRecordDeadline(self: *RealityConn, out: []u8, handshake_keys: bool) !TlsRecord {
         try self.waitForReadable();
-        return self.conn.readRecord(out, handshake_keys) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
+        return self.conn.readRecord(out, handshake_keys) catch |err| return self.mapReaderErr(err);
     }
 
     fn readApp(self: *RealityConn, out: []u8) !usize {
@@ -516,7 +534,7 @@ const RealityConn = struct {
             // of raw inner TLS that arrived with the last Reality record).
             try self.waitForReadable();
             const n = self.conn.reader.readSliceShort(out) catch |err| {
-                return netutil.classifyDeadlineErr(err, self.deadlineFired());
+                return self.mapReaderErr(err);
             };
             if (n == 0) return error.EndOfStream;
             return n;
@@ -1112,9 +1130,9 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
             .allow_truncation_attacks = true,
         },
     ) catch |err| {
-        return pipe.err orelse err;
+        return unwrapPipeErr(&pipe, err);
     };
-    pipe.writer.flush() catch |err| return pipe.err orelse err;
+    pipe.writer.flush() catch |err| return unwrapPipeErr(&pipe, err);
     pipe.handshake_done = true;
 
     var http_buf: [8192]u8 = undefined;
@@ -1128,10 +1146,24 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
     return netutil.elapsedMs(steady_start, io);
 }
 
+/// Prefer VisionPipe / socket causes over opaque `WriteFailed` / `ReadFailed` wrappers.
+fn unwrapPipeErr(pipe: *const VisionPipe, err: anyerror) anyerror {
+    if (pipe.err) |e| return e;
+    if (err == error.WriteFailed) {
+        if (pipe.rc.stream_writer.err) |e|
+            return netutil.classifyDeadlineErr(e, pipe.rc.deadlineFired());
+    }
+    if (err == error.ReadFailed) {
+        if (pipe.rc.stream_reader.err) |e|
+            return netutil.classifyDeadlineErr(e, pipe.rc.deadlineFired());
+    }
+    return err;
+}
+
 fn flushTlsApp(tls_client: *tls.Client, pipe: *VisionPipe, request: []const u8) !void {
-    tls_client.writer.writeAll(request) catch |err| return pipe.err orelse err;
-    tls_client.writer.flush() catch |err| return pipe.err orelse err;
-    pipe.writer.flush() catch |err| return pipe.err orelse err;
+    tls_client.writer.writeAll(request) catch |err| return unwrapPipeErr(pipe, err);
+    tls_client.writer.flush() catch |err| return unwrapPipeErr(pipe, err);
+    pipe.writer.flush() catch |err| return unwrapPipeErr(pipe, err);
 }
 
 fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8, require_uag: []const u8) !usize {
@@ -1140,7 +1172,7 @@ fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u
         if (http_len == http_buf.len) return error.BufferTooSmall;
         // Do not use readSliceShort on a large slice: with keep-alive it waits until
         // the whole buffer is full. Decrypt ≥1 byte, then take whatever cleartext is ready.
-        tls_client.reader.fill(1) catch |err| return pipe.err orelse err;
+        tls_client.reader.fill(1) catch |err| return unwrapPipeErr(pipe, err);
         const chunk = tls_client.reader.buffered();
         const n = @min(chunk.len, http_buf.len - http_len);
         if (n == 0) return error.EndOfStream;
