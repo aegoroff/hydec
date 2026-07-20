@@ -458,6 +458,10 @@ const RealityConn = struct {
     deadline_done: std.atomic.Value(bool) = .init(false),
     deadline_fired: std.atomic.Value(bool) = .init(false),
     deadline_guard: ?netutil.DeadlineShutdown = null,
+    /// After uplink PaddingDirect, further writes are raw TCP under Reality.
+    xtls_raw_write: bool = false,
+    /// After downlink PaddingDirect, further reads are raw TCP under Reality.
+    xtls_raw_read: bool = false,
 
     fn deadlineFired(self: *const RealityConn) bool {
         return self.deadline_fired.load(.acquire);
@@ -475,6 +479,11 @@ const RealityConn = struct {
     }
 
     fn writeApp(self: *RealityConn, data: []const u8) !void {
+        if (self.xtls_raw_write) {
+            self.conn.writer.writeAll(data) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
+            self.conn.writer.flush() catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
+            return;
+        }
         self.conn.writeRecord(23, data, false) catch |err| return netutil.classifyDeadlineErr(err, self.deadlineFired());
     }
 
@@ -502,6 +511,16 @@ const RealityConn = struct {
     }
 
     fn readApp(self: *RealityConn, out: []u8) !usize {
+        if (self.xtls_raw_read) {
+            // Prefer bytes already buffered on the socket reader (may be the start
+            // of raw inner TLS that arrived with the last Reality record).
+            try self.waitForReadable();
+            const n = self.conn.reader.readSliceShort(out) catch |err| {
+                return netutil.classifyDeadlineErr(err, self.deadlineFired());
+            };
+            if (n == 0) return error.EndOfStream;
+            return n;
+        }
         var scratch: [16640]u8 = undefined;
         var attempts: usize = 0;
         while (attempts < 16) : (attempts += 1) {
@@ -887,6 +906,11 @@ pub fn probeVless(
 }
 
 /// VLESS and Vision framing over REALITY, exposed to the inner TLS client.
+///
+/// Uplink (TLS 1.3 / xray Vision): Continue through the handshake; PaddingDirect on
+/// the first complete Application Data write, then raw TCP under Reality.
+/// Downlink: PaddingDirect enables `xtls_raw_read` so further inner TLS is read raw.
+/// Always `pipe.writer.flush()` after TLS writes — Zig's TLS client only advances the buffer.
 const VisionPipe = struct {
     rc: *RealityConn,
     uuid: [16]u8,
@@ -894,7 +918,7 @@ const VisionPipe = struct {
     use_vision: bool,
     first_sent: bool = false,
     handshake_done: bool = false,
-    vision_ended: bool = false,
+    uplink_padding: bool = true,
     err: ?anyerror = null,
 
     wire: [16384]u8 = undefined,
@@ -943,24 +967,35 @@ const VisionPipe = struct {
             return;
         }
 
-        var pkt: [16384]u8 = undefined;
+        if (!self.uplink_padding) {
+            try self.rc.writeApp(data);
+            return;
+        }
+
+        var pkt: [32768]u8 = undefined;
         var n: usize = 0;
+        var uuid_ptr: ?*const [16]u8 = null;
         if (!self.first_sent) {
             if (self.vless_hdr.len > pkt.len) return error.BufferTooSmall;
             @memcpy(pkt[0..self.vless_hdr.len], self.vless_hdr);
             n = self.vless_hdr.len;
-            n += try vless.appendVisionFrame(pkt[n..], vless.vision_cmd_continue, &self.uuid, data, 64);
+            uuid_ptr = &self.uuid;
             self.first_sent = true;
-        } else if (!self.handshake_done) {
-            n = try vless.appendVisionPaddingContinue(&pkt, data);
-        } else if (!self.vision_ended) {
-            n = try vless.appendVisionFrame(&pkt, vless.vision_cmd_end, null, data, 64);
-            self.vision_ended = true;
-        } else {
-            try self.rc.writeApp(data);
+        }
+
+        // Continue through handshake (and incomplete App Data). Direct only on a
+        // complete TLS Application Data flight — matches xray IsCompleteRecord.
+        if (!self.handshake_done or !isCompleteTlsAppData(data)) {
+            n += try vless.appendVisionFrame(pkt[n..], vless.vision_cmd_continue, uuid_ptr, data, 64);
+            try self.rc.writeApp(pkt[0..n]);
             return;
         }
+
+        n += try vless.appendVisionFrame(pkt[n..], vless.vision_cmd_direct, uuid_ptr, data, 64);
+        self.uplink_padding = false;
+        // Direct frame itself still goes through Reality; later writes are raw.
         try self.rc.writeApp(pkt[0..n]);
+        self.rc.xtls_raw_write = true;
     }
 
     fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
@@ -968,7 +1003,8 @@ const VisionPipe = struct {
         const buffered = io_w.buffered();
         const data_len = Io.Writer.countSplat(data, splat);
         const total = buffered.len + data_len;
-        var tmp: [16384]u8 = undefined;
+        // Large ClientHello (e.g. ML-KEM) + Vision framing can exceed 16KiB.
+        var tmp: [32768]u8 = undefined;
         if (total > tmp.len) {
             self.err = error.BufferTooSmall;
             return error.WriteFailed;
@@ -1021,6 +1057,7 @@ const VisionPipe = struct {
                 &self.saw_vision,
                 self.use_vision,
                 &self.vision_state,
+                &self.rc.xtls_raw_read,
             ) catch |err| {
                 self.err = err;
                 return error.ReadFailed;
@@ -1101,12 +1138,33 @@ fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u
     var http_len: usize = 0;
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         if (http_len == http_buf.len) return error.BufferTooSmall;
-        const n = tls_client.reader.readSliceShort(http_buf[http_len..]) catch |err| return pipe.err orelse err;
+        // Do not use readSliceShort on a large slice: with keep-alive it waits until
+        // the whole buffer is full. Decrypt ≥1 byte, then take whatever cleartext is ready.
+        tls_client.reader.fill(1) catch |err| return pipe.err orelse err;
+        const chunk = tls_client.reader.buffered();
+        const n = @min(chunk.len, http_buf.len - http_len);
         if (n == 0) return error.EndOfStream;
+        @memcpy(http_buf[http_len..][0..n], chunk[0..n]);
+        tls_client.reader.toss(n);
         http_len += n;
     }
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag)) return error.ProbeResponseMismatch;
     return http_len;
+}
+
+/// True when `data` is one or more complete TLS 1.3 Application Data records
+/// (xray `IsCompleteRecord` for Vision PaddingDirect).
+fn isCompleteTlsAppData(data: []const u8) bool {
+    if (data.len < 5) return false;
+    var i: usize = 0;
+    while (i + 5 <= data.len) {
+        if (data[i] != 0x17 or data[i + 1] != 0x03 or data[i + 2] != 0x03) return false;
+        const rec_len: usize = (@as(usize, data[i + 3]) << 8) | data[i + 4];
+        const need = 5 + rec_len;
+        if (i + need > data.len) return false;
+        i += need;
+    }
+    return i == data.len;
 }
 
 /// Move bytes from `stream` into `http` after stripping the VLESS response header
@@ -1122,6 +1180,7 @@ fn drainVlessVisionStream(
     saw_vision: *bool,
     require_vision: bool,
     vision_state: *vless.VisionUnpadState,
+    xtls_raw_read: *bool,
 ) !void {
     if (!stripped.*) {
         const hdr = vless.responseHeaderLen(stream[0..stream_len.*]) catch |err| switch (err) {
@@ -1153,6 +1212,7 @@ fn drainVlessVisionStream(
             }
             shiftDown(stream, stream_len, frame.consumed);
             if (frame.switch_to_raw) vision_raw.* = true;
+            if (frame.switch_to_xtls) xtls_raw_read.* = true;
         } else {
             if (http_len.* + stream_len.* > http.len) return error.BufferTooSmall;
             @memcpy(http[http_len.*..][0..stream_len.*], stream[0..stream_len.*]);
@@ -1267,6 +1327,16 @@ test "appendStripVlessHeader large first chunk" {
     try std.testing.expectEqual(@as(usize, 598), len);
 }
 
+test "isCompleteTlsAppData one and several records" {
+    const one = "\x17\x03\x03\x00\x01\xaa";
+    try std.testing.expect(isCompleteTlsAppData(one));
+    const two = one ++ "\x17\x03\x03\x00\x02\xbb\xcc";
+    try std.testing.expect(isCompleteTlsAppData(two));
+    try std.testing.expect(!isCompleteTlsAppData(one[0 .. one.len - 1]));
+    try std.testing.expect(!isCompleteTlsAppData("\x16\x03\x03\x00\x01\x00"));
+    try std.testing.expect(!isCompleteTlsAppData(""));
+}
+
 test "drainVlessVisionStream strips header before Vision unwrap" {
     var uuid: [16]u8 = [_]u8{0xcd} ** 16;
     const http = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
@@ -1285,10 +1355,12 @@ test "drainVlessVisionStream strips header before Vision unwrap" {
     var vision_raw = false;
     var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
+    var xtls_raw_read = false;
 
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read);
     try std.testing.expect(stripped);
     try std.testing.expect(vision_raw);
+    try std.testing.expect(!xtls_raw_read); // End ≠ Direct
     try std.testing.expectEqual(@as(usize, 0), stream_len);
     try std.testing.expectEqualStrings(http, http_buf[0..http_len]);
 }
@@ -1307,17 +1379,18 @@ test "drainVlessVisionStream splits header then Vision across pushes" {
     var vision_raw = false;
     var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
+    var xtls_raw_read = false;
 
     stream[0] = 0;
     stream_len = 1;
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read);
     try std.testing.expect(!stripped);
 
     stream[stream_len] = 0;
     stream_len += 1;
     @memcpy(stream[stream_len..][0..vn], vision[0..vn]);
     stream_len += vn;
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read);
     try std.testing.expect(stripped);
     try std.testing.expectEqualStrings(http, http_buf[0..http_len]);
 }
@@ -1348,10 +1421,12 @@ test "drainVlessVisionStream continues without UUID then End" {
     var vision_raw = false;
     var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
+    var xtls_raw_read = false;
 
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read);
     try std.testing.expect(stripped);
     try std.testing.expect(vision_raw);
+    try std.testing.expect(!xtls_raw_read);
     try std.testing.expect(!vision_state.expect_uuid);
     try std.testing.expectEqualStrings(part1 ++ part2, http_buf[0..http_len]);
 }
@@ -1373,15 +1448,16 @@ test "drainVlessVisionStream steady raw after End grows http" {
     var vision_raw = false;
     var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
+    var xtls_raw_read = false;
 
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read);
     try std.testing.expect(vision_raw);
     const before = http_len;
 
     const more = "HTTP/1.1 200 OK\r\n\r\n";
     @memcpy(stream[0..more.len], more);
     stream_len = more.len;
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read);
     try std.testing.expect(http_len > before);
     try std.testing.expectEqualStrings(http ++ more, http_buf[0..http_len]);
 }
@@ -1404,8 +1480,9 @@ test "drainVlessVisionStream incomplete Vision does not grow http" {
     var vision_raw = false;
     var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
+    var xtls_raw_read = false;
 
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read);
     try std.testing.expect(stripped);
     try std.testing.expect(!vision_raw);
     try std.testing.expectEqual(@as(usize, 0), http_len);
@@ -1414,7 +1491,7 @@ test "drainVlessVisionStream incomplete Vision does not grow http" {
     // Steady-style: feed the rest; http should grow only once the frame is complete.
     @memcpy(stream[stream_len..][0 .. vn - (partial - 2)], vision[partial - 2 .. vn]);
     stream_len += vn - (partial - 2);
-    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state);
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read);
     try std.testing.expect(http_len > 0);
     try std.testing.expect(vision_raw);
 }
@@ -1431,11 +1508,38 @@ test "drainVlessVisionStream rejects raw HTTP when Vision required" {
     var vision_raw = false;
     var saw_vision = false;
     var vision_state: vless.VisionUnpadState = .{};
+    var xtls_raw_read = false;
 
     try std.testing.expectError(
         error.ExpectedVisionPadding,
-        drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state),
+        drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read),
     );
+}
+
+test "drainVlessVisionStream Direct sets xtls_raw_read" {
+    var uuid: [16]u8 = [_]u8{0x66} ** 16;
+    const payload = "\x17\x03\x03\x00\x01\x00";
+    var vision: [256]u8 = undefined;
+    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_direct, &uuid, payload, 8);
+
+    var stream: [512]u8 = undefined;
+    stream[0] = 0;
+    stream[1] = 0;
+    @memcpy(stream[2..][0..vn], vision[0..vn]);
+    var stream_len: usize = 2 + vn;
+
+    var http_buf: [512]u8 = undefined;
+    var http_len: usize = 0;
+    var stripped = false;
+    var vision_raw = false;
+    var saw_vision = false;
+    var vision_state: vless.VisionUnpadState = .{};
+    var xtls_raw_read = false;
+
+    try drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read);
+    try std.testing.expect(vision_raw);
+    try std.testing.expect(xtls_raw_read);
+    try std.testing.expectEqualStrings(payload, http_buf[0..http_len]);
 }
 
 test "parseServerHelloX25519 accepts key_share" {

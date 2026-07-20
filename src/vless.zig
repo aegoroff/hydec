@@ -138,8 +138,10 @@ const VisionFrame = struct {
     /// Total bytes consumed from the front of the buffer (header + content + padding).
     consumed: usize,
     content: []const u8,
-    /// PaddingEnd / PaddingDirect — further downlink is raw application data.
+    /// PaddingEnd / PaddingDirect — further bytes are not Vision-framed.
     switch_to_raw: bool,
+    /// PaddingDirect — peer may send further inner TLS on the raw TCP under Reality.
+    switch_to_xtls: bool,
 };
 
 /// Parse one Vision frame at the front of `buf`.
@@ -160,6 +162,7 @@ pub fn consumeVisionFrame(
         buf[1] == 0x03 and
         buf[2] >= 0x01 and buf[2] <= 0x04)
     {
+        // Peer already left Vision framing (PaddingEnd content path, or XTLS raw).
         return error.NotVision;
     }
     if (buf.len < hdr_off + 5) return error.NeedMore;
@@ -177,6 +180,7 @@ pub fn consumeVisionFrame(
         .consumed = total,
         .content = buf[content_off .. content_off + content_len],
         .switch_to_raw = cmd == vision_cmd_end or cmd == vision_cmd_direct,
+        .switch_to_xtls = cmd == vision_cmd_direct,
     };
 }
 
@@ -220,7 +224,20 @@ test "consumeVisionFrame NeedMore and content before padding" {
     try std.testing.expectEqual(n, frame.consumed);
     try std.testing.expectEqualStrings(http, frame.content);
     try std.testing.expect(frame.switch_to_raw);
+    try std.testing.expect(!frame.switch_to_xtls); // End ≠ Direct/XTLS splice
     try std.testing.expect(!state.expect_uuid);
+}
+
+test "consumeVisionFrame Direct sets switch_to_xtls" {
+    var uuid: [16]u8 = [_]u8{0x55} ** 16;
+    const payload = "\x17\x03\x03\x00\x01\x00";
+    var frame_buf: [128]u8 = undefined;
+    const n = try appendVisionFrame(&frame_buf, vision_cmd_direct, &uuid, payload, 8);
+    var state: VisionUnpadState = .{};
+    const frame = try consumeVisionFrame(frame_buf[0..n], &uuid, &state);
+    try std.testing.expect(frame.switch_to_raw);
+    try std.testing.expect(frame.switch_to_xtls);
+    try std.testing.expectEqualStrings(payload, frame.content);
 }
 
 test "consumeVisionFrame rejects non-uuid prefix" {
