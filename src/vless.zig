@@ -105,7 +105,7 @@ pub fn appendVisionPaddingEnd(out: []u8, uuid: *const [16]u8, content: []const u
 }
 
 /// Continuation Vision frame (no UUID) — used by tests / multi-block peers.
-fn appendVisionPaddingContinue(out: []u8, content: []const u8) error{BufferTooSmall}!usize {
+pub fn appendVisionPaddingContinue(out: []u8, content: []const u8) error{BufferTooSmall}!usize {
     return appendVisionFrame(out, vision_cmd_continue, null, content, 16);
 }
 
@@ -144,7 +144,7 @@ const VisionFrame = struct {
 
 /// Parse one Vision frame at the front of `buf`.
 /// First block (`state.expect_uuid`): requires leading `uuid`. Later Continue blocks omit UUID.
-/// `NeedMore` if incomplete; `NotVision` only when expecting UUID and prefix does not match.
+/// `NeedMore` if incomplete; `NotVision` when the expected framing is absent.
 pub fn consumeVisionFrame(
     buf: []const u8,
     uuid: *const [16]u8,
@@ -155,6 +155,12 @@ pub fn consumeVisionFrame(
         if (buf.len < 16) return error.NeedMore;
         if (!std.mem.eql(u8, buf[0..16], uuid)) return error.NotVision;
         hdr_off = 16;
+    } else if (buf.len >= 3 and
+        buf[0] >= 0x14 and buf[0] <= 0x17 and
+        buf[1] == 0x03 and
+        buf[2] >= 0x01 and buf[2] <= 0x04)
+    {
+        return error.NotVision;
     }
     if (buf.len < hdr_off + 5) return error.NeedMore;
     const cmd = buf[hdr_off];
@@ -246,4 +252,11 @@ test "consumeVisionFrame continue block omits UUID" {
     const f2 = try consumeVisionFrame(cont[0..n2], &uuid, &state);
     try std.testing.expectEqualStrings(part2, f2.content);
     try std.testing.expect(!f2.switch_to_raw);
+}
+
+test "consumeVisionFrame recognizes raw TLS after UUID phase" {
+    var uuid: [16]u8 = [_]u8{0xcd} ** 16;
+    var state: VisionUnpadState = .{ .expect_uuid = false };
+    const tls_record = [_]u8{ 0x16, 0x03, 0x03, 0x00, 0x2a };
+    try std.testing.expectError(error.NotVision, consumeVisionFrame(&tls_record, &uuid, &state));
 }
