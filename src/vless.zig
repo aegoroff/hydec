@@ -70,21 +70,26 @@ pub fn responseHeaderLen(buf: []const u8) error{ NeedMore, InvalidVlessResponse 
 
 const probe_http = util.probe_http;
 
-/// Encode a VLESS probe: TCP CONNECT to probe host:80 + HTTP GET (gRPC).
-pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8) !usize {
+/// Encode a VLESS probe: TCP CONNECT to probe host:80 + HTTP GET (matches ss probe).
+pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8, flow: []const u8) !usize {
     var uuid: [16]u8 = undefined;
     try parseUuid(uuid_text, &uuid);
-    var n = try encodeRequestDomain(out, &uuid, util.probe_domain, util.probe_http_port, "");
-    if (out.len < n + probe_http.len) return error.BufferTooSmall;
-    @memcpy(out[n..][0..probe_http.len], probe_http);
-    n += probe_http.len;
+    // Port 80 + HTTP GET so the remote answers without a TLS handshake hang.
+    var n = try encodeRequestDomain(out, &uuid, util.probe_domain, util.probe_http_port, flow);
+    if (std.mem.indexOf(u8, flow, "vision") != null) {
+        n += try appendVisionPaddingEnd(out[n..], &uuid, probe_http);
+    } else {
+        if (out.len < n + probe_http.len) return error.BufferTooSmall;
+        @memcpy(out[n..][0..probe_http.len], probe_http);
+        n += probe_http.len;
+    }
     return n;
 }
 
 /// Vision padding commands (xray / sing-box).
 pub const vision_cmd_continue: u8 = 0x00;
 pub const vision_cmd_end: u8 = 0x01;
-const vision_cmd_direct: u8 = 0x02;
+pub const vision_cmd_direct: u8 = 0x02;
 
 /// Decoder state for xray `XtlsUnpadding`: UUID only on the first padded block;
 /// subsequent `CommandPaddingContinue` blocks use a 5-byte header.

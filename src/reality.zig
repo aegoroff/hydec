@@ -759,8 +759,8 @@ pub fn probeVless(
     defer rc.deinit();
 
     var vless_buf: [1024]u8 = undefined;
+    const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid, if (grpc) "" else flow);
     if (grpc) {
-        const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid);
         var auth_buf: [256]u8 = undefined;
         const authority = try grpc_gun.formatAuthority(&auth_buf, sni_use, port, authority_param);
 
@@ -775,6 +775,7 @@ pub fn probeVless(
         var settings_seen = false;
         var request_sent = false;
         var saw_headers_ok = false;
+        var saw_grpc_data = false;
         var stripped_vless = false;
         var warmup_done = false;
         // Byte offset in `gather`: DATA/HEADERS with frame start < this are warmup leftovers
@@ -821,6 +822,8 @@ pub fn probeVless(
                     fl += try grpc_gun.buildDataFrame(flight[fl..], 1, grpc_msg[0..glen], false);
                     try rc.writeApp(flight[0..fl]);
                     request_sent = true;
+                    saw_headers_ok = false;
+                    saw_grpc_data = false;
                 } else if (ftyp == 0x06 and (fflags & 0x01) == 0 and frame_len == 8) {
                     var pong: [17]u8 = undefined;
                     const pong_len = try grpc_gun.buildPingAck(&pong, payload[0..8]);
@@ -832,15 +835,18 @@ pub fn probeVless(
                         saw_headers_ok = true;
                     }
                     if ((fflags & 0x01) != 0 and !saw_headers_ok) return error.GrpcStreamEnded;
-                    // END_STREAM on headers with 200 but no DATA: still failure for protocol probe
-                    if ((fflags & 0x01) != 0 and saw_headers_ok) return error.GrpcEmptyResponse;
+                    // Empty 200 before any DATA is a failure; trailer END_STREAM after DATA is normal.
+                    if ((fflags & 0x01) != 0 and saw_headers_ok and !saw_grpc_data) return error.GrpcEmptyResponse;
                 } else if (ftyp == 0x00 and frame_len >= 5 and request_sent) {
                     const msg = try grpc_gun.vlessFromGrpcData(payload);
+                    saw_grpc_data = true;
                     if (!warmup_done) {
                         if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_warmup)) {
                             warmup_done = true;
                             // Fresh buffer for the keep-alive request; VLESS header already stripped.
                             http_len = 0;
+                            saw_headers_ok = false;
+                            saw_grpc_data = false;
                             var hunk: [256]u8 = undefined;
                             const hunk_len = try grpc_gun.wrapHunk(&hunk, util.probe_http_steady);
                             var grpc_msg: [320]u8 = undefined;
@@ -879,268 +885,108 @@ pub fn probeVless(
             }
         }
     } else {
-        // TCP/Vision: full inner TLS + HTTP /cdn-cgi/trace. Stopping at ServerHello
-        // false-OKs nodes that deliver the first flight then break on raw post-Vision I/O.
-        return try probeVlessTcpHttps(&rc, io, uuid, flow);
-    }
-}
+        const use_vision = std.mem.indexOf(u8, flow, "vision") != null;
+        var uuid_bytes: [16]u8 = undefined;
+        try vless.parseUuid(uuid, &uuid_bytes);
 
-/// VLESS + optional Vision framing over an established REALITY connection, exposed as
-/// Io.Reader/Writer for `std.crypto.tls.Client` (inner HTTPS probe).
-const VisionPipe = struct {
-    rc: *RealityConn,
-    uuid: [16]u8,
-    vless_hdr: []const u8,
-    use_vision: bool,
-    first_sent: bool = false,
-    err: ?anyerror = null,
+        var stream: [16384]u8 = undefined;
+        var stream_len: usize = 0;
+        var http_buf: [16384]u8 = undefined;
+        var http_len: usize = 0;
+        var stripped_header = false;
+        var vision_raw = !use_vision;
+        var saw_vision = false;
+        var vision_state: vless.VisionUnpadState = .{};
+        var resp: [16384]u8 = undefined;
 
-    wire: [16384]u8 = undefined,
-    wire_len: usize = 0,
-    plain: [16384]u8 = undefined,
-    plain_len: usize = 0,
-    plain_off: usize = 0,
-    stripped: bool = false,
-    vision_raw: bool,
-    saw_vision: bool = false,
-    vision_state: vless.VisionUnpadState = .{},
+        try rc.writeApp(vless_buf[0..vless_len]);
 
-    wbuf: [tls.Client.min_buffer_len]u8 = undefined,
-    rbuf: [tls.Client.min_buffer_len]u8 = undefined,
-    writer: Io.Writer = undefined,
-    reader: Io.Reader = undefined,
-
-    fn initInterfaces(self: *VisionPipe) void {
-        self.writer = .{
-            .vtable = &.{ .drain = drain },
-            .buffer = &self.wbuf,
-        };
-        self.reader = .{
-            .vtable = &.{
-                .stream = streamImpl,
-                .readVec = readVec,
-            },
-            .buffer = &self.rbuf,
-            .seek = 0,
-            .end = 0,
-        };
-    }
-
-    fn sendPlain(self: *VisionPipe, plain: []const u8) !void {
-        if (!self.first_sent) {
-            var pkt: [16384]u8 = undefined;
-            if (self.vless_hdr.len > pkt.len) return error.BufferTooSmall;
-            @memcpy(pkt[0..self.vless_hdr.len], self.vless_hdr);
-            var n = self.vless_hdr.len;
-            if (self.use_vision) {
-                n += try vless.appendVisionPaddingEnd(pkt[n..], &self.uuid, plain);
-            } else {
-                if (n + plain.len > pkt.len) return error.BufferTooSmall;
-                @memcpy(pkt[n..][0..plain.len], plain);
-                n += plain.len;
-            }
-            try self.rc.writeApp(pkt[0..n]);
-            self.first_sent = true;
-        } else {
-            try self.rc.writeApp(plain);
-        }
-    }
-
-    fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
-        const self: *VisionPipe = @alignCast(@fieldParentPtr("writer", io_w));
-        const buffered = io_w.buffered();
-        const data_len = Io.Writer.countSplat(data, splat);
-        const total = buffered.len + data_len;
-        var tmp: [16384]u8 = undefined;
-        if (total > tmp.len) {
-            self.err = error.BufferTooSmall;
-            return error.WriteFailed;
-        }
-        var off: usize = 0;
-        if (buffered.len > 0) {
-            @memcpy(tmp[0..buffered.len], buffered);
-            off = buffered.len;
-        }
-        if (data.len > 0) {
-            for (data[0 .. data.len - 1]) |bytes| {
-                @memcpy(tmp[off..][0..bytes.len], bytes);
-                off += bytes.len;
-            }
-            const pattern = data[data.len - 1];
-            var s: usize = 0;
-            while (s < splat) : (s += 1) {
-                @memcpy(tmp[off..][0..pattern.len], pattern);
-                off += pattern.len;
-            }
-        }
-        self.sendPlain(tmp[0..off]) catch |e| {
-            self.err = e;
-            return error.WriteFailed;
-        };
-        return io_w.consume(total);
-    }
-
-    fn fillPlain(self: *VisionPipe) Io.Reader.Error!void {
-        while (self.plain_off >= self.plain_len) {
-            self.plain_off = 0;
-            self.plain_len = 0;
-            var resp: [8192]u8 = undefined;
-            const n = self.rc.readApp(&resp) catch |err| {
-                self.err = err;
-                if (util.isPeerClosed(err)) return error.EndOfStream;
-                return error.ReadFailed;
+        while (true) {
+            if (util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup) and
+                util.httpResponseTotalLen(http_buf[0..http_len]) != null)
+                break;
+            const n = rc.readApp(&resp) catch |err| {
+                if (util.httpCloseDelimitedReady(http_buf[0..http_len])) {
+                    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
+                        return error.ProbeResponseMismatch;
+                    break;
+                }
+                if (util.httpHeadersComplete(http_buf[0..http_len]) and util.isPeerClosed(err)) break;
+                return err;
             };
-            if (n == 0) return error.EndOfStream;
-            if (self.wire_len + n > self.wire.len) {
-                self.err = error.BufferTooSmall;
-                return error.ReadFailed;
+            if (n == 0) {
+                if (util.httpCloseDelimitedReady(http_buf[0..http_len])) {
+                    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
+                        return error.ProbeResponseMismatch;
+                    break;
+                }
+                return error.EndOfStream;
             }
-            @memcpy(self.wire[self.wire_len..][0..n], resp[0..n]);
-            self.wire_len += n;
-            drainVlessVisionStream(
-                &self.wire,
-                &self.wire_len,
-                &self.plain,
-                &self.plain_len,
-                &self.uuid,
-                &self.stripped,
-                &self.vision_raw,
-                &self.saw_vision,
-                self.use_vision,
-                &self.vision_state,
-            ) catch |err| {
-                self.err = err;
-                return error.ReadFailed;
-            };
+            if (stream_len + n > stream.len) return error.BufferTooSmall;
+            @memcpy(stream[stream_len..][0..n], resp[0..n]);
+            stream_len += n;
+            try drainVlessVisionStream(
+                &stream,
+                &stream_len,
+                &http_buf,
+                &http_len,
+                &uuid_bytes,
+                &stripped_header,
+                &vision_raw,
+                &saw_vision,
+                use_vision,
+                &vision_state,
+            );
+            if (util.httpResponseTotalLen(http_buf[0..http_len]) != null and
+                !util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
+                return error.ProbeResponseMismatch;
         }
-    }
-
-    fn streamImpl(io_r: *Io.Reader, io_w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
-        const dest = limit.slice(try io_w.writableSliceGreedy(1));
-        var data: [1][]u8 = .{dest};
-        const n = try readVec(io_r, &data);
-        io_w.advance(n);
-        return n;
-    }
-
-    fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
-        const self: *VisionPipe = @alignCast(@fieldParentPtr("reader", io_r));
-        _ = data;
-        try self.fillPlain();
-        if (self.plain_off >= self.plain_len) return error.EndOfStream;
-
-        // Compact reader buffer if fully consumed.
-        if (io_r.seek > 0 and io_r.seek == io_r.end) {
-            io_r.seek = 0;
-            io_r.end = 0;
-        }
-        const space = io_r.buffer.len - io_r.end;
-        if (space == 0) return 0;
-        const avail = self.plain[self.plain_off..self.plain_len];
-        const take = @min(avail.len, space);
-        @memcpy(io_r.buffer[io_r.end..][0..take], avail[0..take]);
-        io_r.end += take;
-        self.plain_off += take;
-        return 0;
-    }
-};
-
-fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []const u8) !u64 {
-    const use_vision = std.mem.indexOf(u8, flow, "vision") != null;
-    var uuid: [16]u8 = undefined;
-    try vless.parseUuid(uuid_text, &uuid);
-
-    var hdr_buf: [256]u8 = undefined;
-    const hdr_len = try vless.encodeRequestDomain(&hdr_buf, &uuid, util.probe_domain, util.probe_tls_port, flow);
-
-    var pipe: VisionPipe = .{
-        .rc = rc,
-        .uuid = uuid,
-        .vless_hdr = hdr_buf[0..hdr_len],
-        .use_vision = use_vision,
-        .vision_raw = !use_vision,
-    };
-    pipe.initInterfaces();
-
-    var tls_read_buf: [tls.Client.min_buffer_len]u8 = undefined;
-    var tls_write_buf: [tls.Client.min_buffer_len]u8 = undefined;
-    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
-    io.random(&entropy);
-    const now = Io.Clock.real.now(io);
-
-    var tls_client = tls.Client.init(
-        &pipe.reader,
-        &pipe.writer,
-        .{
-            .host = .{ .explicit = util.probe_domain },
-            .ca = .no_verification,
-            .read_buffer = &tls_read_buf,
-            .write_buffer = &tls_write_buf,
-            .entropy = &entropy,
-            .realtime_now = now,
-            .allow_truncation_attacks = true,
-        },
-    ) catch |err| {
-        if (pipe.err) |e| return e;
-        return err;
-    };
-
-    // Warmup: full inner TLS + first /cdn-cgi/trace (also catches dead Vision post-SH).
-    try writeHttpGet(&tls_client, &pipe, util.probe_http);
-    var http_buf: [8192]u8 = undefined;
-    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf, util.probe_ua_warmup);
-    if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
-
-    // Steady-state: second request RTT (matches SS / Trojan / gRPC).
-    const steady_start = netutil.monoNow(io);
-    try writeHttpGet(&tls_client, &pipe, util.probe_http_steady);
-    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf, util.probe_ua_steady);
-    return netutil.elapsedMs(steady_start, io);
-}
-
-fn writeHttpGet(tls_client: *tls.Client, pipe: *VisionPipe, request: []const u8) !void {
-    tls_client.writer.writeAll(request) catch |err| {
-        if (pipe.err) |e| return e;
-        return err;
-    };
-    tls_client.writer.flush() catch |err| {
-        if (pipe.err) |e| return e;
-        return err;
-    };
-}
-
-fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8, require_uag: []const u8) !usize {
-    var http_len: usize = 0;
-    while (true) {
-        if (util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag) and
-            util.httpResponseTotalLen(http_buf[0..http_len]) != null)
-        {
-            return http_len;
-        }
-        if (http_len >= http_buf.len) return error.BufferTooSmall;
-        const n = tls_client.reader.readSliceShort(http_buf[http_len..]) catch |err| {
-            if (pipe.err) |e| return e;
-            // Same policy as SS/Trojan: only HTTP/1.0 close-delimited may finish on peer-close.
-            if (util.isPeerClosed(err) and util.httpCloseDelimitedReady(http_buf[0..http_len])) {
-                if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag))
-                    return error.ProbeResponseMismatch;
-                return http_len;
-            }
-            return err;
-        };
-        if (n == 0) {
-            if (util.httpCloseDelimitedReady(http_buf[0..http_len])) {
-                if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag))
-                    return error.ProbeResponseMismatch;
-                return http_len;
-            }
-            return error.EndOfStream;
-        }
-        http_len += n;
-        if (util.httpResponseTotalLen(http_buf[0..http_len]) != null and
-            !util.looksLikeCloudflareTraceUag(http_buf[0..http_len], require_uag))
-        {
+        if (util.httpResponseTotalLen(http_buf[0..http_len]) == null or
+            !util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
             return error.ProbeResponseMismatch;
+        if (use_vision and !saw_vision) return error.ExpectedVisionPadding;
+
+        const steady_start = netutil.monoNow(io);
+        try rc.writeApp(util.probe_http_steady);
+        http_len = 0;
+        while (true) {
+            if (util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady) and
+                util.httpResponseTotalLen(http_buf[0..http_len]) != null)
+                return netutil.elapsedMs(steady_start, io);
+            const n = rc.readApp(&resp) catch |err| {
+                if (util.httpCloseDelimitedReady(http_buf[0..http_len])) {
+                    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
+                        return error.ProbeResponseMismatch;
+                    return netutil.elapsedMs(steady_start, io);
+                }
+                return err;
+            };
+            if (n == 0) {
+                if (util.httpCloseDelimitedReady(http_buf[0..http_len])) {
+                    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
+                        return error.ProbeResponseMismatch;
+                    return netutil.elapsedMs(steady_start, io);
+                }
+                return error.EndOfStream;
+            }
+            if (stream_len + n > stream.len) return error.BufferTooSmall;
+            @memcpy(stream[stream_len..][0..n], resp[0..n]);
+            stream_len += n;
+            try drainVlessVisionStream(
+                &stream,
+                &stream_len,
+                &http_buf,
+                &http_len,
+                &uuid_bytes,
+                &stripped_header,
+                &vision_raw,
+                &saw_vision,
+                use_vision,
+                &vision_state,
+            );
+            if (util.httpResponseTotalLen(http_buf[0..http_len]) != null and
+                !util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
+                return error.ProbeResponseMismatch;
         }
     }
 }
