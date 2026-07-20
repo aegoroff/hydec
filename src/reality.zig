@@ -792,134 +792,135 @@ pub fn probeVless(
     try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs);
     defer rc.deinit();
 
+    if (!grpc) {
+        return probeVlessTcpHttps(&rc, io, uuid, flow);
+    }
+
     var vless_buf: [1024]u8 = undefined;
-    const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid, if (grpc) "" else flow);
-    if (grpc) {
-        var auth_buf: [256]u8 = undefined;
-        const authority = try grpc_gun.formatAuthority(&auth_buf, sni_use, port, authority_param);
+    const vless_len = try vless.encodeProbeRequest(&vless_buf, uuid);
 
-        // Match sing-box: preface+SETTINGS, then after peer SETTINGS: ACK + HEADERS + DATA (no END_STREAM).
-        var preface: [64]u8 = undefined;
-        const plen = try grpc_gun.buildClientPrefaceSettings(&preface);
-        try rc.writeApp(preface[0..plen]);
+    var auth_buf: [256]u8 = undefined;
+    const authority = try grpc_gun.formatAuthority(&auth_buf, sni_use, port, authority_param);
 
-        var app_buf: [16384]u8 = undefined;
-        var gather: [32768]u8 = undefined;
-        var gather_len: usize = 0;
-        var settings_seen = false;
-        var request_sent = false;
-        var saw_headers_ok = false;
-        var saw_grpc_data = false;
-        var stripped_vless = false;
-        var warmup_done = false;
-        // Byte offset in `gather`: DATA/HEADERS with frame start < this are warmup leftovers
-        // already buffered when the steady request was written. Ignoring them avoids false-OK;
-        // keeping them in `gather` preserves HTTP/2 frame alignment (unlike wiping the buffer).
-        var discard_data_before: usize = 0;
-        var steady_start: ?i128 = null;
-        var http_buf: [16384]u8 = undefined;
-        var http_len: usize = 0;
-        while (true) {
-            const n = rc.readApp(app_buf[0..]) catch |err| {
-                // Do not treat peer-close after warmup as success — that hides dest-fallback
-                // and one-shot false positives.
-                return err;
-            };
-            if (gather_len + n > gather.len) return error.BufferTooSmall;
-            @memcpy(gather[gather_len..][0..n], app_buf[0..n]);
-            gather_len += n;
+    // Match sing-box: preface+SETTINGS, then after peer SETTINGS: ACK + HEADERS + DATA (no END_STREAM).
+    var preface: [64]u8 = undefined;
+    const plen = try grpc_gun.buildClientPrefaceSettings(&preface);
+    try rc.writeApp(preface[0..plen]);
 
-            var off: usize = 0;
-            while (off + 9 <= gather_len) {
-                const frame_len: usize = (@as(usize, gather[off]) << 16) | (@as(usize, gather[off + 1]) << 8) | gather[off + 2];
-                const ftyp = gather[off + 3];
-                const fflags = gather[off + 4];
-                if (off + 9 + frame_len > gather_len) break;
+    var app_buf: [16384]u8 = undefined;
+    var gather: [32768]u8 = undefined;
+    var gather_len: usize = 0;
+    var settings_seen = false;
+    var request_sent = false;
+    var saw_headers_ok = false;
+    var saw_grpc_data = false;
+    var stripped_vless = false;
+    var warmup_done = false;
+    // Byte offset in `gather`: DATA/HEADERS with frame start < this are warmup leftovers
+    // already buffered when the steady request was written. Ignoring them avoids false-OK;
+    // keeping them in `gather` preserves HTTP/2 frame alignment (unlike wiping the buffer).
+    var discard_data_before: usize = 0;
+    var steady_start: ?i128 = null;
+    var http_buf: [16384]u8 = undefined;
+    var http_len: usize = 0;
+    while (true) {
+        const n = rc.readApp(app_buf[0..]) catch |err| {
+            // Do not treat peer-close after warmup as success — that hides dest-fallback
+            // and one-shot false positives.
+            return err;
+        };
+        if (gather_len + n > gather.len) return error.BufferTooSmall;
+        @memcpy(gather[gather_len..][0..n], app_buf[0..n]);
+        gather_len += n;
 
-                const payload = gather[off + 9 .. off + 9 + frame_len];
-                const inflight = warmup_done and off < discard_data_before;
+        var off: usize = 0;
+        while (off + 9 <= gather_len) {
+            const frame_len: usize = (@as(usize, gather[off]) << 16) | (@as(usize, gather[off + 1]) << 8) | gather[off + 2];
+            const ftyp = gather[off + 3];
+            const fflags = gather[off + 4];
+            if (off + 9 + frame_len > gather_len) break;
 
-                if (ftyp == 0x04 and (fflags & 0x01) == 0 and !settings_seen) {
-                    settings_seen = true;
-                    var flight: [1536]u8 = undefined;
-                    var fl: usize = 0;
-                    fl += try grpc_gun.buildSettingsAck(flight[fl..]);
-                    // Open the flow-control window generously (some peers start at 0).
-                    fl += try grpc_gun.buildWindowUpdate(flight[fl..], 0, 1 << 20);
-                    fl += try grpc_gun.buildWindowUpdate(flight[fl..], 1, 1 << 20);
-                    fl += try grpc_gun.buildGunHeaders(flight[fl..], service_name, authority);
-                    var hunk: [640]u8 = undefined;
-                    const hunk_len = try grpc_gun.wrapHunk(&hunk, vless_buf[0..vless_len]);
-                    var grpc_msg: [704]u8 = undefined;
-                    const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
-                    // Keep the stream open — gun-lite is bidirectional; END_STREAM yields empty 200s.
-                    fl += try grpc_gun.buildDataFrame(flight[fl..], 1, grpc_msg[0..glen], false);
-                    try rc.writeApp(flight[0..fl]);
-                    request_sent = true;
-                    saw_headers_ok = false;
-                    saw_grpc_data = false;
-                } else if (ftyp == 0x06 and (fflags & 0x01) == 0 and frame_len == 8) {
-                    var pong: [17]u8 = undefined;
-                    const pong_len = try grpc_gun.buildPingAck(&pong, payload[0..8]);
-                    try rc.writeApp(pong[0..pong_len]);
-                } else if (inflight and (ftyp == 0x00 or ftyp == 0x01)) {
-                    // Warmup leftover DATA / trailers — ack framing only.
-                } else if (ftyp == 0x01 and request_sent) {
-                    if (grpc_gun.headersIndicateStatus200(payload, fflags)) {
-                        saw_headers_ok = true;
-                    }
-                    if ((fflags & 0x01) != 0 and !saw_headers_ok) return error.GrpcStreamEnded;
-                    // Empty 200 before any DATA is a failure; trailer END_STREAM after DATA is normal.
-                    if ((fflags & 0x01) != 0 and saw_headers_ok and !saw_grpc_data) return error.GrpcEmptyResponse;
-                } else if (ftyp == 0x00 and frame_len >= 5 and request_sent) {
-                    const msg = try grpc_gun.vlessFromGrpcData(payload);
-                    saw_grpc_data = true;
-                    if (!warmup_done) {
-                        if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_warmup)) {
-                            warmup_done = true;
-                            // Fresh buffer for the keep-alive request; VLESS header already stripped.
-                            http_len = 0;
-                            saw_headers_ok = false;
-                            saw_grpc_data = false;
-                            var hunk: [256]u8 = undefined;
-                            const hunk_len = try grpc_gun.wrapHunk(&hunk, util.probe_http_steady);
-                            var grpc_msg: [320]u8 = undefined;
-                            const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
-                            var data_frame: [384]u8 = undefined;
-                            const dlen = try grpc_gun.buildDataFrame(&data_frame, 1, grpc_msg[0..glen], false);
-                            try rc.writeApp(data_frame[0..dlen]);
-                            steady_start = netutil.monoNow(io);
-                            // Bytes already in `gather` cannot be a reply to the steady write.
-                            discard_data_before = gather_len;
-                        }
-                    } else if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_steady)) {
-                        return netutil.elapsedMs(steady_start.?, io);
-                    }
-                } else if (ftyp == 0x03) {
-                    if (frame_len >= 4) {
-                        const code = std.mem.readInt(u32, payload[0..4], .big);
-                        std.log.warn("gRPC RST_STREAM error_code={d}", .{code});
-                    }
-                    return error.GrpcRstStream;
-                } else if (ftyp == 0x07) {
-                    return error.GrpcGoAway;
+            const payload = gather[off + 9 .. off + 9 + frame_len];
+            const inflight = warmup_done and off < discard_data_before;
+
+            if (ftyp == 0x04 and (fflags & 0x01) == 0 and !settings_seen) {
+                settings_seen = true;
+                var flight: [1536]u8 = undefined;
+                var fl: usize = 0;
+                fl += try grpc_gun.buildSettingsAck(flight[fl..]);
+                // Open the flow-control window generously (some peers start at 0).
+                fl += try grpc_gun.buildWindowUpdate(flight[fl..], 0, 1 << 20);
+                fl += try grpc_gun.buildWindowUpdate(flight[fl..], 1, 1 << 20);
+                fl += try grpc_gun.buildGunHeaders(flight[fl..], service_name, authority);
+                var hunk: [640]u8 = undefined;
+                const hunk_len = try grpc_gun.wrapHunk(&hunk, vless_buf[0..vless_len]);
+                var grpc_msg: [704]u8 = undefined;
+                const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
+                // Keep the stream open — gun-lite is bidirectional; END_STREAM yields empty 200s.
+                fl += try grpc_gun.buildDataFrame(flight[fl..], 1, grpc_msg[0..glen], false);
+                try rc.writeApp(flight[0..fl]);
+                request_sent = true;
+                saw_headers_ok = false;
+                saw_grpc_data = false;
+            } else if (ftyp == 0x06 and (fflags & 0x01) == 0 and frame_len == 8) {
+                var pong: [17]u8 = undefined;
+                const pong_len = try grpc_gun.buildPingAck(&pong, payload[0..8]);
+                try rc.writeApp(pong[0..pong_len]);
+            } else if (inflight and (ftyp == 0x00 or ftyp == 0x01)) {
+                // Warmup leftover DATA / trailers — ack framing only.
+            } else if (ftyp == 0x01 and request_sent) {
+                if (grpc_gun.headersIndicateStatus200(payload, fflags)) {
+                    saw_headers_ok = true;
                 }
-
-                off += 9 + frame_len;
+                if ((fflags & 0x01) != 0 and !saw_headers_ok) return error.GrpcStreamEnded;
+                // Empty 200 before any DATA is a failure; trailer END_STREAM after DATA is normal.
+                if ((fflags & 0x01) != 0 and saw_headers_ok and !saw_grpc_data) return error.GrpcEmptyResponse;
+            } else if (ftyp == 0x00 and frame_len >= 5 and request_sent) {
+                const msg = try grpc_gun.vlessFromGrpcData(payload);
+                saw_grpc_data = true;
+                if (!warmup_done) {
+                    if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_warmup)) {
+                        warmup_done = true;
+                        // Fresh buffer for the keep-alive request; VLESS header already stripped.
+                        http_len = 0;
+                        saw_headers_ok = false;
+                        saw_grpc_data = false;
+                        var hunk: [256]u8 = undefined;
+                        const hunk_len = try grpc_gun.wrapHunk(&hunk, util.probe_http_steady);
+                        var grpc_msg: [320]u8 = undefined;
+                        const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
+                        var data_frame: [384]u8 = undefined;
+                        const dlen = try grpc_gun.buildDataFrame(&data_frame, 1, grpc_msg[0..glen], false);
+                        try rc.writeApp(data_frame[0..dlen]);
+                        steady_start = netutil.monoNow(io);
+                        // Bytes already in `gather` cannot be a reply to the steady write.
+                        discard_data_before = gather_len;
+                    }
+                } else if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_steady)) {
+                    return netutil.elapsedMs(steady_start.?, io);
+                }
+            } else if (ftyp == 0x03) {
+                if (frame_len >= 4) {
+                    const code = std.mem.readInt(u32, payload[0..4], .big);
+                    std.log.warn("gRPC RST_STREAM error_code={d}", .{code});
+                }
+                return error.GrpcRstStream;
+            } else if (ftyp == 0x07) {
+                return error.GrpcGoAway;
             }
-            if (off > 0) {
-                const remain = gather_len - off;
-                if (remain > 0) std.mem.copyForwards(u8, gather[0..remain], gather[off..][0..remain]);
-                gather_len = remain;
-                if (discard_data_before > off) {
-                    discard_data_before -= off;
-                } else {
-                    discard_data_before = 0;
-                }
+
+            off += 9 + frame_len;
+        }
+        if (off > 0) {
+            const remain = gather_len - off;
+            if (remain > 0) std.mem.copyForwards(u8, gather[0..remain], gather[off..][0..remain]);
+            gather_len = remain;
+            if (discard_data_before > off) {
+                discard_data_before -= off;
+            } else {
+                discard_data_before = 0;
             }
         }
-    } else {
-        return probeVlessTcpHttps(&rc, io, uuid, flow);
     }
 }
 

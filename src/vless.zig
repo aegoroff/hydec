@@ -68,21 +68,16 @@ pub fn responseHeaderLen(buf: []const u8) error{ NeedMore, InvalidVlessResponse 
     return total;
 }
 
-const probe_http = util.probe_http;
-
-/// Encode a VLESS probe: TCP CONNECT to probe host:80 + HTTP GET (matches ss probe).
-pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8, flow: []const u8) !usize {
+/// Encode a gRPC VLESS probe: CONNECT to probe host:80 + HTTP GET (no Vision framing).
+/// Vision TCP uses an inner HTTPS client instead (`probeVlessTcpHttps`).
+pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8) !usize {
     var uuid: [16]u8 = undefined;
     try parseUuid(uuid_text, &uuid);
-    // Port 80 + HTTP GET so the remote answers without a TLS handshake hang.
-    var n = try encodeRequestDomain(out, &uuid, util.probe_domain, util.probe_http_port, flow);
-    if (std.mem.indexOf(u8, flow, "vision") != null) {
-        n += try appendVisionPaddingEnd(out[n..], &uuid, probe_http);
-    } else {
-        if (out.len < n + probe_http.len) return error.BufferTooSmall;
-        @memcpy(out[n..][0..probe_http.len], probe_http);
-        n += probe_http.len;
-    }
+    var n = try encodeRequestDomain(out, &uuid, util.probe_domain, util.probe_http_port, "");
+    const http = util.probe_http;
+    if (out.len < n + http.len) return error.BufferTooSmall;
+    @memcpy(out[n..][0..http.len], http);
+    n += http.len;
     return n;
 }
 
@@ -99,7 +94,7 @@ pub const VisionUnpadState = struct {
 
 /// First Vision frame: UUID + command + contentLen + paddingLen + content + padding.
 /// Layout matches xray `XtlsPadding` / `XtlsUnpadding` (content before padding).
-/// command 0x01 = PaddingEnd (enough for a connectivity probe).
+/// command 0x01 = PaddingEnd (tests / downlink peers that still emit End).
 pub fn appendVisionPaddingEnd(out: []u8, uuid: *const [16]u8, content: []const u8) error{BufferTooSmall}!usize {
     return appendVisionFrame(out, vision_cmd_end, uuid, content, 64);
 }
@@ -206,6 +201,14 @@ test "encodeRequestDomain with flow addon" {
     try std.testing.expectEqual(@as(usize, 1 + 16 + 1 + (1 + 1 + flow.len) + 1 + 2 + 1 + 1 + 5), n);
     try std.testing.expectEqual(@as(u8, @intCast(1 + 1 + flow.len)), buf[17]);
     try std.testing.expectEqual(@as(u8, 0x0a), buf[18]);
+}
+
+test "encodeProbeRequest is cleartext HTTP without Vision" {
+    var buf: [512]u8 = undefined;
+    const n = try encodeProbeRequest(&buf, "00000000-1111-2222-3333-444444444444");
+    // No Vision UUID frame after the VLESS header — raw HTTP follows.
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], util.probe_http) != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "xtls-rprx-vision") == null);
 }
 
 test "consumeVisionFrame NeedMore and content before padding" {

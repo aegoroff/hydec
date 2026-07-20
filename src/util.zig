@@ -157,14 +157,9 @@ pub const probe_http =
 pub const probe_http_steady =
     "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nUser-Agent: " ++ probe_ua_steady ++ "\r\nConnection: keep-alive\r\n\r\n";
 
-/// True if `buf` contains a complete HTTP header block (`\r\n\r\n`).
-pub fn httpHeadersComplete(buf: []const u8) bool {
-    return std.mem.indexOf(u8, buf, "\r\n\r\n") != null;
-}
-
 /// True when headers are complete and the body is HTTP/1.0 close-delimited
 /// (no `Content-Length` / `Transfer-Encoding: chunked`). Peer close then ends the response.
-/// Do not use bare `httpHeadersComplete` for that — truncated CL/chunked bodies must fail.
+/// Truncated CL/chunked bodies must not be treated as ready on peer close alone.
 pub fn httpCloseDelimitedReady(buf: []const u8) bool {
     const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return false;
     const headers = buf[0..sep];
@@ -263,7 +258,7 @@ pub fn isPeerClosed(err: anyerror) bool {
         error.BrokenPipe,
         error.ConnectionResetByPeer,
         error.TlsConnectionTruncated,
-        error.SocketNotConnected,
+        error.SocketUnconnected,
         error.NotOpenForReading,
         error.NotOpenForWriting,
         => true,
@@ -367,7 +362,6 @@ test "httpResponseTotalLen HTTP/1.1 empty body without framing" {
     try std.testing.expectEqual(@as(usize, empty.len), httpResponseTotalLen(empty).?);
     // HTTP/1.0 without CL/chunked stays open until peer close.
     try std.testing.expect(httpResponseTotalLen("HTTP/1.0 200 OK\r\n\r\n") == null);
-    try std.testing.expect(httpHeadersComplete("HTTP/1.0 200 OK\r\n\r\n"));
 }
 
 test "httpCloseDelimitedReady only HTTP/1.0 without framing" {

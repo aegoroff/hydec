@@ -418,7 +418,7 @@ pub fn classifyDeadlineErr(err: anyerror, fired: bool) anyerror {
         error.BrokenPipe,
         error.ConnectionResetByPeer,
         error.TlsConnectionTruncated,
-        error.SocketNotConnected,
+        error.SocketUnconnected,
         error.NotOpenForReading,
         error.NotOpenForWriting,
         => if (fired) error.Timeout else err,
@@ -444,6 +444,8 @@ test "classifyDeadlineErr: shutdown-induced errors map to Timeout only when fire
     try std.testing.expect(classifyDeadlineErr(error.ConnectionResetByPeer, true) == error.Timeout);
     try std.testing.expect(classifyDeadlineErr(error.TlsConnectionTruncated, true) == error.Timeout);
     try std.testing.expect(classifyDeadlineErr(error.BrokenPipe, true) == error.Timeout);
+    try std.testing.expect(classifyDeadlineErr(error.SocketUnconnected, false) == error.SocketUnconnected);
+    try std.testing.expect(classifyDeadlineErr(error.SocketUnconnected, true) == error.Timeout);
 }
 
 test "classifyDeadlineErr: unrelated and protocol errors pass through" {
