@@ -725,14 +725,11 @@ fn appendStripVlessHeader(buf: []u8, len: *usize, chunk: []const u8, stripped: *
 }
 
 /// Feed one gRPC/VLESS payload chunk into the HTTP probe buffer.
-/// Returns true when a complete Cloudflare `/cdn-cgi/trace` response is present.
-/// When `require_uag` is set, the body must also echo that User-Agent (`uag=`).
-fn grpcProbeHttpReady(buf: []u8, len: *usize, chunk: []const u8, stripped: *bool, require_uag: ?[]const u8) !bool {
+/// Returns true when a complete Cloudflare `/cdn-cgi/trace` response echoes `require_uag`.
+fn grpcProbeHttpReady(buf: []u8, len: *usize, chunk: []const u8, stripped: *bool, require_uag: []const u8) !bool {
     try appendStripVlessHeader(buf, len, chunk, stripped);
     if (util.httpResponseTotalLen(buf[0..len.*]) == null) return false;
-    if (require_uag) |uag| {
-        if (!util.looksLikeCloudflareTraceUag(buf[0..len.*], uag)) return error.ProbeResponseMismatch;
-    } else if (!util.looksLikeCloudflareTrace(buf[0..len.*])) return error.ProbeResponseMismatch;
+    if (!util.looksLikeCloudflareTraceUag(buf[0..len.*], require_uag)) return error.ProbeResponseMismatch;
     return true;
 }
 
@@ -1099,7 +1096,7 @@ test "grpcProbeHttpReady rejects non-Cloudflare HTTP" {
     var len: usize = 0;
     var stripped = false;
     const bad = "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-    try std.testing.expectError(error.ProbeResponseMismatch, grpcProbeHttpReady(&buf, &len, bad, &stripped, null));
+    try std.testing.expectError(error.ProbeResponseMismatch, grpcProbeHttpReady(&buf, &len, bad, &stripped, util.probe_ua_warmup));
 }
 
 test "grpcProbeHttpReady accepts Cloudflare trace" {
@@ -1132,7 +1129,7 @@ test "grpcProbeHttpReady needs more until complete" {
     var buf: [256]u8 = undefined;
     var len: usize = 0;
     var stripped = false;
-    try std.testing.expect(!(try grpcProbeHttpReady(&buf, &len, "\x00\x00HTTP/1.1 200 OK\r\n", &stripped, null)));
+    try std.testing.expect(!(try grpcProbeHttpReady(&buf, &len, "\x00\x00HTTP/1.1 200 OK\r\n", &stripped, util.probe_ua_warmup)));
     try std.testing.expect(stripped);
 }
 

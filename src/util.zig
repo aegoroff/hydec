@@ -142,7 +142,6 @@ pub fn splitHostPortOrDefault(address: []const u8, default_port: u16) error{Inva
 /// SOCKS5 ATYP domain for a fixed well-known host (reachable from most VPS).
 pub const probe_domain = "cp.cloudflare.com";
 pub const probe_http_port: u16 = 80;
-pub const probe_tls_port: u16 = 443;
 
 /// Distinct UAs so Cloudflare `/cdn-cgi/trace` echoes them in `uag=` — proves the
 /// steady-state reply is not a duplicate of the warmup response (all probe paths).
