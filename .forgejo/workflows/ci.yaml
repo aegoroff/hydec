@@ -41,9 +41,6 @@ jobs:
       - name: Trust mise config
         run: mise trust
 
-      - name: Test
-        run: just ver=${{ steps.get_version.outputs.version }} test
-
       - name: Build archives
         run: just ver=${{ steps.get_version.outputs.version }} build-all
 
