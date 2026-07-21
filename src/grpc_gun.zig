@@ -86,7 +86,9 @@ fn writeFrameHeader(out: []u8, length: u24, typ: u8, flags: u8, stream_id: u31) 
     std.mem.writeInt(u32, out[5..9], stream_id, .big);
 }
 
-fn writeLiteralHeader(out: []u8, name: []const u8, value: []const u8) error{BufferTooSmall}!usize {
+fn writeLiteralHeader(out: []u8, name: []const u8, value: []const u8) error{ BufferTooSmall, HeaderFieldTooLong }!usize {
+    // Single-byte HPACK string lengths (no 0x7f extended form).
+    if (name.len > 255 or value.len > 255) return error.HeaderFieldTooLong;
     if (out.len < 1 + 1 + name.len + 1 + value.len) return error.BufferTooSmall;
     var i: usize = 0;
     out[i] = 0x00;
@@ -277,6 +279,13 @@ pub fn formatAuthority(buf: []u8, sni: []const u8, port: u16, explicit: []const 
 pub fn vlessFromGrpcData(payload: []const u8) ![]const u8 {
     const grpc_payload = try unwrapGrpc(payload);
     return unwrapHunk(grpc_payload) catch grpc_payload;
+}
+
+test "writeLiteralHeader rejects fields longer than 255" {
+    var buf: [512]u8 = undefined;
+    const long = [_]u8{'a'} ** 256;
+    try std.testing.expectError(error.HeaderFieldTooLong, writeLiteralHeader(&buf, &long, "x"));
+    try std.testing.expectError(error.HeaderFieldTooLong, writeLiteralHeader(&buf, "x", &long));
 }
 
 test "wrapGrpc roundtrip" {

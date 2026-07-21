@@ -9,13 +9,15 @@ pub fn encodeRequestDomain(
     domain: []const u8,
     dest_port: u16,
     flow: []const u8,
-) error{BufferTooSmall}!usize {
-    var i: usize = 0;
-    // protobuf Addons { string Flow = 1; } when flow is set
+) error{ BufferTooSmall, DomainTooLong, FlowTooLong }!usize {
+    if (domain.len > 255) return error.DomainTooLong;
+    // protobuf Addons { string Flow = 1; } when flow is set — addon_len is a u8.
     const addon_len: usize = if (flow.len == 0) 0 else 1 + 1 + flow.len;
+    if (addon_len > 255) return error.FlowTooLong;
     const need = 1 + 16 + 1 + addon_len + 1 + 2 + 1 + 1 + domain.len;
     if (out.len < need) return error.BufferTooSmall;
 
+    var i: usize = 0;
     out[i] = 0;
     i += 1;
     @memcpy(out[i..][0..16], uuid);
@@ -95,12 +97,12 @@ pub const VisionUnpadState = struct {
 /// First Vision frame: UUID + command + contentLen + paddingLen + content + padding.
 /// Layout matches xray `XtlsPadding` / `XtlsUnpadding` (content before padding).
 /// command 0x01 = PaddingEnd (tests / downlink peers that still emit End).
-pub fn appendVisionPaddingEnd(out: []u8, uuid: *const [16]u8, content: []const u8) error{BufferTooSmall}!usize {
+pub fn appendVisionPaddingEnd(out: []u8, uuid: *const [16]u8, content: []const u8) error{ BufferTooSmall, ContentTooLong }!usize {
     return appendVisionFrame(out, vision_cmd_end, uuid, content, 64);
 }
 
 /// Continuation Vision frame (no UUID) — used by tests / multi-block peers.
-pub fn appendVisionPaddingContinue(out: []u8, content: []const u8) error{BufferTooSmall}!usize {
+pub fn appendVisionPaddingContinue(out: []u8, content: []const u8) error{ BufferTooSmall, ContentTooLong }!usize {
     return appendVisionFrame(out, vision_cmd_continue, null, content, 16);
 }
 
@@ -110,7 +112,8 @@ pub fn appendVisionFrame(
     uuid: ?*const [16]u8,
     content: []const u8,
     padding_len: u16,
-) error{BufferTooSmall}!usize {
+) error{ BufferTooSmall, ContentTooLong }!usize {
+    if (content.len > std.math.maxInt(u16)) return error.ContentTooLong;
     const hdr: usize = if (uuid != null) 16 + 5 else 5;
     const need = hdr + content.len + padding_len;
     if (out.len < need) return error.BufferTooSmall;
@@ -201,6 +204,24 @@ test "encodeRequestDomain with flow addon" {
     try std.testing.expectEqual(@as(usize, 1 + 16 + 1 + (1 + 1 + flow.len) + 1 + 2 + 1 + 1 + 5), n);
     try std.testing.expectEqual(@as(u8, @intCast(1 + 1 + flow.len)), buf[17]);
     try std.testing.expectEqual(@as(u8, 0x0a), buf[18]);
+}
+
+test "encodeRequestDomain rejects oversized domain and flow" {
+    var buf: [1024]u8 = undefined;
+    var uuid: [16]u8 = [_]u8{0} ** 16;
+    const long_domain = [_]u8{'a'} ** 256;
+    try std.testing.expectError(error.DomainTooLong, encodeRequestDomain(&buf, &uuid, &long_domain, 443, ""));
+    // addon_len = 2 + flow.len must fit in u8 → flow.len > 253 overflows.
+    const long_flow = [_]u8{'f'} ** 254;
+    try std.testing.expectError(error.FlowTooLong, encodeRequestDomain(&buf, &uuid, "x.com", 443, &long_flow));
+}
+
+test "appendVisionFrame rejects content longer than u16" {
+    const gpa = std.testing.allocator;
+    const content = try gpa.alloc(u8, @as(usize, std.math.maxInt(u16)) + 1);
+    defer gpa.free(content);
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.ContentTooLong, appendVisionFrame(&buf, vision_cmd_end, null, content, 0));
 }
 
 test "encodeProbeRequest is cleartext HTTP without Vision" {
