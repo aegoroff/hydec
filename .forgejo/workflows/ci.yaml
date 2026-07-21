@@ -6,6 +6,7 @@ concurrency:
 
 env:
   GITCLIFF_VER: 2.13.1
+  FORGEJO_API_URL: https://git.egoroff.spb.ru/api/v1
 
 on:
   push:
@@ -117,39 +118,49 @@ jobs:
           done < <(find release -type f -name '*.apk' -print0)
           ls -la release/
 
-      - name: Check API access
-        run: |
-          curl -fsS -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
-            "${{ env.FORGEJO_API_URL }}/version"
-
       - name: Install jq
         run: |
           if ! command -v jq >/dev/null 2>&1; then
             apt-get update && apt-get install -y jq
           fi
 
+      - name: Check API access
+        env:
+          FORGEJO_URL: ${{ env.FORGEJO_API_URL }}
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          test -n "$TOKEN" || { echo "FORGEJO_TOKEN secret is empty"; exit 1; }
+          test -n "$REPO" || { echo "github.repository is empty"; exit 1; }
+          echo "API=$FORGEJO_URL repo=$REPO"
+          curl -fsS -H "Authorization: token $TOKEN" \
+            -H "Accept: application/json" \
+            "$FORGEJO_URL/repos/$REPO" | jq -r '"ok: \(.full_name) id=\(.id)"'
+
       - name: Create Release via API
         id: create_release
+        env:
+          FORGEJO_URL: ${{ env.FORGEJO_API_URL }}
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          REPO: ${{ github.repository }}
+          VERSION: v${{ steps.get_version.outputs.version }}
+          RELEASE_BODY: ${{ needs.generate-changelog.outputs.release_body }}
         run: |
-          FORGEJO_URL="${{ env.FORGEJO_API_URL }}"
-          TOKEN="${{ secrets.FORGEJO_TOKEN }}"
-          REPO="${{ forgejo.repository }}"
-          VERSION="v${{ steps.get_version.outputs.version }}"
+          URL="$FORGEJO_URL/repos/$REPO/releases"
+          echo "POST $URL tag=$VERSION"
 
-          RELEASE_BODY=$(echo '${{ needs.generate-changelog.outputs.release_body }}' | jq -Rs .)
+          PAYLOAD=$(jq -n \
+            --arg tag "$VERSION" \
+            --arg name "$VERSION" \
+            --arg body "$RELEASE_BODY" \
+            '{tag_name:$tag, name:$name, body:$body, draft:false, prerelease:false}')
 
           RESPONSE=$(curl -sS -X POST \
             -H "Authorization: token $TOKEN" \
             -H "Content-Type: application/json" \
             -H "Accept: application/json" \
-            -d "{
-              \"tag_name\": \"$VERSION\",
-              \"name\": \"$VERSION\",
-              \"body\": $RELEASE_BODY,
-              \"draft\": false,
-              \"prerelease\": false
-            }" \
-            "$FORGEJO_URL/repos/$REPO/releases")
+            -d "$PAYLOAD" \
+            "$URL")
 
           echo "Response: $RESPONSE"
 
@@ -163,12 +174,12 @@ jobs:
           echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Upload Assets
+        env:
+          FORGEJO_URL: ${{ env.FORGEJO_API_URL }}
+          TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.create_release.outputs.release_id }}
         run: |
-          FORGEJO_URL="${{ env.FORGEJO_API_URL }}"
-          TOKEN="${{ secrets.FORGEJO_TOKEN }}"
-          REPO="${{ forgejo.repository }}"
-          RELEASE_ID="${{ steps.create_release.outputs.release_id }}"
-
           shopt -s nullglob
           for file in release/*.tar.gz release/*.apk; do
             filename=$(basename "$file")
