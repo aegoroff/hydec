@@ -164,20 +164,19 @@ fn openChunk(ctx: *AeadCtx, in: []const u8, out: []u8) error{ AuthenticationFail
 }
 
 /// Read and decrypt one AEAD chunk from the stream (matches Trojan: first tunneled bytes).
-fn readOpenChunk(gpa: std.mem.Allocator, ctx: *AeadCtx, reader: *Io.Reader, out: []u8) !usize {
+/// `scratch` holds ciphertext; plaintext is written to `out`.
+fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8, scratch: []u8) !usize {
     var len_ct: [2]u8 = undefined;
     var len_tag: [16]u8 = undefined;
     try reader.readSliceAll(&len_ct);
     try reader.readSliceAll(&len_tag);
 
-    const payload_len = try openLength(ctx, &len_ct, &len_tag, out.len);
+    const payload_len = try openLength(ctx, &len_ct, &len_tag, @min(out.len, scratch.len));
 
-    const payload_ct = try gpa.alloc(u8, payload_len);
-    defer gpa.free(payload_ct);
     var payload_tag: [16]u8 = undefined;
-    try reader.readSliceAll(payload_ct);
+    try reader.readSliceAll(scratch[0..payload_len]);
     try reader.readSliceAll(&payload_tag);
-    try ctx.open(out[0..payload_len], payload_ct, &payload_tag);
+    try ctx.open(out[0..payload_len], scratch[0..payload_len], &payload_tag);
     return payload_len;
 }
 
@@ -274,14 +273,12 @@ pub fn probe(
 
     // Warmup response (request was in the initial flight).
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-        const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
+        const n = readOpenChunk(&server_ctx, &r.interface, http_buf[http_len..], chunk_buf) catch |err| {
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             // HTTP/1.0 close-delimited only — truncated CL/chunked must fail.
             if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
             return e;
         };
-        if (http_len + n > http_buf.len) return error.BufferTooSmall;
-        @memcpy(http_buf[http_len..][0..n], chunk_buf[0..n]);
         http_len += n;
     }
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
@@ -290,13 +287,11 @@ pub fn probe(
     // Steady response (pipelined write above).
     http_len = 0;
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-        const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
+        const n = readOpenChunk(&server_ctx, &r.interface, http_buf[http_len..], chunk_buf) catch |err| {
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
             if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
             return e;
         };
-        if (http_len + n > http_buf.len) return error.BufferTooSmall;
-        @memcpy(http_buf[http_len..][0..n], chunk_buf[0..n]);
         http_len += n;
     }
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
