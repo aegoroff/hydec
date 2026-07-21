@@ -153,4 +153,5 @@ test {
     _ = @import("reality.zig");
     _ = @import("probe.zig");
     _ = @import("netutil.zig");
+    _ = @import("fetch.zig");
 }

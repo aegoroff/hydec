@@ -128,7 +128,7 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
 }
 
 fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
-    const uri = try std.Uri.parse(url);
+    const uri = try requireHttpsUri(url);
 
     var client = http.Client{
         .allocator = gpa,
@@ -163,6 +163,13 @@ fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
     return try body_reader.allocRemaining(gpa, .limited(4 * 1024 * 1024));
 }
 
+/// Subscription bodies embed proxy credentials; only HTTPS is allowed.
+fn requireHttpsUri(url: []const u8) (std.Uri.ParseError || error{InsecureSubscriptionUrl})!std.Uri {
+    const uri = try std.Uri.parse(url);
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InsecureSubscriptionUrl;
+    return uri;
+}
+
 fn ensureTlsReady(client: *http.Client) !void {
     if (http.Client.disable_tls) return;
 
@@ -185,4 +192,11 @@ fn ensureTlsReady(client: *http.Client) !void {
     if (client.now != null) return;
     client.now = now;
     std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
+}
+
+test "requireHttpsUri rejects plaintext and accepts https" {
+    try std.testing.expectError(error.InsecureSubscriptionUrl, requireHttpsUri("http://example.com/sub"));
+    try std.testing.expectError(error.InsecureSubscriptionUrl, requireHttpsUri("ftp://example.com/sub"));
+    const uri = try requireHttpsUri("HTTPS://example.com/sub");
+    try std.testing.expectEqualStrings("HTTPS", uri.scheme);
 }
