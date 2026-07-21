@@ -181,7 +181,7 @@ fn readOpenChunk(gpa: std.mem.Allocator, ctx: *AeadCtx, reader: *Io.Reader, out:
     return payload_len;
 }
 
-/// Probe SS AEAD: dial, warmup HTTP, then time a second request (steady-state).
+/// Probe SS AEAD: warmup + pipelined steady HTTP (Cloudflare `/cdn-cgi/trace`).
 pub fn probe(
     gpa: std.mem.Allocator,
     io: Io,
@@ -201,7 +201,10 @@ pub fn probe(
     const stream = try netutil.connectHostPort(io, host, port, timeout_secs);
     defer stream.close(io);
 
-    const deadline = netutil.deadlineNs(io, timeout_secs);
+    const read_deadline_ns: ?i128 = if (timeout_secs == 0)
+        null
+    else
+        start + @as(i128, timeout_secs) * std.time.ns_per_s;
 
     var wbuf: [2048]u8 = undefined;
     var rbuf: [2048]u8 = undefined;
@@ -243,7 +246,7 @@ pub fn probe(
     w.interface.writeAll(packet[0..off]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     w.interface.flush() catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
 
-    netutil.waitReadableUntil(stream, io, deadline) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+    netutil.waitReadableUntil(stream, io, read_deadline_ns) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     var server_salt: [32]u8 = undefined;
     r.interface.readSliceAll(server_salt[0..method.saltLen()]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
 
@@ -255,13 +258,21 @@ pub fn probe(
         .key = server_subkey,
     };
 
+    // Pipeline steady before reading warmup: some peers close keep-alive after the
+    // first Cloudflare response if the second request is not already in flight.
+    var steady_pkt: [512]u8 = undefined;
+    const steady_len = try sealChunk(&ctx, &steady_pkt, util.probe_http_steady);
+    const steady_start = netutil.monoNow(io);
+    w.interface.writeAll(steady_pkt[0..steady_len]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+    w.interface.flush() catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+
     const chunk_buf = try gpa.alloc(u8, max_chunk_payload);
     defer gpa.free(chunk_buf);
     const http_buf = try gpa.alloc(u8, max_chunk_payload);
     defer gpa.free(http_buf);
     var http_len: usize = 0;
 
-    // Warmup: drain first HTTP response; require echoed warmup UA (same as gRPC/Vision).
+    // Warmup response (request was in the initial flight).
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
             const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
@@ -276,16 +287,7 @@ pub fn probe(
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
         return error.ProbeResponseMismatch;
 
-    // Steady-state: require a real keep-alive reply (same fail-closed policy as gRPC/Vision).
-    const steady_start = netutil.monoNow(io);
-    var second: [512]u8 = undefined;
-    const second_len = try sealChunk(&ctx, &second, util.probe_http_steady);
-    w.interface.writeAll(second[0..second_len]) catch |err| {
-        return netutil.classifyDeadlineErr(err, fired.load(.acquire));
-    };
-    w.interface.flush() catch |err| {
-        return netutil.classifyDeadlineErr(err, fired.load(.acquire));
-    };
+    // Steady response (pipelined write above).
     http_len = 0;
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         const n = readOpenChunk(gpa, &server_ctx, &r.interface, chunk_buf) catch |err| {
