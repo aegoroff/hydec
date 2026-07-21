@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const tls = std.crypto.tls;
 const util = @import("util.zig");
 const netutil = @import("netutil.zig");
@@ -458,9 +459,9 @@ const RealityConn = struct {
     deadline_done: std.atomic.Value(bool) = .init(false),
     deadline_fired: std.atomic.Value(bool) = .init(false),
     deadline_guard: ?netutil.DeadlineShutdown = null,
-    /// After uplink PaddingDirect, further writes are raw TCP under Reality.
+    /// After uplink PaddingDirect, further writes are raw TCP (xray UnwrapRawConn).
     xtls_raw_write: bool = false,
-    /// After downlink PaddingDirect, further reads are raw TCP under Reality.
+    /// After downlink PaddingDirect, further reads are raw TCP (xray UnwrapRawConn).
     xtls_raw_read: bool = false,
 
     fn deadlineFired(self: *const RealityConn) bool {
@@ -498,6 +499,7 @@ const RealityConn = struct {
 
     fn writeApp(self: *RealityConn, data: []const u8) !void {
         if (self.xtls_raw_write) {
+            // After Vision PaddingDirect: peer expects raw TCP (xray UnwrapRawConn).
             self.conn.writer.writeAll(data) catch |err| return self.mapWriterErr(err);
             self.conn.writer.flush() catch |err| return self.mapWriterErr(err);
             return;
@@ -530,14 +532,14 @@ const RealityConn = struct {
 
     fn readApp(self: *RealityConn, out: []u8) !usize {
         if (self.xtls_raw_read) {
-            // Prefer bytes already buffered on the socket reader (may be the start
-            // of raw inner TLS that arrived with the last Reality record).
+            // After Vision PaddingDirect, further downlink is usually raw TCP (xray
+            // UnwrapRawConn). A complete Reality record may still sit in sock_rbuf —
+            // decrypt that first. Then one recv only: Io.Reader.readSliceShort loops
+            // until dest is full, which on a blocking socket stalls until DeadlineShutdown.
+            if (try self.tryDecryptBufferedRealityApp(out)) |n| return n;
             try self.waitForReadable();
-            const n = self.conn.reader.readSliceShort(out) catch |err| {
-                return self.mapReaderErr(err);
-            };
-            if (n == 0) return error.EndOfStream;
-            return n;
+            if (try self.tryDecryptBufferedRealityApp(out)) |n| return n;
+            return try self.recvRawOnce(out);
         }
         var scratch: [16640]u8 = undefined;
         var attempts: usize = 0;
@@ -560,6 +562,81 @@ const RealityConn = struct {
             }
         }
         return error.TlsUnexpectedMessage;
+    }
+
+    /// Drain already-buffered Io.Reader bytes, else a single `recv` (not readSliceShort).
+    fn recvRawOnce(self: *RealityConn, out: []u8) !usize {
+        const r = self.conn.reader;
+        const buffered = r.end - r.seek;
+        if (buffered > 0) {
+            const n = @min(buffered, out.len);
+            @memcpy(out[0..n], r.buffer[r.seek..][0..n]);
+            r.seek += n;
+            return n;
+        }
+        if (builtin.os.tag == .windows) {
+            const n = self.conn.reader.readSliceShort(out[0..@min(out.len, 1)]) catch |err| {
+                return self.mapReaderErr(err);
+            };
+            if (n == 0) return error.EndOfStream;
+            return n;
+        }
+        const n = std.posix.read(self.stream.socket.handle, out) catch |err| {
+            return self.mapReaderErr(err);
+        };
+        if (n == 0) return error.EndOfStream;
+        return n;
+    }
+
+    /// If sock_rbuf holds a complete REALITY application-data record, decrypt it into
+    /// `out` and return its length. Returns null when there is not a full record yet,
+    /// or when buffered bytes are not Reality ciphertext (raw TCP after splice).
+    /// Peek-decrypts first so a failed AEAD leaves bytes for the raw TCP path.
+    fn tryDecryptBufferedRealityApp(self: *RealityConn, out: []u8) !?usize {
+        const r = self.conn.reader;
+        const avail = r.end - r.seek;
+        if (avail < 5) return null;
+        const buf = r.buffer[r.seek..r.end];
+        if (buf[0] != 23 or buf[1] != 0x03 or buf[2] != 0x03) return null;
+        const length: usize = (@as(usize, buf[3]) << 8) | buf[4];
+        if (length < 16 or length > 16640) return null;
+        if (avail < 5 + length) return null;
+
+        const payload = buf[5 .. 5 + length];
+        const ct_len = length - 16;
+        const nonce = RecordConn.xorNonce(&self.conn.server_iv, self.conn.read_seq);
+        var aad: [5]u8 = .{ 23, 0x03, 0x03, 0, 0 };
+        putU16(aad[3..5], @intCast(length));
+        var plain: [16640]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        @memcpy(&tag, payload[ct_len..][0..16]);
+        Aes128Gcm.decrypt(plain[0..ct_len], payload[0..ct_len], tag, &aad, nonce, self.conn.server_key) catch {
+            return null; // not Reality — leave bytes for raw read
+        };
+
+        // Commit: consume ciphertext and advance seq.
+        r.seek += 5 + length;
+        self.conn.read_seq += 1;
+
+        var end = ct_len;
+        while (end > 0 and plain[end - 1] == 0) end -= 1;
+        if (end == 0) return error.TlsDecodeError;
+        const inner_type = plain[end - 1];
+        const msg_len = end - 1;
+        switch (inner_type) {
+            23 => {
+                if (msg_len > out.len) return error.BufferTooSmall;
+                @memcpy(out[0..msg_len], plain[0..msg_len]);
+                return msg_len;
+            },
+            22 => {
+                try rejectPostHandshakeKeyUpdate(plain[0..msg_len]);
+                return try self.tryDecryptBufferedRealityApp(out);
+            },
+            20 => return try self.tryDecryptBufferedRealityApp(out),
+            21 => return error.TlsAlert,
+            else => return error.TlsUnexpectedMessage,
+        }
     }
 };
 
@@ -927,8 +1004,9 @@ pub fn probeVless(
 /// VLESS and Vision framing over REALITY, exposed to the inner TLS client.
 ///
 /// Uplink (TLS 1.3 / xray Vision): Continue through the handshake; PaddingDirect on
-/// the first complete Application Data write, then raw TCP under Reality.
-/// Downlink: PaddingDirect enables `xtls_raw_read` so further inner TLS is read raw.
+/// the first complete Application Data write, then raw TCP (xray UnwrapRawConn).
+/// Downlink: PaddingDirect enables `xtls_raw_read` — one `recv` per read (not
+/// `readSliceShort`, which fills the whole buffer and stalls on a blocking socket).
 /// Always `pipe.writer.flush()` after TLS writes — Zig's TLS client only advances the buffer.
 const VisionPipe = struct {
     rc: *RealityConn,
@@ -1002,8 +1080,8 @@ const VisionPipe = struct {
             self.first_sent = true;
         }
 
-        // Continue through handshake (and incomplete App Data). Direct only on a
-        // complete TLS Application Data flight — matches xray IsCompleteRecord.
+        // Continue through handshake (and incomplete App Data). Direct on a complete
+        // TLS Application Data flight — matches xray IsCompleteRecord / EnableXtls.
         if (!self.handshake_done or !isCompleteTlsAppData(data)) {
             n += try vless.appendVisionFrame(pkt[n..], vless.vision_cmd_continue, uuid_ptr, data, 64);
             try self.rc.writeApp(pkt[0..n]);
@@ -1012,7 +1090,6 @@ const VisionPipe = struct {
 
         n += try vless.appendVisionFrame(pkt[n..], vless.vision_cmd_direct, uuid_ptr, data, 64);
         self.uplink_padding = false;
-        // Direct frame itself still goes through Reality; later writes are raw.
         try self.rc.writeApp(pkt[0..n]);
         self.rc.xtls_raw_write = true;
     }
@@ -1081,6 +1158,7 @@ const VisionPipe = struct {
                 self.err = err;
                 return error.ReadFailed;
             };
+            // Keep RealityConn.xtls_raw_read as set by drain (PaddingDirect → raw TCP).
         }
     }
 
@@ -1136,14 +1214,13 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
     pipe.writer.flush() catch |err| return unwrapPipeErr(&pipe, err);
     pipe.handshake_done = true;
 
+    // One CF HTTPS request after inner TLS — fail-closed on distinct steady UA.
+    // Nested handshake dominates wall time; a separate warmup RTT is not needed.
     var http_buf: [8192]u8 = undefined;
-    try flushTlsApp(&tls_client, &pipe, util.probe_http);
-    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf, util.probe_ua_warmup);
-    if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
-
     const steady_start = netutil.monoNow(io);
     try flushTlsApp(&tls_client, &pipe, util.probe_http_steady);
     _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf, util.probe_ua_steady);
+    if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
     return netutil.elapsedMs(steady_start, io);
 }
 
