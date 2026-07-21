@@ -266,13 +266,20 @@ pub fn isPeerClosed(err: anyerror) bool {
     };
 }
 
-pub fn writeSocksAddrDomain(buf: []u8, domain: []const u8, port: u16) error{BufferTooSmall}!usize {
+pub fn writeSocksAddrDomain(buf: []u8, domain: []const u8, port: u16) error{ BufferTooSmall, DomainTooLong }!usize {
+    if (domain.len > 255) return error.DomainTooLong;
     if (buf.len < 1 + 1 + domain.len + 2) return error.BufferTooSmall;
     buf[0] = 0x03;
     buf[1] = @intCast(domain.len);
     @memcpy(buf[2..][0..domain.len], domain);
     std.mem.writeInt(u16, buf[2 + domain.len ..][0..2], port, .big);
     return 1 + 1 + domain.len + 2;
+}
+
+test "writeSocksAddrDomain rejects domain longer than 255" {
+    var buf: [512]u8 = undefined;
+    const long = [_]u8{'a'} ** 256;
+    try std.testing.expectError(error.DomainTooLong, writeSocksAddrDomain(&buf, &long, 80));
 }
 
 test "looksLikeCloudflareTrace" {
