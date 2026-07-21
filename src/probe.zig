@@ -235,23 +235,32 @@ pub fn selectBestClass(
 }
 
 fn considerBest(shared: *Shared, class: PrefClass, latency: u64, raw: []const u8, host: []const u8) void {
-    shared.lock();
-    defer shared.unlock();
-    const slot = shared.best.getPtr(class);
-    if (slot.*) |cur| {
-        if (latency >= cur.latency_ms) return;
-    }
-    // Own a copy: proxy.deinit may free legacy-SS hosts before the caller reads Result.
+    // Dupe outside the lock so host workers do not serialize on allocation.
     const host_copy = shared.gpa.dupe(u8, host) catch {
+        shared.lock();
+        defer shared.unlock();
         shared.best_oom = true;
         return;
     };
-    if (slot.*) |*old| shared.gpa.free(old.host);
+
+    shared.lock();
+    const slot = shared.best.getPtr(class);
+    if (slot.*) |cur| {
+        if (latency >= cur.latency_ms) {
+            shared.unlock();
+            shared.gpa.free(host_copy);
+            return;
+        }
+    }
+    // Own a copy: proxy.deinit may free legacy-SS hosts before the caller reads Result.
+    const prev_host: ?[]u8 = if (slot.*) |old| old.host else null;
     slot.* = .{
         .latency_ms = latency,
         .raw = raw,
         .host = host_copy,
     };
+    shared.unlock();
+    if (prev_host) |h| shared.gpa.free(h);
 }
 
 /// Short hint for FAIL logs (why the probe likely failed).
