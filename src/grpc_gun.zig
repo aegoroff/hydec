@@ -66,6 +66,10 @@ fn readVarint(buf: []const u8) error{InvalidVarint}!struct { usize, usize } {
         if (i >= 10) return error.InvalidVarint;
         const b = buf[i];
         if (shift >= @bitSizeOf(usize)) return error.InvalidVarint;
+        // Last partial group (e.g. 10th byte of u64: only bit 0 allowed).
+        const bits_left = @as(u8, @bitSizeOf(usize)) - shift;
+        if (bits_left < 7 and ((b & 0x7f) >> @intCast(bits_left)) != 0)
+            return error.InvalidVarint;
         result |= @as(usize, b & 0x7f) << @intCast(shift);
         if ((b & 0x80) == 0) return .{ result, i + 1 };
         shift += 7;
@@ -319,4 +323,17 @@ test "headersIndicateStatus200 accepts literal :status 200" {
 test "readVarint rejects overlong continuation" {
     const crafted = [_]u8{0xff} ** 10;
     try std.testing.expectError(error.InvalidVarint, readVarint(&crafted));
+}
+
+test "readVarint rejects overflow past usize" {
+    // 9 continuation bytes + terminating 0x02 would set bit 64 (u64) / overflow.
+    const crafted = [_]u8{0xff} ** 9 ++ [_]u8{0x02};
+    try std.testing.expectError(error.InvalidVarint, readVarint(&crafted));
+    // Max usize: 9×0xff then 0x01 (bit 63 only) is valid on 64-bit.
+    if (@bitSizeOf(usize) == 64) {
+        const max_u64 = [_]u8{0xff} ** 9 ++ [_]u8{0x01};
+        const v, const n = try readVarint(&max_u64);
+        try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), v);
+        try std.testing.expectEqual(@as(usize, 10), n);
+    }
 }
