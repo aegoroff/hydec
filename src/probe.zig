@@ -18,6 +18,28 @@ const Result = struct {
     }
 };
 
+/// Preference class for `best` ranking (higher = preferred when latencies are comparable).
+/// VLESS² = REALITY gRPC; VLESS³ = REALITY TCP vision — matching HyNet subscription labels.
+pub const PrefClass = enum {
+    trojan,
+    shadowsocks,
+    vless3,
+    vless2,
+
+    pub fn fromProxy(proxy: proxy_uri.Proxy) ?PrefClass {
+        return switch (proxy.kind) {
+            .vless => switch (proxy.transport) {
+                .grpc => .vless2,
+                .tcp => .vless3,
+                else => null,
+            },
+            .shadowsocks => .shadowsocks,
+            .trojan => .trojan,
+            else => null,
+        };
+    }
+};
+
 pub const Stats = struct {
     tested: usize = 0,
     passed: usize = 0,
@@ -40,7 +62,8 @@ const Shared = struct {
     verbose: bool,
     timeout_secs: u32,
     mutex: Io.Mutex = .init,
-    best: ?Result = null,
+    /// Fastest successful probe per preference class.
+    best: std.EnumArray(PrefClass, ?Result) = .initFill(null),
     /// Set when a successful probe could not be recorded as best (host dupe OOM).
     best_oom: bool = false,
     stats: *Stats,
@@ -51,6 +74,13 @@ const Shared = struct {
 
     fn unlock(self: *Shared) void {
         self.mutex.unlock(self.io);
+    }
+
+    fn deinitBests(self: *Shared) void {
+        for (std.enums.values(PrefClass)) |class| {
+            if (self.best.getPtr(class).*) |*r| r.deinit(self.gpa);
+            self.best.set(class, null);
+        }
     }
 };
 
@@ -144,17 +174,80 @@ pub fn probeAverage(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, time
     return averageMs(&samples);
 }
 
-fn considerBest(shared: *Shared, latency: u64, raw: []const u8, host: []const u8) void {
+/// `a > ratio * b`, saturating on mul overflow (treat as not exceeding).
+fn exceedsRatio(a: u64, b: u64, ratio: u64) bool {
+    const limit = std.math.mul(u64, ratio, b) catch return false;
+    return a > limit;
+}
+
+/// `a >= ratio * b`, saturating on mul overflow.
+fn atLeastRatio(a: u64, b: u64, ratio: u64) bool {
+    const limit = std.math.mul(u64, ratio, b) catch return false;
+    return a >= limit;
+}
+
+/// Pick the winning preference class from per-class fastest latencies.
+///
+/// Policy:
+/// 1. Prefer fastest VLESS² (gRPC).
+/// 2. Prefer VLESS³ over VLESS² when VLESS² is strictly more than 3× slower.
+/// 3. Prefer SS over VLESS² only when there is no VLESS², or VLESS² is ≥5× slower than SS.
+///    When VLESS² was demoted to VLESS³ and SS is eligible, apply the 3× rule (as in 4).
+/// 4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is strictly more than 3× slower than SS.
+/// 5. Trojan only when no VLESS² / VLESS³ / SS succeeded.
+pub fn selectBestClass(
+    vless2_ms: ?u64,
+    vless3_ms: ?u64,
+    ss_ms: ?u64,
+    trojan_ms: ?u64,
+) ?PrefClass {
+    if (vless2_ms) |v2| {
+        var class: PrefClass = .vless2;
+        var win_ms = v2;
+        if (vless3_ms) |v3| {
+            if (exceedsRatio(v2, v3, 3)) {
+                class = .vless3;
+                win_ms = v3;
+            }
+        }
+        if (ss_ms) |ss_lat| {
+            if (atLeastRatio(v2, ss_lat, 5)) {
+                if (class == .vless2) {
+                    return .shadowsocks;
+                }
+                // Demoted to VLESS³: same 3× rule as when VLESS² is absent.
+                if (exceedsRatio(win_ms, ss_lat, 3)) return .shadowsocks;
+            }
+        }
+        return class;
+    }
+
+    if (vless3_ms) |v3| {
+        if (ss_ms) |ss_lat| {
+            if (exceedsRatio(v3, ss_lat, 3)) return .shadowsocks;
+        }
+        return .vless3;
+    }
+
+    if (ss_ms != null) return .shadowsocks;
+    if (trojan_ms != null) return .trojan;
+    return null;
+}
+
+fn considerBest(shared: *Shared, class: PrefClass, latency: u64, raw: []const u8, host: []const u8) void {
     shared.lock();
     defer shared.unlock();
-    if (shared.best != null and latency >= shared.best.?.latency_ms) return;
+    const slot = shared.best.getPtr(class);
+    if (slot.*) |cur| {
+        if (latency >= cur.latency_ms) return;
+    }
     // Own a copy: proxy.deinit may free legacy-SS hosts before the caller reads Result.
     const host_copy = shared.gpa.dupe(u8, host) catch {
         shared.best_oom = true;
         return;
     };
-    if (shared.best) |*old| shared.gpa.free(old.host);
-    shared.best = .{
+    if (slot.*) |*old| shared.gpa.free(old.host);
+    slot.* = .{
         .latency_ms = latency,
         .raw = raw,
         .host = host_copy,
@@ -238,7 +331,8 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
             }
         }
 
-        considerBest(shared, latency, item.raw, proxy.host);
+        const class = PrefClass.fromProxy(proxy) orelse continue;
+        considerBest(shared, class, latency, item.raw, proxy.host);
     }
 }
 
@@ -327,7 +421,7 @@ pub fn findBest(
         .timeout_secs = timeout_secs,
         .stats = stats,
     };
-    errdefer if (shared.best) |*b| b.deinit(gpa);
+    errdefer shared.deinitBests();
 
     const lists = groups.values();
     const n = lists.len;
@@ -349,10 +443,27 @@ pub fn findBest(
         next += batch;
     }
 
-    const best = shared.best;
-    shared.best = null;
-    if (best == null and shared.best_oom) return error.OutOfMemory;
-    return best;
+    const chosen = selectBestClass(
+        if (shared.best.get(.vless2)) |r| r.latency_ms else null,
+        if (shared.best.get(.vless3)) |r| r.latency_ms else null,
+        if (shared.best.get(.shadowsocks)) |r| r.latency_ms else null,
+        if (shared.best.get(.trojan)) |r| r.latency_ms else null,
+    );
+
+    if (chosen == null) {
+        shared.deinitBests();
+        if (shared.best_oom) return error.OutOfMemory;
+        return null;
+    }
+
+    // Take ownership of the winner; free the other class bests.
+    const winner = shared.best.get(chosen.?).?;
+    shared.best.set(chosen.?, null);
+    for (std.enums.values(PrefClass)) |class| {
+        if (shared.best.getPtr(class).*) |*r| r.deinit(gpa);
+        shared.best.set(class, null);
+    }
+    return winner;
 }
 
 test "averageMs rounds half up via integer bias" {
@@ -405,4 +516,53 @@ test "failHint classifies write and buffer errors" {
     try std.testing.expectEqualStrings("buffer/overflow", failHint(error.BufferTooSmall));
     try std.testing.expectEqualStrings("rejected/closed", failHint(error.ConnectionResetByPeer));
     try std.testing.expectEqualStrings("unreachable", failHint(error.NetworkDown));
+}
+
+test "PrefClass.fromProxy maps vless transport and protocols" {
+    const gpa = std.testing.allocator;
+    const v2_line =
+        \\vless://00000000-1111-2222-3333-444444444444@192.0.2.10:2053?security=reality&type=grpc&mode=gun&serviceName=xyz&sni=example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef#VLESS2
+    ;
+    const v3_line =
+        \\vless://00000000-1111-2222-3333-444444444444@192.0.2.10:8444?security=reality&type=tcp&flow=xtls-rprx-vision&sni=example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef#VLESS3
+    ;
+    const ss_line = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3Jk@192.0.2.1:8388#ss";
+    const tj_line = "trojan://password@192.0.2.1:443?security=tls&type=ws&sni=example.com&path=%2F#tj";
+
+    var v2 = try proxy_uri.parse(gpa, v2_line);
+    defer v2.deinit(gpa);
+    var v3 = try proxy_uri.parse(gpa, v3_line);
+    defer v3.deinit(gpa);
+    var ss_p = try proxy_uri.parse(gpa, ss_line);
+    defer ss_p.deinit(gpa);
+    var tj = try proxy_uri.parse(gpa, tj_line);
+    defer tj.deinit(gpa);
+
+    try std.testing.expect(PrefClass.fromProxy(v2) == .vless2);
+    try std.testing.expect(PrefClass.fromProxy(v3) == .vless3);
+    try std.testing.expect(PrefClass.fromProxy(ss_p) == .shadowsocks);
+    try std.testing.expect(PrefClass.fromProxy(tj) == .trojan);
+}
+
+test "selectBestClass prefers VLESS2 then demotes on 3x / SS on 5x" {
+    // Fastest VLESS² wins when close to others.
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(100, 90, 80, 50));
+    // Exactly 3×: keep VLESS² ("больше чем в три раза").
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(300, 100, null, null));
+    // Strictly more than 3× → VLESS³.
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(301, 100, null, null));
+    // SS needs ≥5× vs VLESS².
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(499, null, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(500, null, 100, null));
+    // Demoted to VLESS³; SS eligible via VLESS²≥5×SS, then 3× vs VLESS³.
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(600, 100, 40, null)); // 100 ≯ 3×40
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(600, 100, 30, null)); // 100 > 3×30
+    // No VLESS²: VLESS³ vs SS at 3×.
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(null, 300, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(null, 301, 100, null));
+    // SS without VLESS.
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(null, null, 40, 10));
+    // Trojan only as last resort.
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(null, null, null, 10));
+    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(null, null, null, null));
 }
