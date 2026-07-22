@@ -307,6 +307,7 @@ pub fn failHint(err: anyerror) []const u8 {
         error.SystemResources => "sys/resources",
         // --interface binding failures (interface name / source IP).
         error.NoSuchInterface => "iface/missing",
+        error.EmptyInterfaceName => "iface/empty",
         error.InterfaceBindingUnsupported => "iface/unsupported",
         error.InterfaceNameTooLong => "iface/toolong",
         error.AccessDenied => "denied",

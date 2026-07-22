@@ -142,16 +142,15 @@ test "sleepUntilDeadline is no-op when already past" {
     sleepUntilDeadline(io, past);
 }
 
-test "applyBind is a no-op for null and empty spec" {
+test "applyBind treats null as no-op and empty spec as an error" {
     // Neither touches the (invalid) socket fd: they return before any syscall.
     try applyBind(0, null);
-    try applyBind(0, "");
+    try std.testing.expectError(error.EmptyInterfaceName, applyBind(0, ""));
 }
 
 test "bindToDevice rejects over-long interface name without calling setsockopt" {
     // 16 chars == IFNAMSIZ: rejected before setsockopt, so a bogus fd is safe.
     try std.testing.expectError(error.InterfaceNameTooLong, bindToDevice(0, "0123456789abcdef"));
-    try std.testing.expectError(error.InterfaceNameTooLong, bindToDevice(0, ""));
 }
 
 fn connectIpTimed(
@@ -207,14 +206,15 @@ fn openSocket(family: posix.sa_family_t, flags: u32) !posix.socket_t {
 
 /// Bind `sock` per `bind` before connecting.
 ///
-/// `null`/empty → no-op (kernel chooses the source). An IP literal is bound via
-/// `bind(2)` to that source address (port 0, works unprivileged). Anything else
-/// is treated as an interface name and bound via `SO_BINDTODEVICE` (Linux only,
-/// requires `CAP_NET_RAW`). Hostname dials call this per candidate address, so a
-/// family mismatch just makes that candidate fail and the next one is tried.
+/// `null` → no-op (kernel chooses the source). An empty spec is rejected as
+/// `error.EmptyInterfaceName`. An IP literal is bound via `bind(2)` to that
+/// source address (port 0, works unprivileged). Anything else is treated as an
+/// interface name and bound via `SO_BINDTODEVICE` (Linux only, requires
+/// `CAP_NET_RAW`). Hostname dials call this per candidate address, so a family
+/// mismatch just makes that candidate fail and the next one is tried.
 fn applyBind(sock: posix.socket_t, bind: ?[]const u8) !void {
     const spec = bind orelse return;
-    if (spec.len == 0) return;
+    if (spec.len == 0) return error.EmptyInterfaceName;
 
     if (Io.net.IpAddress.parse(spec, 0)) |src| {
         return bindSrcIp(sock, src);
@@ -260,9 +260,10 @@ fn bindSrcIp(sock: posix.socket_t, src: Io.net.IpAddress) !void {
 }
 
 /// `SO_BINDTODEVICE` (Linux). Needs `CAP_NET_RAW`; otherwise `PermissionDenied`.
+/// Caller must ensure `name` is non-empty (empty is rejected earlier by `applyBind`).
 fn bindToDevice(sock: posix.socket_t, name: []const u8) !void {
     // IFNAMSIZ = 16 including the NUL terminator.
-    if (name.len == 0 or name.len >= 16) return error.InterfaceNameTooLong;
+    if (name.len >= 16) return error.InterfaceNameTooLong;
     var buf: [16]u8 = undefined;
     @memcpy(buf[0..name.len], name);
     buf[name.len] = 0;

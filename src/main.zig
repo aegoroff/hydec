@@ -47,6 +47,9 @@ pub fn main(init: std.process.Init) !void {
         .run => |opts| {
             defer gpa.free(opts.uri);
             defer if (opts.interface) |i| gpa.free(i);
+            if (builtin.os.tag == .windows and opts.interface != null) {
+                std.log.warn("--interface/-I is not supported on Windows; ignored", .{});
+            }
             switch (opts.command) {
                 .best => try runBest(gpa, io, opts),
                 .ping => try runPing(gpa, io, opts),
