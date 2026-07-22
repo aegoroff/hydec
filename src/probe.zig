@@ -310,6 +310,7 @@ pub fn failHint(err: anyerror) []const u8 {
         error.EmptyInterfaceName => "iface/empty",
         error.InterfaceBindingUnsupported => "iface/unsupported",
         error.InterfaceNameTooLong => "iface/toolong",
+        error.AddressNotAvailable => "iface/addr",
         error.AccessDenied => "denied",
         error.AddressFamilyUnsupported => "family",
         // Opaque Io wrappers — Reality/Vision should unwrap socket causes first.
@@ -550,6 +551,8 @@ test "failHint classifies write and buffer errors" {
     try std.testing.expectEqualStrings("buffer/overflow", failHint(error.BufferTooSmall));
     try std.testing.expectEqualStrings("rejected/closed", failHint(error.ConnectionResetByPeer));
     try std.testing.expectEqualStrings("unreachable", failHint(error.NetworkDown));
+    try std.testing.expectEqualStrings("iface/addr", failHint(error.AddressNotAvailable));
+    try std.testing.expectEqualStrings("iface/empty", failHint(error.EmptyInterfaceName));
 }
 
 test "PrefClass.fromProxy maps vless transport and protocols" {

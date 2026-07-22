@@ -6,7 +6,7 @@ Requires **Zig 0.16.0** ([mise](https://mise.jdx.dev/) pin in `mise.toml`, or in
 
 ## Features
 
-- Fetches an **HTTPS-only** subscription URL and base64-decodes URI lines
+- Fetches an **HTTPS-only** subscription URL (HTTP redirects rejected) and base64-decodes URI lines
 - Probes **Shadowsocks** (AEAD), **Trojan** (TLS / WebSocket), **VLESS REALITY** (TCP vision and gRPC gun)
 - Skips VMess (counted in stats)
 - Groups by host/IP: different IPs in parallel, same IP sequentially

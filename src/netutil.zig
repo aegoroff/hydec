@@ -4,9 +4,10 @@ const Io = std.Io;
 const posix = std.posix;
 
 /// Optional bind spec for outbound probe sockets (see `applyBind`).
-/// `null`/empty → kernel chooses the source (unchanged behavior).
-/// Otherwise either an IP literal (`bind()` to source IP) or, on Linux,
-/// an interface name (`SO_BINDTODEVICE`; needs CAP_NET_RAW).
+/// `null` → kernel chooses the source (unchanged behavior). An empty spec is
+/// rejected as `error.EmptyInterfaceName`. Otherwise either an IP literal
+/// (`bind()` to source IP) or, on Linux, an interface name (`SO_BINDTODEVICE`;
+/// needs CAP_NET_RAW).
 pub fn connectHostPort(
     io: Io,
     host: []const u8,

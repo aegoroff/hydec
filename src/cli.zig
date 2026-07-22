@@ -71,7 +71,10 @@ fn onPing(ctx: *zig_cli.BaseCommand.ParseContext) !void {
 }
 
 fn dupeOpt(gpa: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
-    if (value) |v| return try gpa.dupe(u8, v);
+    if (value) |v| {
+        if (v.len == 0) return error.EmptyInterfaceName;
+        return try gpa.dupe(u8, v);
+    }
     return null;
 }
 

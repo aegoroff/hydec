@@ -24,7 +24,7 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 
 **Behavior (`best`)**
 
-1. Fetch subscription URL (**HTTPS only**; plaintext schemes → `InsecureSubscriptionUrl`).
+1. Fetch subscription URL (**HTTPS only**; plaintext schemes → `InsecureSubscriptionUrl`). Redirects are followed only while the resolved target stays HTTPS; `http://` hops are rejected. Scheme is normalized to lowercase for `std.http.Client`.
 2. Base64-decode body; iterate URI lines.
 3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**.
 4. Each candidate: **3 probes**, fail-fast on first error; keep **average** latency per preference class.
@@ -168,7 +168,7 @@ build: zig 0.16
 
 - Never commit secrets, tokens, or credentials.
 - Subscription URIs and proxy lines often embed passwords/UUIDs — avoid logging full URIs; prefer host/port and decoded `#fragment` name (as in `probe.zig` verbose output).
-- Treat user-supplied URLs carefully when fetching; never allow non-HTTPS subscription downloads.
+- Treat user-supplied URLs carefully when fetching; never allow non-HTTPS subscription downloads or redirects to plaintext HTTP.
 - Interface-name binds require elevated privileges on Linux; do not weaken that requirement in docs or code comments.
 
 ## What agents should avoid

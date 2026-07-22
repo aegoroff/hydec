@@ -128,7 +128,11 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
 }
 
 fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
-    const uri = try requireHttpsUri(url);
+    // Own redirect targets so resolve buffers do not alias across iterations.
+    var owned_url: ?[]u8 = null;
+    defer if (owned_url) |u| gpa.free(u);
+    var current_url: []const u8 = url;
+    var redirects_left: u16 = 5;
 
     var client = http.Client{
         .allocator = gpa,
@@ -138,36 +142,107 @@ fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
 
     try ensureTlsReady(&client);
 
-    var req = try client.request(.GET, uri, .{
-        .headers = .{
-            .user_agent = .{ .override = DEFAULT_USER_AGENT },
-        },
-        .redirect_behavior = .init(5),
-    });
-    defer req.deinit();
+    while (true) {
+        const uri = try requireHttpsUri(current_url);
 
-    try req.sendBodiless();
+        var req = try client.request(.GET, uri, .{
+            .headers = .{
+                .user_agent = .{ .override = DEFAULT_USER_AGENT },
+            },
+            // Manual follow so each hop can be re-checked for HTTPS.
+            .redirect_behavior = .unhandled,
+        });
 
-    var header_buffer: [16 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&header_buffer);
+        req.sendBodiless() catch |err| {
+            req.deinit();
+            return err;
+        };
 
-    if (response.head.status != .ok) {
-        return error.HttpStatusNotOk;
+        var header_buffer: [16 * 1024]u8 = undefined;
+        var response = req.receiveHead(&header_buffer) catch |err| {
+            req.deinit();
+            return err;
+        };
+
+        if (response.head.status.class() == .redirect) {
+            const next = takeHttpsRedirect(gpa, uri, &response, &redirects_left) catch |err| {
+                req.deinit();
+                return err;
+            };
+            req.deinit();
+            if (owned_url) |u| gpa.free(u);
+            owned_url = next;
+            current_url = next;
+            continue;
+        }
+
+        if (response.head.status != .ok) {
+            req.deinit();
+            return error.HttpStatusNotOk;
+        }
+
+        defer req.deinit();
+
+        var transfer_buffer: [8 * 1024]u8 = undefined;
+        var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+        var decompress: http.Decompress = undefined;
+        var body_reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
+
+        return try body_reader.allocRemaining(gpa, .limited(4 * 1024 * 1024));
     }
+}
 
-    var transfer_buffer: [8 * 1024]u8 = undefined;
-    var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-    var decompress: http.Decompress = undefined;
-    var body_reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
+/// Follow one redirect only when the resolved target is HTTPS. Returns an owned absolute URL.
+fn takeHttpsRedirect(
+    gpa: std.mem.Allocator,
+    base: std.Uri,
+    response: *http.Client.Response,
+    redirects_left: *u16,
+) ![]u8 {
+    if (redirects_left.* == 0) return error.TooManyHttpRedirects;
+    redirects_left.* -= 1;
 
-    return try body_reader.allocRemaining(gpa, .limited(4 * 1024 * 1024));
+    const location = response.head.location orelse return error.HttpRedirectLocationMissing;
+    const loc_copy = try gpa.dupe(u8, location);
+    defer gpa.free(loc_copy);
+
+    // Discard body before resolve — Location pointers into the head buffer are invalidated.
+    const reader = response.reader(&.{});
+    _ = reader.discardRemaining() catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+    };
+
+    var resolve_storage: [16 * 1024]u8 = undefined;
+    if (loc_copy.len > resolve_storage.len) return error.HttpRedirectLocationOversize;
+    @memcpy(resolve_storage[0..loc_copy.len], loc_copy);
+    var aux: []u8 = &resolve_storage;
+    const new_uri = base.resolveInPlace(loc_copy.len, &aux) catch |err| switch (err) {
+        error.NoSpaceLeft => return error.HttpRedirectLocationOversize,
+        else => return error.HttpRedirectLocationInvalid,
+    };
+
+    // Re-apply the HTTPS gate — std client would otherwise allow http:// hops.
+    _ = try ensureHttpsScheme(new_uri.scheme);
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    var normalized = new_uri;
+    normalized.scheme = "https";
+    try normalized.writeToStream(&aw.writer, std.Uri.Format.Flags.all);
+    return try aw.toOwnedSlice();
 }
 
 /// Subscription bodies embed proxy credentials; only HTTPS is allowed.
+/// Scheme is normalized to lowercase `"https"` for `std.http.Client` (case-sensitive).
 fn requireHttpsUri(url: []const u8) (std.Uri.ParseError || error{InsecureSubscriptionUrl})!std.Uri {
-    const uri = try std.Uri.parse(url);
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InsecureSubscriptionUrl;
+    var uri = try std.Uri.parse(url);
+    try ensureHttpsScheme(uri.scheme);
+    uri.scheme = "https";
     return uri;
+}
+
+fn ensureHttpsScheme(scheme: []const u8) error{InsecureSubscriptionUrl}!void {
+    if (!std.ascii.eqlIgnoreCase(scheme, "https")) return error.InsecureSubscriptionUrl;
 }
 
 fn ensureTlsReady(client: *http.Client) !void {
@@ -194,9 +269,16 @@ fn ensureTlsReady(client: *http.Client) !void {
     std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
 }
 
-test "requireHttpsUri rejects plaintext and accepts https" {
+test "requireHttpsUri rejects plaintext and normalizes scheme case" {
     try std.testing.expectError(error.InsecureSubscriptionUrl, requireHttpsUri("http://example.com/sub"));
     try std.testing.expectError(error.InsecureSubscriptionUrl, requireHttpsUri("ftp://example.com/sub"));
     const uri = try requireHttpsUri("HTTPS://example.com/sub");
-    try std.testing.expectEqualStrings("HTTPS", uri.scheme);
+    try std.testing.expectEqualStrings("https", uri.scheme);
+}
+
+test "ensureHttpsScheme rejects http redirect targets" {
+    try ensureHttpsScheme("https");
+    try ensureHttpsScheme("HTTPS");
+    try std.testing.expectError(error.InsecureSubscriptionUrl, ensureHttpsScheme("http"));
+    try std.testing.expectError(error.InsecureSubscriptionUrl, ensureHttpsScheme("HTTP"));
 }

@@ -31,6 +31,10 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("invalid --timeout", .{});
             std.process.exit(2);
         },
+        error.EmptyInterfaceName => {
+            std.log.err("invalid --interface/-I: empty", .{});
+            std.process.exit(2);
+        },
         error.UnknownCommand => {
             std.log.err("unknown command (try 'hydec --help')", .{});
             std.process.exit(2);
