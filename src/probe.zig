@@ -61,6 +61,8 @@ const Shared = struct {
     io: Io,
     verbose: bool,
     timeout_secs: u32,
+    /// Optional interface/source-IP spec forwarded to `connectHostPort` (`null` = default).
+    bind: ?[]const u8,
     mutex: Io.Mutex = .init,
     /// Fastest successful probe per preference class.
     best: std.EnumArray(PrefClass, ?Result) = .initFill(null),
@@ -87,12 +89,18 @@ const Shared = struct {
 /// How many successful probes are required for `ping` / `best` (fail-fast on first error).
 pub const probe_attempts: usize = 3;
 
-pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_secs: u32) !u64 {
+pub fn probeOne(
+    gpa: std.mem.Allocator,
+    io: Io,
+    proxy: proxy_uri.Proxy,
+    timeout_secs: u32,
+    bind: ?[]const u8,
+) !u64 {
     return switch (proxy.kind) {
         .shadowsocks => blk: {
             const method = proxy.method orelse return error.InvalidProxyUri;
             const password = proxy.password orelse return error.InvalidProxyUri;
-            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, timeout_secs);
+            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, timeout_secs, bind);
         },
         .trojan => blk: {
             const sni = proxy.getParam("sni") orelse proxy.host;
@@ -115,6 +123,7 @@ pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_
                 host_hdr,
                 allow_insecure,
                 timeout_secs,
+                bind,
             );
         },
         .vless => blk: {
@@ -149,6 +158,7 @@ pub fn probeOne(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_
                 service,
                 authority,
                 timeout_secs,
+                bind,
             );
         },
         .vmess => error.SkippedVmess,
@@ -166,10 +176,16 @@ pub fn averageMs(samples: []const u64) u64 {
 
 /// Run `probe_attempts` full probes; stop on the first failure.
 /// On success returns the rounded average latency in ms.
-pub fn probeAverage(gpa: std.mem.Allocator, io: Io, proxy: proxy_uri.Proxy, timeout_secs: u32) !u64 {
+pub fn probeAverage(
+    gpa: std.mem.Allocator,
+    io: Io,
+    proxy: proxy_uri.Proxy,
+    timeout_secs: u32,
+    bind: ?[]const u8,
+) !u64 {
     var samples: [probe_attempts]u64 = undefined;
     for (&samples) |*slot| {
-        slot.* = try probeOne(gpa, io, proxy, timeout_secs);
+        slot.* = try probeOne(gpa, io, proxy, timeout_secs, bind);
     }
     return averageMs(&samples);
 }
@@ -289,6 +305,12 @@ pub fn failHint(err: anyerror) []const u8 {
         error.UnsupportedVlessEncryption => "unsupported-encryption",
         error.BufferTooSmall, error.RecordTooLarge => "buffer/overflow",
         error.SystemResources => "sys/resources",
+        // --interface binding failures (interface name / source IP).
+        error.NoSuchInterface => "iface/missing",
+        error.InterfaceBindingUnsupported => "iface/unsupported",
+        error.InterfaceNameTooLong => "iface/toolong",
+        error.AccessDenied => "denied",
+        error.AddressFamilyUnsupported => "family",
         // Opaque Io wrappers — Reality/Vision should unwrap socket causes first.
         error.WriteFailed => "write/failed",
         error.ReadFailed => "read/failed",
@@ -315,7 +337,7 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
         }
 
         // Three probes, fail-fast; ranking uses the average of all three.
-        const latency = probeAverage(shared.gpa, shared.io, proxy, shared.timeout_secs) catch |err| {
+        const latency = probeAverage(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind) catch |err| {
             if (shared.verbose) {
                 if (proxy.name) |n| {
                     std.log.warn("FAIL: {s} ({s}): {s} ({})", .{ n, proxy.host, failHint(err), err });
@@ -416,6 +438,7 @@ pub fn findBest(
     lines: []const []const u8,
     verbose: bool,
     timeout_secs: u32,
+    bind: ?[]const u8,
     stats: *Stats,
 ) !?Result {
     var groups = try collectGroups(gpa, lines, stats, verbose);
@@ -428,6 +451,7 @@ pub fn findBest(
         .io = io,
         .verbose = verbose,
         .timeout_secs = timeout_secs,
+        .bind = bind,
         .stats = stats,
     };
     errdefer shared.deinitBests();

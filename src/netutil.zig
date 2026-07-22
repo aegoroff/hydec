@@ -3,20 +3,36 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const posix = std.posix;
 
-pub fn connectHostPort(io: Io, host: []const u8, port: u16, timeout_secs: u32) !Io.net.Stream {
+/// Optional bind spec for outbound probe sockets (see `applyBind`).
+/// `null`/empty → kernel chooses the source (unchanged behavior).
+/// Otherwise either an IP literal (`bind()` to source IP) or, on Linux,
+/// an interface name (`SO_BINDTODEVICE`; needs CAP_NET_RAW).
+pub fn connectHostPort(
+    io: Io,
+    host: []const u8,
+    port: u16,
+    timeout_secs: u32,
+    bind: ?[]const u8,
+) !Io.net.Stream {
     // Zig's Threaded Io panics on ConnectOptions.timeout ("TODO"), so IP dials
     // use a non-blocking connect + poll. Hostnames resolve via DNS then use the
     // same timed IP dial against a shared absolute deadline.
     if (Io.net.IpAddress.parse(host, port)) |addr| {
-        const stream = try connectIpTimed(io, addr, timeout_secs);
+        const stream = try connectIpTimed(io, addr, timeout_secs, bind);
         setTcpNoDelay(stream);
         return stream;
     } else |_| {}
 
-    return connectHostnameTimed(io, host, port, timeout_secs);
+    return connectHostnameTimed(io, host, port, timeout_secs, bind);
 }
 
-fn connectHostnameTimed(io: Io, host: []const u8, port: u16, timeout_secs: u32) !Io.net.Stream {
+fn connectHostnameTimed(
+    io: Io,
+    host: []const u8,
+    port: u16,
+    timeout_secs: u32,
+    bind: ?[]const u8,
+) !Io.net.Stream {
     const hostname = try Io.net.HostName.init(host);
     if (builtin.os.tag == .windows) {
         // Best-effort: timed IP connect is Linux/posix-only below.
@@ -91,7 +107,7 @@ fn connectHostnameTimed(io: Io, host: []const u8, port: u16, timeout_secs: u32) 
                         if (deadline) |d| {
                             if (monoNow(io) >= d) return error.Timeout;
                         }
-                        if (connectIpUntil(io, address, deadline)) |stream| {
+                        if (connectIpUntil(io, address, deadline, bind)) |stream| {
                             setTcpNoDelay(stream);
                             return stream;
                         } else |err| {
@@ -126,11 +142,33 @@ test "sleepUntilDeadline is no-op when already past" {
     sleepUntilDeadline(io, past);
 }
 
-fn connectIpTimed(io: Io, address: Io.net.IpAddress, timeout_secs: u32) !Io.net.Stream {
-    return connectIpUntil(io, address, deadlineNs(io, timeout_secs));
+test "applyBind is a no-op for null and empty spec" {
+    // Neither touches the (invalid) socket fd: they return before any syscall.
+    try applyBind(0, null);
+    try applyBind(0, "");
 }
 
-fn connectIpUntil(io: Io, address: Io.net.IpAddress, deadline: ?i128) !Io.net.Stream {
+test "bindToDevice rejects over-long interface name without calling setsockopt" {
+    // 16 chars == IFNAMSIZ: rejected before setsockopt, so a bogus fd is safe.
+    try std.testing.expectError(error.InterfaceNameTooLong, bindToDevice(0, "0123456789abcdef"));
+    try std.testing.expectError(error.InterfaceNameTooLong, bindToDevice(0, ""));
+}
+
+fn connectIpTimed(
+    io: Io,
+    address: Io.net.IpAddress,
+    timeout_secs: u32,
+    bind: ?[]const u8,
+) !Io.net.Stream {
+    return connectIpUntil(io, address, deadlineNs(io, timeout_secs), bind);
+}
+
+fn connectIpUntil(
+    io: Io,
+    address: Io.net.IpAddress,
+    deadline: ?i128,
+    bind: ?[]const u8,
+) !Io.net.Stream {
     if (builtin.os.tag == .windows) {
         // Best-effort: Zig Windows connect timeout is also TODO.
         return address.connect(io, .{ .mode = .stream });
@@ -144,6 +182,7 @@ fn connectIpUntil(io: Io, address: Io.net.IpAddress, deadline: ?i128) !Io.net.St
     const sock = try openSocket(family, flags);
     errdefer _ = posix.system.close(sock);
 
+    try applyBind(sock, bind);
     try startConnect(sock, address);
     try waitConnectedUntil(io, sock, deadline);
     try clearNonblock(sock);
@@ -164,6 +203,79 @@ fn openSocket(family: posix.sa_family_t, flags: u32) !posix.socket_t {
             else => return error.Unexpected,
         }
     }
+}
+
+/// Bind `sock` per `bind` before connecting.
+///
+/// `null`/empty → no-op (kernel chooses the source). An IP literal is bound via
+/// `bind(2)` to that source address (port 0, works unprivileged). Anything else
+/// is treated as an interface name and bound via `SO_BINDTODEVICE` (Linux only,
+/// requires `CAP_NET_RAW`). Hostname dials call this per candidate address, so a
+/// family mismatch just makes that candidate fail and the next one is tried.
+fn applyBind(sock: posix.socket_t, bind: ?[]const u8) !void {
+    const spec = bind orelse return;
+    if (spec.len == 0) return;
+
+    if (Io.net.IpAddress.parse(spec, 0)) |src| {
+        return bindSrcIp(sock, src);
+    } else |_| {}
+
+    if (builtin.os.tag == .linux) {
+        return bindToDevice(sock, spec);
+    }
+    return error.InterfaceBindingUnsupported;
+}
+
+/// `bind(2)` the socket to a source IP on port 0.
+fn bindSrcIp(sock: posix.socket_t, src: Io.net.IpAddress) !void {
+    while (true) {
+        const rc = switch (src) {
+            .ip4 => |ip4| blk: {
+                const sa = posix.sockaddr.in{
+                    .port = 0,
+                    .addr = @bitCast(ip4.bytes),
+                };
+                break :blk posix.system.bind(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in));
+            },
+            .ip6 => |ip6| blk: {
+                const sa = posix.sockaddr.in6{
+                    .port = 0,
+                    .flowinfo = ip6.flow,
+                    .addr = ip6.bytes,
+                    .scope_id = ip6.interface.index,
+                };
+                break :blk posix.system.bind(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in6));
+            },
+        };
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            .ACCES => return error.AccessDenied,
+            .ADDRNOTAVAIL => return error.AddressNotAvailable,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .NOMEM => return error.SystemResources,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+/// `SO_BINDTODEVICE` (Linux). Needs `CAP_NET_RAW`; otherwise `PermissionDenied`.
+fn bindToDevice(sock: posix.socket_t, name: []const u8) !void {
+    // IFNAMSIZ = 16 including the NUL terminator.
+    if (name.len == 0 or name.len >= 16) return error.InterfaceNameTooLong;
+    var buf: [16]u8 = undefined;
+    @memcpy(buf[0..name.len], name);
+    buf[name.len] = 0;
+    std.posix.setsockopt(
+        sock,
+        posix.SOL.SOCKET,
+        posix.SO.BINDTODEVICE,
+        buf[0 .. name.len + 1],
+    ) catch |err| switch (err) {
+        error.PermissionDenied => return error.AccessDenied,
+        error.NoDevice => return error.NoSuchInterface,
+        else => |e| return e,
+    };
 }
 
 fn startConnect(sock: posix.socket_t, address: Io.net.IpAddress) !void {

@@ -652,6 +652,7 @@ fn connect(
     pbk_b64: []const u8,
     sid_hex: []const u8,
     timeout_secs: u32,
+    bind: ?[]const u8,
 ) !void {
     var server_pub: [32]u8 = undefined;
     try decodePublicKey(pbk_b64, &server_pub);
@@ -689,7 +690,7 @@ fn connect(
     else
         dial_start + @as(i128, timeout_secs) * std.time.ns_per_s;
     rc.* = .{
-        .stream = try netutil.connectHostPort(io, host, port, timeout_secs),
+        .stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind),
         .io = io,
         .open = true,
         .read_deadline_ns = read_deadline_ns,
@@ -862,11 +863,12 @@ pub fn probeVless(
     service_name: []const u8,
     authority_param: []const u8,
     timeout_secs: u32,
+    bind: ?[]const u8,
 ) !u64 {
     const sni_use = if (sni.len > 0) sni else host;
 
     var rc: RealityConn = undefined;
-    try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs);
+    try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind);
     defer rc.deinit();
 
     if (!grpc) {

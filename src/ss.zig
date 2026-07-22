@@ -189,6 +189,7 @@ pub fn probe(
     method_name: []const u8,
     password: []const u8,
     timeout_secs: u32,
+    bind: ?[]const u8,
 ) !u64 {
     const method = Method.fromName(method_name) orelse return error.UnsupportedSsMethod;
 
@@ -197,7 +198,7 @@ pub fn probe(
     evpBytesToKey(password, method.keyLen(), master[0..method.keyLen()]);
 
     const start = netutil.monoNow(io);
-    const stream = try netutil.connectHostPort(io, host, port, timeout_secs);
+    const stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind);
     defer stream.close(io);
 
     const read_deadline_ns: ?i128 = if (timeout_secs == 0)

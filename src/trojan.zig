@@ -113,9 +113,10 @@ pub fn probe(
     ws_host: []const u8,
     allow_insecure: bool,
     timeout_secs: u32,
+    bind: ?[]const u8,
 ) !u64 {
     const start = netutil.monoNow(io);
-    const stream = try netutil.connectHostPort(io, host, port, timeout_secs);
+    const stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind);
     defer stream.close(io);
 
     const remain = netutil.remainingTimeoutNs(start, io, timeout_secs);

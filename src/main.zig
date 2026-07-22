@@ -46,6 +46,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .run => |opts| {
             defer gpa.free(opts.uri);
+            defer if (opts.interface) |i| gpa.free(i);
             switch (opts.command) {
                 .best => try runBest(gpa, io, opts),
                 .ping => try runPing(gpa, io, opts),
@@ -87,7 +88,7 @@ fn runBest(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     try subscription.iterLines(decoded, Ctx.on, &ctx);
 
     var stats: probe.Stats = .{};
-    var best = try probe.findBest(gpa, io, lines.items, opts.verbose, opts.timeout_secs, &stats);
+    var best = try probe.findBest(gpa, io, lines.items, opts.verbose, opts.timeout_secs, opts.interface, &stats);
     defer if (best) |*b| b.deinit(gpa);
 
     std.log.info("Tested: {d}, passed: {d}, skipped vmess: {d}, skipped other: {d}, parse failed: {d}", .{
@@ -124,7 +125,7 @@ fn runPing(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     };
     defer proxy.deinit(gpa);
 
-    const latency = probe.probeAverage(gpa, io, proxy, opts.timeout_secs) catch |err| {
+    const latency = probe.probeAverage(gpa, io, proxy, opts.timeout_secs, opts.interface) catch |err| {
         if (proxy.name) |n| {
             std.log.warn("FAIL: {s} ({s}): {s} ({})", .{ n, proxy.host, probe.failHint(err), err });
         } else {

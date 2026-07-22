@@ -13,6 +13,9 @@ pub const Options = struct {
     uri: []u8,
     timeout_secs: u32,
     verbose: bool,
+    /// Optional owned interface/source-IP spec forwarded to probe sockets.
+    /// `null` = kernel chooses. Free with `gpa.free`.
+    interface: ?[]u8,
 };
 
 const Capture = struct {
@@ -38,11 +41,15 @@ fn onBest(ctx: *zig_cli.BaseCommand.ParseContext) !void {
     const uri = try capture.gpa.dupe(u8, uri_arg);
     errdefer capture.gpa.free(uri);
 
+    const interface = try dupeOpt(capture.gpa, ctx.getOption("interface"));
+    errdefer if (interface) |i| capture.gpa.free(i);
+
     capture.options = .{
         .command = .best,
         .uri = uri,
         .timeout_secs = try parseTimeout(ctx),
         .verbose = ctx.hasOption("verbose"),
+        .interface = interface,
     };
 }
 
@@ -51,12 +58,21 @@ fn onPing(ctx: *zig_cli.BaseCommand.ParseContext) !void {
     const uri = try capture.gpa.dupe(u8, uri_arg);
     errdefer capture.gpa.free(uri);
 
+    const interface = try dupeOpt(capture.gpa, ctx.getOption("interface"));
+    errdefer if (interface) |i| capture.gpa.free(i);
+
     capture.options = .{
         .command = .ping,
         .uri = uri,
         .timeout_secs = try parseTimeout(ctx),
         .verbose = false,
+        .interface = interface,
     };
+}
+
+fn dupeOpt(gpa: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    if (value) |v| return try gpa.dupe(u8, v);
+    return null;
 }
 
 fn wantsHelp(args: []const []const u8) bool {
@@ -144,6 +160,17 @@ fn addTimeoutOption(cmd: *zig_cli.BaseCommand) !*zig_cli.BaseCommand {
     );
 }
 
+fn addInterfaceOption(cmd: *zig_cli.BaseCommand) !*zig_cli.BaseCommand {
+    return cmd.addOption(
+        zig_cli.Option.init(
+            "interface",
+            "interface",
+            "Bind probe sockets to a network interface NAME or source IP (default: kernel chooses; NAME needs root/CAP_NET_RAW on Linux)",
+            .string,
+        ).withShort('I'),
+    );
+}
+
 fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseCommand {
     const root = try zig_cli.BaseCommand.init(gpa, "hydec", description);
     errdefer {
@@ -171,6 +198,7 @@ fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseComm
             zig_cli.Argument.init("URI", "Subscription URL (HTTPS, base64 body)", .string).withRequired(true),
         );
         _ = try addTimeoutOption(best);
+        _ = try addInterfaceOption(best);
         _ = try best.addOption(
             zig_cli.Option.init(
                 "verbose",
@@ -195,6 +223,7 @@ fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseComm
             zig_cli.Argument.init("PROXY", "Full proxy URI (ss://, trojan://, vless://)", .string).withRequired(true),
         );
         _ = try addTimeoutOption(ping);
+        _ = try addInterfaceOption(ping);
         _ = ping.setAction(onPing);
         _ = try root.addCommand(ping);
         owned = false;
@@ -370,7 +399,10 @@ pub fn parse(gpa: std.mem.Allocator, io: Io, args: std.process.Args) !ParseResul
     capture = .{ .gpa = gpa };
     var parser = zig_cli.Parser.init(gpa);
     parser.parse(root, arg_slice) catch |err| {
-        if (capture.options) |opts| gpa.free(opts.uri);
+        if (capture.options) |opts| {
+            gpa.free(opts.uri);
+            if (opts.interface) |i| gpa.free(i);
+        }
         capture.options = null;
         return err;
     };
@@ -401,4 +433,16 @@ test "normalizeArgs expands --timeout=value" {
     try std.testing.expectEqual(@as(usize, 3), normalized.len);
     try std.testing.expectEqualStrings("--timeout", normalized[0]);
     try std.testing.expectEqualStrings("5", normalized[1]);
+}
+
+test "normalizeArgs expands attached interface" {
+    const options = [_]zig_cli.Option{
+        zig_cli.Option.init("interface", "interface", "", .string).withShort('I'),
+    };
+    const raw = [_][]const u8{ "-Ieth0", "https://example.com/s/x" };
+    const normalized = try normalizeArgs(std.testing.allocator, &options, &raw);
+    defer std.testing.allocator.free(normalized);
+    try std.testing.expectEqual(@as(usize, 3), normalized.len);
+    try std.testing.expectEqualStrings("-I", normalized[0]);
+    try std.testing.expectEqualStrings("eth0", normalized[1]);
 }
