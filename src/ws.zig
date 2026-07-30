@@ -167,9 +167,19 @@ pub fn readBinaryFrame(reader: *Io.Reader, writer: *Io.Writer, io: Io, out: []u8
             try reader.readSliceAll(&ext);
             len = std.mem.readInt(u16, &ext, .big);
         } else if (len == 127) {
-            // Drain the 8-byte extended length so the stream stays aligned if the caller retries.
+            // 64-bit extended length. Frames this large never occur in Trojan-over-WS,
+            // but drain mask+payload so a caller retry reads the next frame (mirrors the
+            // len > out.len path). `discardAll` of a huge length will block until the
+            // probe deadline (DeadlineShutdown) on a live socket.
             var ext: [8]u8 = undefined;
             try reader.readSliceAll(&ext);
+            const big = std.mem.readInt(u64, &ext, .big);
+            if (big > std.math.maxInt(usize)) return error.PayloadTooLarge; // cannot represent/drain on this platform
+            if (masked) {
+                var discard_mask: [4]u8 = undefined;
+                try reader.readSliceAll(&discard_mask);
+            }
+            try reader.discardAll(@intCast(big));
             return error.PayloadTooLarge;
         }
         var mask: [4]u8 = .{ 0, 0, 0, 0 };
@@ -255,6 +265,44 @@ test "readBinaryFrame BufferTooSmall drains payload" {
     var small: [2]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, readBinaryFrame(&reader, &writer, io, &small));
     var out: [8]u8 = undefined;
+    const n = try readBinaryFrame(&reader, &writer, io, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
+}
+
+test "readBinaryFrame drains 64-bit length frame for alignment" {
+    const wire = [_]u8{
+        0x82, 0x7f, // FIN binary, 64-bit length
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, // length 3
+        'a',  'b',  'c',  0x82, 0x01, 'Z',
+    };
+    var reader: Io.Reader = .fixed(&wire);
+    var sink_buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&sink_buf);
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var out: [8]u8 = undefined;
+    try std.testing.expectError(error.PayloadTooLarge, readBinaryFrame(&reader, &writer, io, &out));
+    const n = try readBinaryFrame(&reader, &writer, io, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
+}
+
+test "readBinaryFrame drains masked 64-bit length frame" {
+    const wire = [_]u8{
+        0x82, 0xff, // FIN binary, masked, 64-bit length
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, // length 3
+        0xaa, 0xbb, 0xcc, 0xdd, // mask
+        'a',  'b',  'c', // masked payload (drained, not decoded)
+        0x82, 0x01, 'Z',
+    };
+    var reader: Io.Reader = .fixed(&wire);
+    var sink_buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&sink_buf);
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var out: [8]u8 = undefined;
+    try std.testing.expectError(error.PayloadTooLarge, readBinaryFrame(&reader, &writer, io, &out));
     const n = try readBinaryFrame(&reader, &writer, io, &out);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
