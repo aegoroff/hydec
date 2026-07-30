@@ -179,66 +179,163 @@ fn hpackHasStatus200(block: []const u8) bool {
             // Literal with incremental indexing.
             const name_idx = b & 0x3f;
             p = p[1..];
-            const is_status = blk: {
-                if (name_idx == 8) break :blk true;
-                if (name_idx != 0) break :blk false;
-                break :blk hpackMatchLiteralName(&p, ":status") catch return false;
-            };
+            const is_status = if (name_idx == 8)
+                true
+            else if (name_idx == 0)
+                hpackStringEql(&p, ":status")
+            else
+                false;
             if (!is_status) {
                 if (!hpackSkipString(&p)) return false;
                 continue;
             }
-            return hpackConsumeRawValue(&p, "200");
+            return hpackStringEql(&p, "200");
         }
         if ((b & 0xf0) == 0x00 or (b & 0xf0) == 0x10) {
             // Without indexing / never indexed — 4-bit name index.
             const name_idx = b & 0x0f;
             p = p[1..];
-            const is_status = blk: {
-                if (name_idx == 8) break :blk true;
-                if (name_idx != 0) break :blk false;
-                break :blk hpackMatchLiteralName(&p, ":status") catch return false;
-            };
+            const is_status = if (name_idx == 8)
+                true
+            else if (name_idx == 0)
+                hpackStringEql(&p, ":status")
+            else
+                false;
             if (!is_status) {
                 if (!hpackSkipString(&p)) return false;
                 continue;
             }
-            return hpackConsumeRawValue(&p, "200");
+            return hpackStringEql(&p, "200");
         }
-        // Dynamic table size update (0x20) or unknown — stop.
+        if ((b & 0xe0) == 0x20) {
+            // Dynamic table size update (RFC 7541 §4.2). We keep no dynamic table,
+            // but the new max size must be consumed so subsequent representations are
+            // found. Updates may only precede other fields in a header block.
+            _ = hpackReadInt(&p, 5) catch return false;
+            continue;
+        }
+        // Unknown representation — stop.
         return false;
     }
     return false;
 }
 
-fn hpackSkipString(p: *[]const u8) bool {
+/// RFC 7541 §5.1 integer with an N-bit prefix. Advances `p` past the integer.
+/// Rejects overlong encodings and values that exceed `usize` (§5.1 mandates
+/// implementation limits).
+fn hpackReadInt(p: *[]const u8, comptime prefix_bits: u3) error{InvalidHpack}!usize {
     const s = p.*;
-    if (s.len < 1) return false;
-    const len: usize = s[0] & 0x7f;
-    if (len == 0x7f) return false; // overlong; status values are tiny
-    if (1 + len > s.len) return false;
-    p.* = s[1 + len ..];
+    if (s.len < 1) return error.InvalidHpack;
+    const prefix_max: usize = (@as(usize, 1) << @intCast(prefix_bits)) - 1;
+    const first = s[0] & prefix_max;
+    if (first < prefix_max) {
+        p.* = s[1..];
+        return first;
+    }
+
+    // Extended form: 7-bit continuation groups (high bit = more). Mirrors readVarint.
+    var value: usize = 0;
+    var shift: u8 = 0;
+    var i: usize = 1;
+    while (i < s.len) : (i += 1) {
+        if (i >= 11) return error.InvalidHpack; // 10 groups cover >64 bits
+        const b = s[i];
+        if (shift >= @bitSizeOf(usize)) return error.InvalidHpack;
+        const bits_left = @as(u8, @bitSizeOf(usize)) - shift;
+        if (bits_left < 7 and ((b & 0x7f) >> @intCast(bits_left)) != 0)
+            return error.InvalidHpack;
+        value |= @as(usize, b & 0x7f) << @intCast(shift);
+        shift += 7;
+        if ((b & 0x80) == 0) {
+            // HPACK adds the prefix baseline to the continuation sum.
+            if (value > std.math.maxInt(usize) - prefix_max) return error.InvalidHpack;
+            value += prefix_max;
+            p.* = s[i + 1 ..];
+            return value;
+        }
+    }
+    return error.InvalidHpack;
+}
+
+fn hpackSkipString(p: *[]const u8) bool {
+    const len = hpackReadInt(p, 7) catch return false;
+    if (len > p.*.len) return false;
+    p.* = p.*[len..];
     return true;
 }
 
-fn hpackMatchLiteralName(p: *[]const u8, want: []const u8) error{InvalidHpack}!bool {
-    const s = p.*;
-    if (s.len < 1) return error.InvalidHpack;
-    if ((s[0] & 0x80) != 0) return error.InvalidHpack; // Huffman name unused for :status
-    const len: usize = s[0] & 0x7f;
-    if (len == 0x7f or 1 + len > s.len) return error.InvalidHpack;
-    const matched = std.mem.eql(u8, s[1 .. 1 + len], want);
-    p.* = s[1 + len ..];
-    return matched;
-}
-
-fn hpackConsumeRawValue(p: *[]const u8, want: []const u8) bool {
+/// Read one HPACK string literal (length + bytes) and return true when it equals
+/// `want`. Huffman-encoded literals (H bit set) are matched against the canonical
+/// encoding computed by `hpackHuffmanEncode`. Always advances `p` past the literal.
+fn hpackStringEql(p: *[]const u8, comptime want: []const u8) bool {
     const s = p.*;
     if (s.len < 1) return false;
-    if ((s[0] & 0x80) != 0) return false; // Huffman — uncommon for "200"
-    const len: usize = s[0] & 0x7f;
-    if (len == 0x7f or 1 + len > s.len) return false;
-    return std.mem.eql(u8, s[1 .. 1 + len], want);
+    const huff = (s[0] & 0x80) != 0;
+    const len = hpackReadInt(p, 7) catch return false;
+    if (len > p.*.len) return false;
+    const raw = p.*[0..len];
+    p.* = p.*[len..];
+    if (!huff) return std.mem.eql(u8, raw, want);
+    const enc = comptime hpackHuffmanEncode(want);
+    if (raw.len != enc.len) return false;
+    return std.mem.eql(u8, raw, &enc);
+}
+
+const HpackHuffCode = struct { code: u32, len: u4 };
+
+/// Subset of RFC 7541 Appendix B covering the literals matched by `hpackStringEql`
+/// (`":status"`, `"200"`). Extend if the function is reused with other strings.
+fn hpackHuffCodeFor(c: u8) ?HpackHuffCode {
+    return switch (c) {
+        '0' => .{ .code = 0b00000, .len = 5 },
+        '2' => .{ .code = 0b00010, .len = 5 },
+        ':' => .{ .code = 0b1011100, .len = 7 },
+        'a' => .{ .code = 0b00011, .len = 5 },
+        's' => .{ .code = 0b01000, .len = 5 },
+        't' => .{ .code = 0b01001, .len = 5 },
+        'u' => .{ .code = 0b101101, .len = 6 },
+        else => null,
+    };
+}
+
+/// Byte length of the canonical HPACK Huffman encoding of `s` (with EOS padding).
+fn hpackHuffmanLen(comptime s: []const u8) usize {
+    comptime {
+        var n: usize = 0;
+        for (s) |c| {
+            n += (hpackHuffCodeFor(c) orelse @compileError("hpackHuffman: unsupported symbol")).len;
+        }
+        const pad: usize = (8 - (n % 8)) % 8;
+        return (n + pad) / 8;
+    }
+}
+
+/// Canonical HPACK Huffman encoding of `s` with EOS-prefix padding (RFC 7541 §5.2),
+/// returned by value. Comptime so a symbol outside `hpackHuffCodeFor` is a build
+/// error, not a silent runtime mismatch. Sized for short literals (status name/value).
+fn hpackHuffmanEncode(comptime s: []const u8) [hpackHuffmanLen(s)]u8 {
+    comptime {
+        var bits: u128 = 0;
+        var nbits: u32 = 0;
+        for (s) |c| {
+            const e = hpackHuffCodeFor(c) orelse @compileError("hpackHuffman: unsupported symbol");
+            nbits += e.len;
+            if (nbits > 120) @compileError("hpackHuffman: literal too long");
+            bits = (bits << @intCast(e.len)) | @as(u128, e.code);
+        }
+        const pad: u32 = (8 - (nbits % 8)) % 8;
+        if (pad > 0) {
+            bits = (bits << @intCast(pad)) | ((@as(u128, 1) << @intCast(pad)) - 1);
+            nbits += pad;
+        }
+        var out: [hpackHuffmanLen(s)]u8 = undefined;
+        var i: usize = 0;
+        while (i < out.len) : (i += 1) {
+            const shift: u7 = @intCast(nbits - 8 * (i + 1));
+            out[i] = @truncate(bits >> shift);
+        }
+        return out;
+    }
 }
 
 pub fn buildDataFrame(out: []u8, stream_id: u31, payload: []const u8, end_stream: bool) error{BufferTooSmall}!usize {
@@ -327,6 +424,53 @@ test "headersIndicateStatus200 accepts literal :status 200" {
     // Wrong status
     const not_ok = [_]u8{ 0x08, 0x03, '4', '0', '4' };
     try std.testing.expect(!headersIndicateStatus200(&not_ok, 0));
+}
+
+test "hpackReadInt single-byte prefix" {
+    var p: []const u8 = &.{0x1a}; // 5-bit prefix value 26 < 31
+    try std.testing.expectEqual(@as(usize, 26), try hpackReadInt(&p, 5));
+    try std.testing.expectEqual(@as(usize, 0), p.len);
+}
+
+test "hpackReadInt extended form (RFC 7541 C.1.2: 1337, 5-bit prefix)" {
+    var p: []const u8 = &.{ 0x1f, 0x9a, 0x0a };
+    try std.testing.expectEqual(@as(usize, 1337), try hpackReadInt(&p, 5));
+    try std.testing.expectEqual(@as(usize, 0), p.len);
+}
+
+test "hpackReadInt rejects overflow and truncation" {
+    const overlong = [_]u8{0x1f} ++ ([_]u8{0xff} ** 10);
+    var p: []const u8 = &overlong;
+    try std.testing.expectError(error.InvalidHpack, hpackReadInt(&p, 5));
+    var trunc: []const u8 = &.{ 0x1f, 0xff }; // continuation never terminates
+    try std.testing.expectError(error.InvalidHpack, hpackReadInt(&trunc, 5));
+}
+
+test "hpackHuffmanEncode canonical bytes for 200 and :status" {
+    const enc_200 = comptime hpackHuffmanEncode("200");
+    try std.testing.expectEqualSlices(u8, &.{ 0x10, 0x01 }, &enc_200);
+    const enc_status = comptime hpackHuffmanEncode(":status");
+    try std.testing.expectEqualSlices(u8, &.{ 0xb8, 0x84, 0x8d, 0x36, 0xa3 }, &enc_status);
+}
+
+test "headersIndicateStatus200 skips dynamic table size update" {
+    // 0x20 = size update, max size 0; then indexed :status 200.
+    try std.testing.expect(headersIndicateStatus200(&.{ 0x20, 0x88 }, 0));
+    // Extended size update (prefix maxed + continuation) then 200.
+    try std.testing.expect(headersIndicateStatus200(&.{ 0x3f, 0x00, 0x88 }, 0));
+    // Size update before a Huffman literal :status 200.
+    try std.testing.expect(headersIndicateStatus200(&.{ 0x20, 0x48, 0x82, 0x10, 0x01 }, 0));
+}
+
+test "headersIndicateStatus200 accepts Huffman literal :status 200" {
+    // Literal without indexing, name index 8, Huffman value "200" (0x10 0x01).
+    try std.testing.expect(headersIndicateStatus200(&.{ 0x08, 0x82, 0x10, 0x01 }, 0));
+    // Incremental indexing variant.
+    try std.testing.expect(headersIndicateStatus200(&.{ 0x48, 0x82, 0x10, 0x01 }, 0));
+    // Huffman name ":status" + Huffman value "200".
+    try std.testing.expect(headersIndicateStatus200(&.{
+        0x00, 0x85, 0xb8, 0x84, 0x8d, 0x36, 0xa3, 0x82, 0x10, 0x01,
+    }, 0));
 }
 
 test "readVarint rejects overlong continuation" {
