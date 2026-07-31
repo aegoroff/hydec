@@ -101,6 +101,44 @@ fn tlsOptions(
     };
 }
 
+/// Drain until `http_buf[0..http_len]` is a complete HTTP response, or peer close
+/// ends an HTTP/1.0 close-delimited body. Updates `http_len` in place.
+fn readHttpUntilReady(
+    http_buf: []u8,
+    http_len: *usize,
+    frame_buf: []u8,
+    transport_ws: bool,
+    tls_reader: *Io.Reader,
+    tls_writer: *Io.Writer,
+    io: Io,
+    fired: *const std.atomic.Value(bool),
+) !void {
+    while (util.httpResponseTotalLen(http_buf[0..http_len.*]) == null) {
+        const n = if (transport_ws)
+            ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
+                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
+                return e;
+            }
+        else blk: {
+            const got = tls_reader.readSliceShort(frame_buf) catch |err| {
+                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
+                return e;
+            };
+            if (got == 0) {
+                const e = netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
+                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
+                return e;
+            }
+            break :blk got;
+        };
+        if (http_len.* + n > http_buf.len) return error.BufferTooSmall;
+        @memcpy(http_buf[http_len.*..][0..n], frame_buf[0..n]);
+        http_len.* += n;
+    }
+}
+
 pub fn probe(
     gpa: std.mem.Allocator,
     io: Io,
@@ -174,32 +212,7 @@ pub fn probe(
     var http_len: usize = 0;
     const frame_buf = try gpa.alloc(u8, 16384);
     defer gpa.free(frame_buf);
-    while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-        if (transport_ws) {
-            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
-                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
-                return e;
-            };
-            if (http_len + n > http_buf.len) return error.BufferTooSmall;
-            @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
-            http_len += n;
-        } else {
-            const n = tls_reader.readSliceShort(frame_buf) catch |err| {
-                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
-                return e;
-            };
-            if (n == 0) {
-                const e = netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
-                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
-                return e;
-            }
-            if (http_len + n > http_buf.len) return error.BufferTooSmall;
-            @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
-            http_len += n;
-        }
-    }
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, tls_reader, tls_writer, io, &fired);
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
         return error.ProbeResponseMismatch;
 
@@ -218,32 +231,7 @@ pub fn probe(
         };
     }
     http_len = 0;
-    while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-        if (transport_ws) {
-            const n = ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
-                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
-                return e;
-            };
-            if (http_len + n > http_buf.len) return error.BufferTooSmall;
-            @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
-            http_len += n;
-        } else {
-            const n = tls_reader.readSliceShort(frame_buf) catch |err| {
-                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
-                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
-                return e;
-            };
-            if (n == 0) {
-                const e = netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
-                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
-                return e;
-            }
-            if (http_len + n > http_buf.len) return error.BufferTooSmall;
-            @memcpy(http_buf[http_len..][0..n], frame_buf[0..n]);
-            http_len += n;
-        }
-    }
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, tls_reader, tls_writer, io, &fired);
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
         return error.ProbeResponseMismatch;
 
