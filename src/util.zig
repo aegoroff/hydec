@@ -96,47 +96,30 @@ const HostPort = struct {
     port: u16,
 };
 
-/// Split `host:port`, `[ipv6]:port`. Bare IPv6 without brackets → error.
-fn splitHostPort(address: []const u8) error{InvalidAddress}!HostPort {
-    if (address.len == 0) return error.InvalidAddress;
-
-    if (address[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, address, ']') orelse return error.InvalidAddress;
-        if (close + 1 >= address.len or address[close + 1] != ':') return error.InvalidAddress;
-        if (close + 2 >= address.len) return error.InvalidAddress;
-        const port = std.fmt.parseInt(u16, address[close + 2 ..], 10) catch return error.InvalidAddress;
-        if (close < 2) return error.InvalidAddress;
-        return .{ .host = address[1..close], .port = port };
-    }
-
-    // Bare IPv6 has multiple colons — require brackets.
-    if (std.mem.count(u8, address, ":") > 1) return error.InvalidAddress;
-
-    const colon = std.mem.lastIndexOfScalar(u8, address, ':') orelse return error.InvalidAddress;
-    if (colon == 0 or colon + 1 >= address.len) return error.InvalidAddress;
-    const port = std.fmt.parseInt(u16, address[colon + 1 ..], 10) catch return error.InvalidAddress;
-    return .{ .host = address[0..colon], .port = port };
-}
-
-/// Like `splitHostPort`, but if no port is present use `default_port`.
-/// `[ipv6]` without port also gets `default_port`. Bare IPv6 still errors.
+/// Split `host:port` / `[ipv6]:port`. No port → `default_port` (`host` or `[ipv6]`).
+/// Bare IPv6 without brackets → error.
 pub fn splitHostPortOrDefault(address: []const u8, default_port: u16) error{InvalidAddress}!HostPort {
     if (address.len == 0) return error.InvalidAddress;
 
     if (address[0] == '[') {
         const close = std.mem.indexOfScalar(u8, address, ']') orelse return error.InvalidAddress;
-        if (close + 1 == address.len) {
-            if (close < 2) return error.InvalidAddress;
-            return .{ .host = address[1..close], .port = default_port };
-        }
-        return splitHostPort(address);
+        if (close < 2) return error.InvalidAddress;
+        const host = address[1..close];
+        if (close + 1 == address.len) return .{ .host = host, .port = default_port };
+        if (address[close + 1] != ':' or close + 2 >= address.len) return error.InvalidAddress;
+        const port = std.fmt.parseInt(u16, address[close + 2 ..], 10) catch return error.InvalidAddress;
+        return .{ .host = host, .port = port };
     }
 
+    // Bare IPv6 has multiple colons — require brackets.
     if (std.mem.count(u8, address, ":") > 1) return error.InvalidAddress;
-    if (std.mem.indexOfScalar(u8, address, ':') == null) {
+
+    const colon = std.mem.lastIndexOfScalar(u8, address, ':') orelse {
         return .{ .host = address, .port = default_port };
-    }
-    return splitHostPort(address);
+    };
+    if (colon == 0 or colon + 1 >= address.len) return error.InvalidAddress;
+    const port = std.fmt.parseInt(u16, address[colon + 1 ..], 10) catch return error.InvalidAddress;
+    return .{ .host = address[0..colon], .port = port };
 }
 
 /// SOCKS5 ATYP domain for a fixed well-known host (reachable from most VPS).
@@ -335,26 +318,24 @@ test "queryParamTruthy" {
     try std.testing.expect(!queryParamTruthy("type=tcp", "allowInsecure"));
 }
 
-test "splitHostPort" {
-    const hp = try splitHostPort("192.0.2.10:8444");
-    try std.testing.expectEqualStrings("192.0.2.10", hp.host);
-    try std.testing.expectEqual(@as(u16, 8444), hp.port);
-}
-
-test "splitHostPort ipv6 bracket" {
-    const hp = try splitHostPort("[2001:db8::1]:443");
-    try std.testing.expectEqualStrings("2001:db8::1", hp.host);
-    try std.testing.expectEqual(@as(u16, 443), hp.port);
-}
-
-test "splitHostPort rejects bare ipv6" {
-    try std.testing.expectError(error.InvalidAddress, splitHostPort("2001:db8::1"));
-}
-
 test "splitHostPortOrDefault" {
-    const hp = try splitHostPortOrDefault("example.com", 443);
-    try std.testing.expectEqualStrings("example.com", hp.host);
-    try std.testing.expectEqual(@as(u16, 443), hp.port);
+    const with_port = try splitHostPortOrDefault("192.0.2.10:8444", 443);
+    try std.testing.expectEqualStrings("192.0.2.10", with_port.host);
+    try std.testing.expectEqual(@as(u16, 8444), with_port.port);
+
+    const bare = try splitHostPortOrDefault("example.com", 443);
+    try std.testing.expectEqualStrings("example.com", bare.host);
+    try std.testing.expectEqual(@as(u16, 443), bare.port);
+
+    const v6 = try splitHostPortOrDefault("[2001:db8::1]:443", 80);
+    try std.testing.expectEqualStrings("2001:db8::1", v6.host);
+    try std.testing.expectEqual(@as(u16, 443), v6.port);
+
+    const v6_default = try splitHostPortOrDefault("[2001:db8::1]", 443);
+    try std.testing.expectEqualStrings("2001:db8::1", v6_default.host);
+    try std.testing.expectEqual(@as(u16, 443), v6_default.port);
+
+    try std.testing.expectError(error.InvalidAddress, splitHostPortOrDefault("2001:db8::1", 443));
 }
 
 test "httpResponseTotalLen needs Content-Length body" {
