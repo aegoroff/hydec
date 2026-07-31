@@ -16,31 +16,13 @@ const HkdfSha256 = std.crypto.kdf.hkdf.Hkdf(HmacSha256);
 const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 const named_group_x25519: u16 = 0x001d;
 
-fn putU16(buf: []u8, v: u16) void {
-    std.mem.writeInt(u16, buf[0..2], v, .big);
-}
-
-fn putU24(buf: []u8, v: u24) void {
-    buf[0] = @intCast((v >> 16) & 0xff);
-    buf[1] = @intCast((v >> 8) & 0xff);
-    buf[2] = @intCast(v & 0xff);
-}
-
-fn readU16(buf: []const u8) u16 {
-    return std.mem.readInt(u16, buf[0..2], .big);
-}
-
-fn readU24(buf: []const u8) u24 {
-    return (@as(u24, buf[0]) << 16) | (@as(u24, buf[1]) << 8) | buf[2];
-}
-
 /// Post-handshake TLS 1.3 messages (typ 22). NewSessionTicket is ignorable;
 /// KeyUpdate would require traffic-secret rotation we do not keep — fail closed.
 fn rejectPostHandshakeKeyUpdate(plaintext: []const u8) !void {
     var off: usize = 0;
     while (off + 4 <= plaintext.len) {
         const ht = plaintext[off];
-        const hl = readU24(plaintext[off + 1 ..][0..3]);
+        const hl = std.mem.readInt(u24, plaintext[off + 1 ..][0..3], .big);
         if (off + 4 + hl > plaintext.len) break;
         if (ht == 24) return error.TlsKeyUpdateUnsupported;
         off += 4 + hl;
@@ -171,12 +153,12 @@ const RecordConn = struct {
 
         // AAD = TLSCiphertext header: type=23, version=0x0303, length=inner_len+16
         var aad: [5]u8 = .{ 23, 0x03, 0x03, 0, 0 };
-        putU16(aad[3..5], @intCast(inner_len + 16));
+        std.mem.writeInt(u16, aad[3..5], @intCast(inner_len + 16), .big);
         Aes128Gcm.encrypt(ciphertext[0..inner_len], &tag, inner[0..inner_len], &aad, nonce, key);
         @memcpy(ciphertext[inner_len..][0..16], &tag);
 
         var hdr: [5]u8 = .{ 23, 0x03, 0x03, 0, 0 };
-        putU16(hdr[3..5], @intCast(inner_len + 16));
+        std.mem.writeInt(u16, hdr[3..5], @intCast(inner_len + 16), .big);
         try self.writer.writeAll(&hdr);
         try self.writer.writeAll(ciphertext[0 .. inner_len + 16]);
         try self.writer.flush();
@@ -186,7 +168,7 @@ const RecordConn = struct {
 
     fn writeClear(self: *RecordConn, content_type: u8, data: []const u8) !void {
         var hdr: [5]u8 = .{ content_type, 0x03, 0x01, 0, 0 };
-        putU16(hdr[3..5], @intCast(data.len));
+        std.mem.writeInt(u16, hdr[3..5], @intCast(data.len), .big);
         try self.writer.writeAll(&hdr);
         try self.writer.writeAll(data);
         try self.writer.flush();
@@ -201,7 +183,7 @@ const RecordConn = struct {
             var hdr: [5]u8 = undefined;
             try self.reader.readSliceAll(&hdr);
             const content_type = hdr[0];
-            const length = readU16(hdr[3..5]);
+            const length = std.mem.readInt(u16, hdr[3..5], .big);
             if (length > 16640) return error.TlsRecordOverflow;
 
             var payload: [16640]u8 = undefined;
@@ -221,7 +203,7 @@ const RecordConn = struct {
                 const seq = if (handshake_keys) self.hs_read_seq else self.read_seq;
                 const nonce = xorNonce(&iv, seq);
                 var aad: [5]u8 = .{ 23, 0x03, 0x03, 0, 0 };
-                putU16(aad[3..5], length);
+                std.mem.writeInt(u16, aad[3..5], length, .big);
                 var plain: [16640]u8 = undefined;
                 var tag: [16]u8 = undefined;
                 @memcpy(&tag, payload[ct_len..][0..16]);
@@ -273,26 +255,26 @@ fn parseServerHelloX25519(sh_body: []const u8) ![32]u8 {
     const sid_echo_len = sh_body[pos];
     pos += 1 + sid_echo_len;
     if (pos + 3 > sh_body.len) return error.TlsDecodeError;
-    const suite = readU16(sh_body[pos..][0..2]);
+    const suite = std.mem.readInt(u16, sh_body[pos..][0..2], .big);
     pos += 2;
     pos += 1; // compression
     if (suite != TLS_AES_128_GCM_SHA256) return error.UnsupportedCipherSuite;
 
     if (pos + 2 > sh_body.len) return error.TlsDecodeError;
-    const ext_len = readU16(sh_body[pos..][0..2]);
+    const ext_len = std.mem.readInt(u16, sh_body[pos..][0..2], .big);
     pos += 2;
     if (pos + ext_len > sh_body.len) return error.TlsDecodeError;
     const ext_end = pos + ext_len;
 
     var server_x25519: ?[32]u8 = null;
     while (pos + 4 <= ext_end) {
-        const et = readU16(sh_body[pos..][0..2]);
-        const el = readU16(sh_body[pos + 2 ..][0..2]);
+        const et = std.mem.readInt(u16, sh_body[pos..][0..2], .big);
+        const el = std.mem.readInt(u16, sh_body[pos + 2 ..][0..2], .big);
         pos += 4;
         if (pos + el > ext_end) return error.TlsDecodeError;
         if (et == 51 and el >= 4 + 32) { // key_share
-            const group = readU16(sh_body[pos..][0..2]);
-            const klen = readU16(sh_body[pos + 2 ..][0..2]);
+            const group = std.mem.readInt(u16, sh_body[pos..][0..2], .big);
+            const klen = std.mem.readInt(u16, sh_body[pos + 2 ..][0..2], .big);
             if (group == named_group_x25519 and klen == 32) {
                 var pubk: [32]u8 = undefined;
                 @memcpy(&pubk, sh_body[pos + 4 ..][0..32]);
@@ -314,7 +296,7 @@ fn buildClientHello(
     var body: [2048]u8 = undefined;
     var i: usize = 0;
 
-    putU16(body[i..][0..2], 0x0303);
+    std.mem.writeInt(u16, body[i..][0..2], 0x0303, .big);
     i += 2;
     @memcpy(body[i..][0..32], client_random);
     i += 32;
@@ -324,9 +306,9 @@ fn buildClientHello(
     i += 32;
 
     // TLS_AES_128_GCM_SHA256 only (keeps record AEAD key length at 16)
-    putU16(body[i..][0..2], 2);
+    std.mem.writeInt(u16, body[i..][0..2], 2, .big);
     i += 2;
-    putU16(body[i..][0..2], TLS_AES_128_GCM_SHA256);
+    std.mem.writeInt(u16, body[i..][0..2], TLS_AES_128_GCM_SHA256, .big);
     i += 2;
 
     body[i] = 1;
@@ -339,19 +321,19 @@ fn buildClientHello(
     const ext_start = i;
 
     // supported_versions: TLS 1.3 only
-    putU16(body[i..][0..2], 43);
+    std.mem.writeInt(u16, body[i..][0..2], 43, .big);
     i += 2;
-    putU16(body[i..][0..2], 3);
+    std.mem.writeInt(u16, body[i..][0..2], 3, .big);
     i += 2;
     body[i] = 2;
     i += 1;
-    putU16(body[i..][0..2], 0x0304);
+    std.mem.writeInt(u16, body[i..][0..2], 0x0304, .big);
     i += 2;
 
     // psk_key_exchange_modes: psk_dhe_ke
-    putU16(body[i..][0..2], 45);
+    std.mem.writeInt(u16, body[i..][0..2], 45, .big);
     i += 2;
-    putU16(body[i..][0..2], 2);
+    std.mem.writeInt(u16, body[i..][0..2], 2, .big);
     i += 2;
     body[i] = 1;
     i += 1;
@@ -359,38 +341,38 @@ fn buildClientHello(
     i += 1;
 
     // supported_groups: x25519
-    putU16(body[i..][0..2], 10);
+    std.mem.writeInt(u16, body[i..][0..2], 10, .big);
     i += 2;
-    putU16(body[i..][0..2], 4);
+    std.mem.writeInt(u16, body[i..][0..2], 4, .big);
     i += 2;
-    putU16(body[i..][0..2], 2);
+    std.mem.writeInt(u16, body[i..][0..2], 2, .big);
     i += 2;
-    putU16(body[i..][0..2], named_group_x25519);
+    std.mem.writeInt(u16, body[i..][0..2], named_group_x25519, .big);
     i += 2;
 
     // key_share: x25519
-    putU16(body[i..][0..2], 51);
+    std.mem.writeInt(u16, body[i..][0..2], 51, .big);
     i += 2;
-    putU16(body[i..][0..2], 38);
+    std.mem.writeInt(u16, body[i..][0..2], 38, .big);
     i += 2;
-    putU16(body[i..][0..2], 36);
+    std.mem.writeInt(u16, body[i..][0..2], 36, .big);
     i += 2;
-    putU16(body[i..][0..2], named_group_x25519);
+    std.mem.writeInt(u16, body[i..][0..2], named_group_x25519, .big);
     i += 2;
-    putU16(body[i..][0..2], 32);
+    std.mem.writeInt(u16, body[i..][0..2], 32, .big);
     i += 2;
     @memcpy(body[i..][0..32], x25519_pub);
     i += 32;
 
     // signature_algorithms
-    putU16(body[i..][0..2], 13);
+    std.mem.writeInt(u16, body[i..][0..2], 13, .big);
     i += 2;
-    putU16(body[i..][0..2], 12);
+    std.mem.writeInt(u16, body[i..][0..2], 12, .big);
     i += 2;
-    putU16(body[i..][0..2], 10);
+    std.mem.writeInt(u16, body[i..][0..2], 10, .big);
     i += 2;
     inline for (.{ 0x0403, 0x0804, 0x0805, 0x0806, 0x0807 }) |scheme| {
-        putU16(body[i..][0..2], scheme);
+        std.mem.writeInt(u16, body[i..][0..2], scheme, .big);
         i += 2;
     }
 
@@ -399,15 +381,15 @@ fn buildClientHello(
         if (sni.len > 255) return error.SniTooLong;
         const sni_need = 2 + 2 + 2 + 1 + 2 + sni.len;
         if (i + sni_need > body.len) return error.BufferTooSmall;
-        putU16(body[i..][0..2], 0);
+        std.mem.writeInt(u16, body[i..][0..2], 0, .big);
         i += 2;
-        putU16(body[i..][0..2], @intCast(2 + 1 + 2 + sni.len));
+        std.mem.writeInt(u16, body[i..][0..2], @intCast(2 + 1 + 2 + sni.len), .big);
         i += 2;
-        putU16(body[i..][0..2], @intCast(1 + 2 + sni.len));
+        std.mem.writeInt(u16, body[i..][0..2], @intCast(1 + 2 + sni.len), .big);
         i += 2;
         body[i] = 0;
         i += 1;
-        putU16(body[i..][0..2], @intCast(sni.len));
+        std.mem.writeInt(u16, body[i..][0..2], @intCast(sni.len), .big);
         i += 2;
         @memcpy(body[i..][0..sni.len], sni);
         i += sni.len;
@@ -418,11 +400,11 @@ fn buildClientHello(
         const p1 = "h2";
         const p2 = "http/1.1";
         const list_len: usize = (1 + p1.len) + (1 + p2.len);
-        putU16(body[i..][0..2], 16);
+        std.mem.writeInt(u16, body[i..][0..2], 16, .big);
         i += 2;
-        putU16(body[i..][0..2], @intCast(2 + list_len));
+        std.mem.writeInt(u16, body[i..][0..2], @intCast(2 + list_len), .big);
         i += 2;
-        putU16(body[i..][0..2], @intCast(list_len));
+        std.mem.writeInt(u16, body[i..][0..2], @intCast(list_len), .big);
         i += 2;
         body[i] = @intCast(p1.len);
         i += 1;
@@ -434,12 +416,12 @@ fn buildClientHello(
         i += p2.len;
     }
 
-    putU16(body[ext_len_at..][0..2], @intCast(i - ext_start));
+    std.mem.writeInt(u16, body[ext_len_at..][0..2], @intCast(i - ext_start), .big);
 
     const hs_len = i;
     if (out.len < 4 + hs_len) return error.BufferTooSmall;
     out[0] = 1;
-    putU24(out[1..4], @intCast(hs_len));
+    std.mem.writeInt(u24, out[1..4], @intCast(hs_len), .big);
     @memcpy(out[4..][0..hs_len], body[0..hs_len]);
     return 4 + hs_len;
 }
@@ -606,7 +588,7 @@ const RealityConn = struct {
         const ct_len = length - 16;
         const nonce = RecordConn.xorNonce(&self.conn.server_iv, self.conn.read_seq);
         var aad: [5]u8 = .{ 23, 0x03, 0x03, 0, 0 };
-        putU16(aad[3..5], @intCast(length));
+        std.mem.writeInt(u16, aad[3..5], @intCast(length), .big);
         var plain: [16640]u8 = undefined;
         var tag: [16]u8 = undefined;
         @memcpy(&tag, payload[ct_len..][0..16]);
@@ -722,7 +704,7 @@ fn connect(
     // Parse ServerHello for key_share
     if (sh_rec.len < 4) return error.TlsDecodeError;
     if (sh_buf[0] != 2) return error.TlsUnexpectedMessage;
-    const sh_body_len = readU24(sh_buf[1..4]);
+    const sh_body_len = std.mem.readInt(u24, sh_buf[1..4], .big);
     if (4 + sh_body_len > sh_rec.len) return error.TlsDecodeError;
     const sh_body = sh_buf[4 .. 4 + sh_body_len];
     const server_share = try parseServerHelloX25519(sh_body);
@@ -778,7 +760,7 @@ fn connect(
         var off: usize = 0;
         while (off + 4 <= hs_pending_len) {
             const ht = hs_pending[off];
-            const hl = readU24(hs_pending[off + 1 ..][0..3]);
+            const hl = std.mem.readInt(u24, hs_pending[off + 1 ..][0..3], .big);
             // Bound claimed length so a hostile/corrupt peer cannot fill the pending buffer forever.
             if (hl > 16384) return error.TlsDecodeError;
             if (off + 4 + hl > hs_pending_len) break;
@@ -815,7 +797,7 @@ fn connect(
     const finished_verify = tls.hmac(HmacSha256, &hs_hash, client_fin_key);
     var fin_msg: [4 + 32]u8 = undefined;
     fin_msg[0] = 20;
-    putU24(fin_msg[1..4], 32);
+    std.mem.writeInt(u24, fin_msg[1..4], 32, .big);
     @memcpy(fin_msg[4..], &finished_verify);
     try rc.writeHandshake(&fin_msg);
 
@@ -1342,28 +1324,28 @@ fn shiftDown(buf: []u8, len: *usize, n: usize) void {
 
 fn appendServerHelloMinimal(buf: []u8, key_share: *const [32]u8, ext_len_override: ?u16) !usize {
     var i: usize = 0;
-    putU16(buf[i..][0..2], 0x0303);
+    std.mem.writeInt(u16, buf[i..][0..2], 0x0303, .big);
     i += 2;
     @memset(buf[i..][0..32], 0xaa);
     i += 32;
     buf[i] = 0; // empty session id
     i += 1;
-    putU16(buf[i..][0..2], TLS_AES_128_GCM_SHA256);
+    std.mem.writeInt(u16, buf[i..][0..2], TLS_AES_128_GCM_SHA256, .big);
     i += 2;
     buf[i] = 0; // compression
     i += 1;
 
     const ext_payload_len: u16 = 4 + 4 + 32; // type+len + group+klen+key
     const ext_len = ext_len_override orelse ext_payload_len;
-    putU16(buf[i..][0..2], ext_len);
+    std.mem.writeInt(u16, buf[i..][0..2], ext_len, .big);
     i += 2;
-    putU16(buf[i..][0..2], 51); // key_share
+    std.mem.writeInt(u16, buf[i..][0..2], 51, .big); // key_share
     i += 2;
-    putU16(buf[i..][0..2], 4 + 32);
+    std.mem.writeInt(u16, buf[i..][0..2], 4 + 32, .big);
     i += 2;
-    putU16(buf[i..][0..2], named_group_x25519);
+    std.mem.writeInt(u16, buf[i..][0..2], named_group_x25519, .big);
     i += 2;
-    putU16(buf[i..][0..2], 32);
+    std.mem.writeInt(u16, buf[i..][0..2], 32, .big);
     i += 2;
     @memcpy(buf[i..][0..32], key_share);
     i += 32;
