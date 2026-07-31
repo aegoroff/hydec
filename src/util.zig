@@ -219,15 +219,11 @@ fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?usize {
     }
 }
 
-/// True when `buf` looks like a Cloudflare `/cdn-cgi/trace` body.
-/// Used to reject generic HTTP 400/empty pages from REALITY dest fallback.
-pub fn looksLikeCloudflareTrace(buf: []const u8) bool {
-    return std.mem.indexOf(u8, buf, "visit_scheme=") != null;
-}
-
-/// Like `looksLikeCloudflareTrace`, but also requires the echoed `uag=` line.
+/// True when `buf` looks like Cloudflare `/cdn-cgi/trace` and echoes `uag=`.
+/// Rejects generic HTTP 400/empty pages from REALITY dest fallback and stale
+/// warmup copies (wrong UA).
 pub fn looksLikeCloudflareTraceUag(buf: []const u8, uag: []const u8) bool {
-    if (!looksLikeCloudflareTrace(buf)) return false;
+    if (std.mem.indexOf(u8, buf, "visit_scheme=") == null) return false;
     var needle_buf: [64]u8 = undefined;
     const needle = std.fmt.bufPrint(&needle_buf, "uag={s}", .{uag}) catch return false;
     return std.mem.indexOf(u8, buf, needle) != null;
@@ -265,17 +261,14 @@ test "writeSocksAddrDomain rejects domain longer than 255" {
     try std.testing.expectError(error.DomainTooLong, writeSocksAddrDomain(&buf, &long, 80));
 }
 
-test "looksLikeCloudflareTrace" {
-    try std.testing.expect(looksLikeCloudflareTrace("fl=1\nh=cp.cloudflare.com\nvisit_scheme=http\n"));
-    try std.testing.expect(!looksLikeCloudflareTrace("HTTP/1.1 400 Bad Request\r\n\r\n"));
-    try std.testing.expect(!looksLikeCloudflareTrace("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"));
-}
-
 test "looksLikeCloudflareTraceUag matches echoed UA" {
     const body = "fl=1\nvisit_scheme=http\nuag=hydec-steady\n";
     try std.testing.expect(looksLikeCloudflareTraceUag(body, probe_ua_steady));
     try std.testing.expect(!looksLikeCloudflareTraceUag(body, probe_ua_warmup));
     try std.testing.expect(!looksLikeCloudflareTraceUag("fl=1\nvisit_scheme=http\nuag=curl\n", probe_ua_steady));
+    // Not a Cloudflare trace body (no visit_scheme=).
+    try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 400 Bad Request\r\n\r\n", probe_ua_steady));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", probe_ua_steady));
 }
 
 test "urlDecodeStrict keeps plus" {
