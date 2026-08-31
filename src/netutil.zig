@@ -522,6 +522,10 @@ pub fn remainingTimeoutNs(start_ns: i128, io: Io, timeout_secs: u32) u64 {
 /// Genuine timeouts always become `Timeout`. `shutdown(2)`-induced EOF/reset
 /// map to `Timeout` only when the watchdog fired (`fired == true`); otherwise
 /// they pass through so callers can distinguish "slow" from "rejected".
+///
+/// Zig `Io.Writer`/`Io.Reader` collapse socket failures to `WriteFailed`/
+/// `ReadFailed`; prefer `classifyIoErr` to unwrap `Stream.Writer.err` /
+/// `Stream.Reader.err` first. When still collapsed, map to `Timeout` if fired.
 pub fn classifyDeadlineErr(err: anyerror, fired: bool) anyerror {
     return switch (err) {
         error.ConnectionTimedOut,
@@ -535,9 +539,23 @@ pub fn classifyDeadlineErr(err: anyerror, fired: bool) anyerror {
         error.SocketUnconnected,
         error.NotOpenForReading,
         error.NotOpenForWriting,
+        error.WriteFailed,
+        error.ReadFailed,
         => if (fired) error.Timeout else err,
         else => err,
     };
+}
+
+/// Prefer socket causes on `Stream.Writer.err` / `Stream.Reader.err` over opaque
+/// `WriteFailed` / `ReadFailed`, then apply `classifyDeadlineErr`.
+pub fn classifyIoErr(err: anyerror, writer_err: ?anyerror, reader_err: ?anyerror, fired: bool) anyerror {
+    const cause: anyerror = if (err == error.WriteFailed)
+        (writer_err orelse err)
+    else if (err == error.ReadFailed)
+        (reader_err orelse err)
+    else
+        err;
+    return classifyDeadlineErr(cause, fired);
 }
 
 test "classifyDeadlineErr: genuine timeouts always map to Timeout" {
@@ -552,6 +570,8 @@ test "classifyDeadlineErr: shutdown-induced errors map to Timeout only when fire
     try std.testing.expect(classifyDeadlineErr(error.ConnectionResetByPeer, false) == error.ConnectionResetByPeer);
     try std.testing.expect(classifyDeadlineErr(error.TlsConnectionTruncated, false) == error.TlsConnectionTruncated);
     try std.testing.expect(classifyDeadlineErr(error.BrokenPipe, false) == error.BrokenPipe);
+    try std.testing.expect(classifyDeadlineErr(error.WriteFailed, false) == error.WriteFailed);
+    try std.testing.expect(classifyDeadlineErr(error.ReadFailed, false) == error.ReadFailed);
 
     try std.testing.expect(classifyDeadlineErr(error.EndOfStream, true) == error.Timeout);
     try std.testing.expect(classifyDeadlineErr(error.UnexpectedEndOfStream, true) == error.Timeout);
@@ -560,6 +580,8 @@ test "classifyDeadlineErr: shutdown-induced errors map to Timeout only when fire
     try std.testing.expect(classifyDeadlineErr(error.BrokenPipe, true) == error.Timeout);
     try std.testing.expect(classifyDeadlineErr(error.SocketUnconnected, false) == error.SocketUnconnected);
     try std.testing.expect(classifyDeadlineErr(error.SocketUnconnected, true) == error.Timeout);
+    try std.testing.expect(classifyDeadlineErr(error.WriteFailed, true) == error.Timeout);
+    try std.testing.expect(classifyDeadlineErr(error.ReadFailed, true) == error.Timeout);
 }
 
 test "classifyDeadlineErr: unrelated and protocol errors pass through" {
@@ -568,4 +590,15 @@ test "classifyDeadlineErr: unrelated and protocol errors pass through" {
     try std.testing.expect(classifyDeadlineErr(error.TlsUnexpectedMessage, false) == error.TlsUnexpectedMessage);
     try std.testing.expect(classifyDeadlineErr(error.TlsUnexpectedMessage, true) == error.TlsUnexpectedMessage);
     try std.testing.expect(classifyDeadlineErr(error.AuthenticationFailed, true) == error.AuthenticationFailed);
+}
+
+test "classifyIoErr unwraps WriteFailed/ReadFailed before classify" {
+    try std.testing.expect(classifyIoErr(error.WriteFailed, error.BrokenPipe, null, false) == error.BrokenPipe);
+    try std.testing.expect(classifyIoErr(error.WriteFailed, error.BrokenPipe, null, true) == error.Timeout);
+    try std.testing.expect(classifyIoErr(error.ReadFailed, null, error.EndOfStream, false) == error.EndOfStream);
+    try std.testing.expect(classifyIoErr(error.ReadFailed, null, error.EndOfStream, true) == error.Timeout);
+    // No cause stored: still Timeout when fired.
+    try std.testing.expect(classifyIoErr(error.WriteFailed, null, null, true) == error.Timeout);
+    try std.testing.expect(classifyIoErr(error.ReadFailed, null, null, false) == error.ReadFailed);
+    try std.testing.expect(classifyIoErr(error.AuthenticationFailed, error.BrokenPipe, error.EndOfStream, true) == error.AuthenticationFailed);
 }

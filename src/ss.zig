@@ -243,12 +243,12 @@ pub fn probe(
     var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
 
-    w.interface.writeAll(packet[0..off]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
-    w.interface.flush() catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+    w.interface.writeAll(packet[0..off]) catch |err| return netutil.classifyIoErr(err, w.err, null, fired.load(.acquire));
+    w.interface.flush() catch |err| return netutil.classifyIoErr(err, w.err, null, fired.load(.acquire));
 
     netutil.waitReadableUntil(stream, io, read_deadline_ns) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     var server_salt: [32]u8 = undefined;
-    r.interface.readSliceAll(server_salt[0..method.saltLen()]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+    r.interface.readSliceAll(server_salt[0..method.saltLen()]) catch |err| return netutil.classifyIoErr(err, null, r.err, fired.load(.acquire));
 
     var server_subkey: [32]u8 = undefined;
     @memset(&server_subkey, 0);
@@ -263,8 +263,8 @@ pub fn probe(
     var steady_pkt: [512]u8 = undefined;
     const steady_len = try sealChunk(&ctx, &steady_pkt, util.probe_http_steady);
     const steady_start = netutil.monoNow(io);
-    w.interface.writeAll(steady_pkt[0..steady_len]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
-    w.interface.flush() catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+    w.interface.writeAll(steady_pkt[0..steady_len]) catch |err| return netutil.classifyIoErr(err, w.err, null, fired.load(.acquire));
+    w.interface.flush() catch |err| return netutil.classifyIoErr(err, w.err, null, fired.load(.acquire));
 
     const chunk_buf = try gpa.alloc(u8, max_chunk_payload);
     defer gpa.free(chunk_buf);
@@ -275,7 +275,7 @@ pub fn probe(
     // Warmup response (request was in the initial flight).
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         const n = readOpenChunk(&server_ctx, &r.interface, http_buf[http_len..], chunk_buf) catch |err| {
-            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            const e = netutil.classifyIoErr(err, null, r.err, fired.load(.acquire));
             // HTTP/1.0 close-delimited only — truncated CL/chunked must fail.
             if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
             return e;
@@ -289,7 +289,7 @@ pub fn probe(
     http_len = 0;
     while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
         const n = readOpenChunk(&server_ctx, &r.interface, http_buf[http_len..], chunk_buf) catch |err| {
-            const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            const e = netutil.classifyIoErr(err, null, r.err, fired.load(.acquire));
             if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
             return e;
         };

@@ -110,19 +110,21 @@ fn readHttpUntilReady(
     transport_ws: bool,
     tls_reader: *Io.Reader,
     tls_writer: *Io.Writer,
+    stream_reader: *const Io.net.Stream.Reader,
+    stream_writer: *const Io.net.Stream.Writer,
     io: Io,
     fired: *const std.atomic.Value(bool),
 ) !void {
     while (util.httpResponseTotalLen(http_buf[0..http_len.*]) == null) {
         const n = if (transport_ws)
             ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
-                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+                const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
                 if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
                 return e;
             }
         else blk: {
             const got = tls_reader.readSliceShort(frame_buf) catch |err| {
-                const e = netutil.classifyDeadlineErr(err, fired.load(.acquire));
+                const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
                 if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
                 return e;
             };
@@ -185,7 +187,7 @@ pub fn probe(
         &stream_reader.interface,
         &stream_writer.interface,
         tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, allow_insecure, bundle),
-    ) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+    ) catch |err| return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
 
     const tls_reader = &tls_client.reader;
     const tls_writer = &tls_client.writer;
@@ -193,17 +195,25 @@ pub fn probe(
     if (transport_ws) {
         const path = if (ws_path.len > 0) ws_path else "/";
         const host_hdr = if (ws_host.len > 0) ws_host else sni_use;
-        ws.performUpgrade(tls_reader, tls_writer, io, path, host_hdr) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+        ws.performUpgrade(tls_reader, tls_writer, io, path, host_hdr) catch |err| {
+            return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
+        };
     }
 
     var req_buf: [256]u8 = undefined;
     const req_len = try buildRequest(password, &req_buf);
 
     if (transport_ws) {
-        ws.writeBinaryFrame(tls_writer, io, req_buf[0..req_len]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+        ws.writeBinaryFrame(tls_writer, io, req_buf[0..req_len]) catch |err| {
+            return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
+        };
     } else {
-        tls_writer.writeAll(req_buf[0..req_len]) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
-        tls_writer.flush() catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+        tls_writer.writeAll(req_buf[0..req_len]) catch |err| {
+            return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
+        };
+        tls_writer.flush() catch |err| {
+            return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
+        };
     }
 
     // Warmup: drain first HTTP response; require echoed warmup UA (same as gRPC/SS/Vision).
@@ -212,7 +222,7 @@ pub fn probe(
     var http_len: usize = 0;
     const frame_buf = try gpa.alloc(u8, 16384);
     defer gpa.free(frame_buf);
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, tls_reader, tls_writer, io, &fired);
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, tls_reader, tls_writer, &stream_reader, &stream_writer, io, &fired);
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
         return error.ProbeResponseMismatch;
 
@@ -220,18 +230,18 @@ pub fn probe(
     const steady_start = netutil.monoNow(io);
     if (transport_ws) {
         ws.writeBinaryFrame(tls_writer, io, util.probe_http_steady) catch |err| {
-            return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     } else {
         tls_writer.writeAll(util.probe_http_steady) catch |err| {
-            return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
         tls_writer.flush() catch |err| {
-            return netutil.classifyDeadlineErr(err, fired.load(.acquire));
+            return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     }
     http_len = 0;
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, tls_reader, tls_writer, io, &fired);
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, tls_reader, tls_writer, &stream_reader, &stream_writer, io, &fired);
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
         return error.ProbeResponseMismatch;
 
