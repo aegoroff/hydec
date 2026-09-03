@@ -264,7 +264,10 @@ fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
 }
 
 fn decodeUserinfo(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
-    return util.decodeBase64Url(gpa, encoded, false);
+    // SIP002: userinfo may percent-encode `+` `/` `=` before base64(method:password).
+    const pct = try util.urlDecodeStrict(gpa, encoded);
+    defer gpa.free(pct);
+    return util.decodeBase64Url(gpa, pct, false);
 }
 
 test "parse vless" {
@@ -302,6 +305,19 @@ test "parse ss sip002" {
     try std.testing.expectEqualStrings("test-password", p.password.?);
     try std.testing.expectEqual(@as(u16, 2060), p.port);
     try std.testing.expectEqualStrings("tag", p.name.?);
+}
+
+test "parse ss sip002 percent-encoded userinfo" {
+    const gpa = std.testing.allocator;
+    // base64(aes-256-gcm:p@ss/word!) with padding as %3D (SIP002)
+    const line =
+        \\ss://YWVzLTI1Ni1nY206cEBzcy93b3JkIQ%3D%3D@192.0.2.10:2060#tag
+    ;
+    var p = try parse(gpa, line);
+    defer p.deinit(gpa);
+    try std.testing.expectEqualStrings("aes-256-gcm", p.method.?);
+    try std.testing.expectEqualStrings("p@ss/word!", p.password.?);
+    try std.testing.expectEqual(@as(u16, 2060), p.port);
 }
 
 test "parse ss legacy owns host" {
