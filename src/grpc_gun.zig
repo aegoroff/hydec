@@ -9,11 +9,22 @@ pub fn wrapGrpc(out: []u8, message: []const u8) error{BufferTooSmall}!usize {
     return 5 + message.len;
 }
 
+/// Cap for one gun-lite message (probe CF traces are tiny; rejects hostile length prefixes).
+pub const max_grpc_message_len: u32 = 16384;
+
+/// Length of the first complete gRPC frame in `buf`, or null if more DATA bytes are needed.
+pub fn completeGrpcFrameLen(buf: []const u8) error{InvalidGrpcFrame}!?usize {
+    if (buf.len < 5) return null;
+    const body_len = std.mem.readInt(u32, buf[1..5], .big);
+    if (body_len > max_grpc_message_len) return error.InvalidGrpcFrame;
+    const total: usize = 5 + body_len;
+    if (buf.len < total) return null;
+    return total;
+}
+
 fn unwrapGrpc(frame: []const u8) error{InvalidGrpcFrame}![]const u8 {
-    if (frame.len < 5) return error.InvalidGrpcFrame;
-    const len = std.mem.readInt(u32, frame[1..5], .big);
-    if (5 + len > frame.len) return error.InvalidGrpcFrame;
-    return frame[5 .. 5 + len];
+    const total = try completeGrpcFrameLen(frame) orelse return error.InvalidGrpcFrame;
+    return frame[5..total];
 }
 
 /// xray/sing-box gun: `message Hunk { bytes data = 1; }`
@@ -389,6 +400,21 @@ test "wrapGrpc roundtrip" {
     var buf: [64]u8 = undefined;
     const n = try wrapGrpc(&buf, "hello");
     try std.testing.expectEqualStrings("hello", try unwrapGrpc(buf[0..n]));
+}
+
+test "completeGrpcFrameLen reassembles across splits" {
+    var frame: [64]u8 = undefined;
+    const n = try wrapGrpc(&frame, "hello");
+    try std.testing.expectEqual(@as(?usize, null), try completeGrpcFrameLen(frame[0..0]));
+    try std.testing.expectEqual(@as(?usize, null), try completeGrpcFrameLen(frame[0..3]));
+    try std.testing.expectEqual(@as(?usize, null), try completeGrpcFrameLen(frame[0 .. n - 1]));
+    try std.testing.expectEqual(@as(usize, n), (try completeGrpcFrameLen(frame[0..n])).?);
+    try std.testing.expectEqualStrings("hello", try unwrapGrpc(frame[0..n]));
+}
+
+test "completeGrpcFrameLen rejects oversized length" {
+    const hdr = [_]u8{ 0, 0, 0, 0x40, 0x01 }; // body_len = 16385
+    try std.testing.expectError(error.InvalidGrpcFrame, completeGrpcFrameLen(&hdr));
 }
 
 test "preface starts correctly" {
