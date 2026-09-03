@@ -57,6 +57,12 @@ pub const Proxy = struct {
     pub fn getParam(self: Proxy, key: []const u8) ?[]const u8 {
         return util.getQueryParam(self.query, key);
     }
+
+    /// Percent-decoded query value; caller owns the slice. `null` if the key is absent.
+    pub fn getParamDecoded(self: Proxy, gpa: std.mem.Allocator, key: []const u8) !?[]u8 {
+        const raw = util.getQueryParam(self.query, key) orelse return null;
+        return try util.urlDecodeStrict(gpa, raw);
+    }
 };
 
 fn startsWithScheme(line: []const u8, scheme: []const u8) bool {
@@ -284,6 +290,23 @@ test "parse vless" {
     try std.testing.expect(p.transport == .tcp);
     try std.testing.expectEqualStrings("00000000-1111-2222-3333-444444444444", p.userinfo);
     try std.testing.expectEqualStrings("tag", p.name.?);
+}
+
+test "getParamDecoded percent-decodes probe values" {
+    const gpa = std.testing.allocator;
+    const line =
+        \\vless://00000000-1111-2222-3333-444444444444@192.0.2.10:8444?security=reality&type=grpc&serviceName=foo%2Fbar&sni=a%2Eb.example&pbk=AAAA&sid=01
+    ;
+    var p = try parse(gpa, line);
+    defer p.deinit(gpa);
+    const service = try p.getParamDecoded(gpa, "serviceName");
+    defer gpa.free(service.?);
+    try std.testing.expectEqualStrings("foo/bar", service.?);
+    const sni = try p.getParamDecoded(gpa, "sni");
+    defer gpa.free(sni.?);
+    try std.testing.expectEqualStrings("a.b.example", sni.?);
+    // Raw getParam stays encoded
+    try std.testing.expectEqualStrings("foo%2Fbar", p.getParam("serviceName").?);
 }
 
 test "classify case-insensitive scheme" {

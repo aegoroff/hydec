@@ -103,11 +103,15 @@ pub fn probeOne(
             break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, timeout_secs, bind);
         },
         .trojan => blk: {
-            const sni = proxy.getParam("sni") orelse proxy.host;
-            const path_enc = proxy.getParam("path") orelse "/";
-            const path = try util.urlDecodeStrict(gpa, path_enc);
-            defer gpa.free(path);
-            const host_hdr = proxy.getParam("host") orelse sni;
+            const sni_owned = try proxy.getParamDecoded(gpa, "sni");
+            defer if (sni_owned) |s| gpa.free(s);
+            const sni = sni_owned orelse proxy.host;
+            const path_owned = try proxy.getParamDecoded(gpa, "path");
+            defer if (path_owned) |p| gpa.free(p);
+            const path = path_owned orelse "/";
+            const host_owned = try proxy.getParamDecoded(gpa, "host");
+            defer if (host_owned) |h| gpa.free(h);
+            const host_hdr = host_owned orelse sni;
             const allow_insecure = util.queryParamTruthy(proxy.query, "allowInsecure") or
                 util.queryParamTruthy(proxy.query, "allow_insecure") or
                 util.queryParamTruthy(proxy.query, "insecure");
@@ -131,20 +135,35 @@ pub fn probeOne(
             if (proxy.transport == .other) return error.UnsupportedTransport;
             if (proxy.transport == .ws) return error.UnsupportedTransport;
 
-            const enc = proxy.getParam("encryption") orelse "none";
+            const enc_owned = try proxy.getParamDecoded(gpa, "encryption");
+            defer if (enc_owned) |e| gpa.free(e);
+            const enc = enc_owned orelse "none";
             if (enc.len != 0 and !std.mem.eql(u8, enc, "none")) return error.UnsupportedVlessEncryption;
 
-            const sni = proxy.getParam("sni") orelse proxy.host;
-            const pbk = proxy.getParam("pbk") orelse return error.MissingRealityPublicKey;
-            const sid = proxy.getParam("sid") orelse "";
-            const flow = proxy.getParam("flow") orelse "";
-            const service = proxy.getParam("serviceName") orelse "";
+            const sni_owned = try proxy.getParamDecoded(gpa, "sni");
+            defer if (sni_owned) |s| gpa.free(s);
+            const sni = sni_owned orelse proxy.host;
+            const pbk = (try proxy.getParamDecoded(gpa, "pbk")) orelse return error.MissingRealityPublicKey;
+            defer gpa.free(pbk);
+            const sid_owned = try proxy.getParamDecoded(gpa, "sid");
+            defer if (sid_owned) |s| gpa.free(s);
+            const sid = sid_owned orelse "";
+            const flow_owned = try proxy.getParamDecoded(gpa, "flow");
+            defer if (flow_owned) |f| gpa.free(f);
+            const flow = flow_owned orelse "";
+            const service_owned = try proxy.getParamDecoded(gpa, "serviceName");
+            defer if (service_owned) |s| gpa.free(s);
+            const service = service_owned orelse "";
             const use_grpc = proxy.transport == .grpc;
             if (use_grpc) {
-                const mode = proxy.getParam("mode") orelse "gun";
+                const mode_owned = try proxy.getParamDecoded(gpa, "mode");
+                defer if (mode_owned) |m| gpa.free(m);
+                const mode = mode_owned orelse "gun";
                 if (!std.mem.eql(u8, mode, "gun") and mode.len != 0) return error.UnsupportedGrpcMode;
             }
-            const authority = proxy.getParam("authority") orelse "";
+            const authority_owned = try proxy.getParamDecoded(gpa, "authority");
+            defer if (authority_owned) |a| gpa.free(a);
+            const authority = authority_owned orelse "";
             break :blk try reality.probeVless(
                 io,
                 proxy.host,
