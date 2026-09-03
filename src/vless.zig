@@ -94,18 +94,8 @@ pub const VisionUnpadState = struct {
     expect_uuid: bool = true,
 };
 
-/// First Vision frame: UUID + command + contentLen + paddingLen + content + padding.
-/// Layout matches xray `XtlsPadding` / `XtlsUnpadding` (content before padding).
-/// command 0x01 = PaddingEnd (tests / downlink peers that still emit End).
-pub fn appendVisionPaddingEnd(out: []u8, uuid: *const [16]u8, content: []const u8) error{ BufferTooSmall, ContentTooLong }!usize {
-    return appendVisionFrame(out, vision_cmd_end, uuid, content, 64);
-}
-
-/// Continuation Vision frame (no UUID) — used by tests / multi-block peers.
-pub fn appendVisionPaddingContinue(out: []u8, content: []const u8) error{ BufferTooSmall, ContentTooLong }!usize {
-    return appendVisionFrame(out, vision_cmd_continue, null, content, 16);
-}
-
+/// Encode a Vision padding frame (xray `XtlsPadding`): optional UUID, then
+/// command + contentLen + paddingLen + content + padding.
 pub fn appendVisionFrame(
     out: []u8,
     cmd: u8,
@@ -236,7 +226,7 @@ test "consumeVisionFrame NeedMore and content before padding" {
     var uuid: [16]u8 = [_]u8{0xab} ** 16;
     var frame_buf: [128]u8 = undefined;
     const http = "HTTP/1.1 200 OK\r\n\r\n";
-    const n = try appendVisionPaddingEnd(&frame_buf, &uuid, http);
+    const n = try appendVisionFrame(&frame_buf, vision_cmd_end, &uuid, http, 64);
 
     // Wire layout: header then content immediately (xray order).
     try std.testing.expectEqualStrings(http, frame_buf[21 .. 21 + http.len]);
@@ -282,7 +272,7 @@ test "consumeVisionFrame continue block omits UUID" {
     const n1 = try appendVisionFrame(&first, vision_cmd_continue, &uuid, part1, 8);
 
     var cont: [128]u8 = undefined;
-    const n2 = try appendVisionPaddingContinue(&cont, part2);
+    const n2 = try appendVisionFrame(&cont, vision_cmd_continue, null, part2, 16);
 
     var state: VisionUnpadState = .{};
     const f1 = try consumeVisionFrame(first[0..n1], &uuid, &state);

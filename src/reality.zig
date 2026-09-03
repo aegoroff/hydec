@@ -1462,7 +1462,7 @@ test "drainVlessVisionStream strips header before Vision unwrap" {
     var uuid: [16]u8 = [_]u8{0xcd} ** 16;
     const http = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     var vision: [256]u8 = undefined;
-    const vn = try vless.appendVisionPaddingEnd(&vision, &uuid, http);
+    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_end, &uuid, http, 64);
 
     var stream: [512]u8 = undefined;
     stream[0] = 0;
@@ -1490,7 +1490,7 @@ test "drainVlessVisionStream splits header then Vision across pushes" {
     var uuid: [16]u8 = [_]u8{0xef} ** 16;
     const http = "HTTP/1.1 200 OK\r\n\r\n";
     var vision: [256]u8 = undefined;
-    const vn = try vless.appendVisionPaddingEnd(&vision, &uuid, http);
+    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_end, &uuid, http, 64);
 
     var stream: [512]u8 = undefined;
     var stream_len: usize = 0;
@@ -1556,7 +1556,7 @@ test "drainVlessVisionStream steady raw after End grows http" {
     var uuid: [16]u8 = [_]u8{0x22} ** 16;
     const http = "HTTP/1.1 200 OK\r\n\r\n";
     var vision: [256]u8 = undefined;
-    const vn = try vless.appendVisionPaddingEnd(&vision, &uuid, http);
+    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_end, &uuid, http, 64);
 
     var stream: [512]u8 = undefined;
     stream[0] = 0;
@@ -1586,7 +1586,7 @@ test "drainVlessVisionStream steady raw after End grows http" {
 test "drainVlessVisionStream incomplete Vision does not grow http" {
     var uuid: [16]u8 = [_]u8{0x33} ** 16;
     var vision: [256]u8 = undefined;
-    const vn = try vless.appendVisionPaddingEnd(&vision, &uuid, "HTTP/1.1 200 OK\r\n\r\n");
+    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_end, &uuid, "HTTP/1.1 200 OK\r\n\r\n", 64);
 
     var stream: [512]u8 = undefined;
     stream[0] = 0;
