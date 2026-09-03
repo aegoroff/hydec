@@ -34,13 +34,10 @@ fn rejectPostHandshakeKeyUpdate(plaintext: []const u8) !void {
 }
 
 fn decodePublicKey(pbk_b64: []const u8, out: *[32]u8) !void {
-    // sing-box uses RawURLEncoding (no padding)
-    var cleaned: [64]u8 = undefined;
-    const normalized = util.normalizeBase64Url(&cleaned, pbk_b64, false) catch return error.InvalidPublicKey;
+    // sing-box uses RawURLEncoding; also accept standard / padded forms.
     var tmp: [48]u8 = undefined;
-    const decoded_len = std.base64.standard.Decoder.calcSizeForSlice(normalized) catch return error.InvalidPublicKey;
-    if (decoded_len != 32) return error.InvalidPublicKey;
-    std.base64.standard.Decoder.decode(tmp[0..32], normalized) catch return error.InvalidPublicKey;
+    const n = util.decodeBase64UrlInto(&tmp, pbk_b64, false) catch return error.InvalidPublicKey;
+    if (n != 32) return error.InvalidPublicKey;
     @memcpy(out, tmp[0..32]);
 }
 
