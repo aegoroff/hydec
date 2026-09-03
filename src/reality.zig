@@ -16,6 +16,10 @@ const HkdfSha256 = std.crypto.kdf.hkdf.Hkdf(HmacSha256);
 const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 const named_group_x25519: u16 = 0x001d;
 
+/// TLS 1.3 max ciphertext length (2^14 + 256). Same bound as `RecordConn` /
+/// `RealityConn.readApp` scratch — Vision downlink must accept one full record.
+const max_tls_record_len = 16640;
+
 /// Post-handshake TLS 1.3 messages (typ 22). NewSessionTicket is ignorable;
 /// KeyUpdate would require traffic-secret rotation we do not keep — fail closed.
 fn rejectPostHandshakeKeyUpdate(plaintext: []const u8) !void {
@@ -1002,9 +1006,9 @@ const VisionPipe = struct {
     uplink_padding: bool = true,
     err: ?anyerror = null,
 
-    wire: [16384]u8 = undefined,
+    wire: [max_tls_record_len]u8 = undefined,
     wire_len: usize = 0,
-    plain: [16384]u8 = undefined,
+    plain: [max_tls_record_len]u8 = undefined,
     plain_len: usize = 0,
     plain_off: usize = 0,
     stripped: bool = false,
@@ -1114,7 +1118,8 @@ const VisionPipe = struct {
         while (self.plain_off >= self.plain_len) {
             self.plain_off = 0;
             self.plain_len = 0;
-            var resp: [8192]u8 = undefined;
+            // Must fit a full Reality/TLS app record; 8KiB rejected large Certificate flights.
+            var resp: [max_tls_record_len]u8 = undefined;
             const n = self.rc.readApp(&resp) catch |err| {
                 self.err = err;
                 return if (util.isPeerClosed(err)) error.EndOfStream else error.ReadFailed;
