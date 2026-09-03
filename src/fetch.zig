@@ -6,6 +6,15 @@ const netutil = @import("netutil.zig");
 
 const DEFAULT_USER_AGENT = std.fmt.comptimePrint("hydec/{s}", .{build_options.version});
 
+/// Waiter/worker handoff for timed fetches. `swap` decides who destroys `FetchCtx`.
+const FetchState = enum(u8) {
+    running = 0,
+    /// Worker finished; waiter joins and frees.
+    done = 1,
+    /// Waiter timed out; worker frees when it finishes.
+    abandoned = 2,
+};
+
 const FetchCtx = struct {
     gpa: std.mem.Allocator,
     io: Io,
@@ -13,9 +22,7 @@ const FetchCtx = struct {
     url: []u8,
     body: ?[]u8 = null,
     err: ?anyerror = null,
-    done: std.atomic.Value(bool) = .init(false),
-    /// Set just before detach: worker destroys ctx when it finishes.
-    worker_owns_cleanup: std.atomic.Value(bool) = .init(false),
+    state: std.atomic.Value(FetchState) = .init(.running),
     /// Only one side destroys the context.
     cleanup_taken: std.atomic.Value(bool) = .init(false),
 };
@@ -32,8 +39,10 @@ fn destroyCtx(ctx: *FetchCtx) void {
 }
 
 fn finishWorker(ctx: *FetchCtx) void {
-    ctx.done.store(true, .release);
-    if (ctx.worker_owns_cleanup.load(.acquire)) {
+    // Publish body/err first, then claim `.done`. If the waiter already abandoned,
+    // we own cleanup; otherwise the waiter will join and free.
+    const prev = ctx.state.swap(.done, .acq_rel);
+    if (prev == .abandoned) {
         if (tryTakeCleanup(ctx)) destroyCtx(ctx);
     }
 }
@@ -74,40 +83,36 @@ pub fn fetchUrl(gpa: std.mem.Allocator, io: Io, url: []const u8, timeout_secs: u
     return fetchUrlWait(io, ctx, thread, timeout_secs);
 }
 
-/// After abandon + join: return body if the download finished, else Timeout.
-fn takeResultAfterAbandon(ctx: *FetchCtx) ![]u8 {
-    if (!tryTakeCleanup(ctx)) {
-        // Worker already destroyed under worker_owns_cleanup.
-        return error.Timeout;
-    }
+/// After join when the download finished first: take body/err and free ctx.
+fn takeFinishedResult(ctx: *FetchCtx) ![]u8 {
+    if (!tryTakeCleanup(ctx)) return error.FetchStateCorrupt;
+    const err = ctx.err;
     const body = ctx.body;
     ctx.body = null;
     destroyCtx(ctx);
-    return body orelse error.Timeout;
+    if (err) |e| return e;
+    return body orelse error.EmptySubscriptionBody;
 }
 
 fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) ![]u8 {
     const start = netutil.monoNow(io);
     const budget: i128 = @as(i128, timeout_secs) * std.time.ns_per_s;
-    while (!ctx.done.load(.acquire)) {
+    while (ctx.state.load(.acquire) != .done) {
         if (netutil.monoNow(io) - start >= budget) {
-            // Brief grace so a nearly-finished worker can publish done before detach.
+            // Brief grace so a nearly-finished worker can publish `.done` first.
             const grace_deadline = netutil.monoNow(io) + 250 * std.time.ns_per_ms;
-            while (!ctx.done.load(.acquire) and netutil.monoNow(io) < grace_deadline) {
+            while (ctx.state.load(.acquire) != .done and netutil.monoNow(io) < grace_deadline) {
                 const pause: Io.Duration = .fromMilliseconds(20);
                 io.sleep(pause, .awake) catch {};
             }
-            if (ctx.done.load(.acquire)) {
+            // Claim abandon, or observe that the worker won with `.done`.
+            const prev = ctx.state.swap(.abandoned, .acq_rel);
+            if (prev == .done) {
                 thread.join();
-                return takeResultAfterAbandon(ctx);
+                return takeFinishedResult(ctx);
             }
-            // Hand cleanup to the worker and detach. Do not re-read ctx after
-            // this store: the worker may destroy ctx as soon as it sees the flag
-            // (UAF if we join/takeResultAfterAbandon on freed memory). Rare
-            // leak if the worker finished between the grace check and this
-            // store without seeing the flag — preferred over UAF.
-            ctx.worker_owns_cleanup.store(true, .release);
-            // std.http has no cancel; worker destroys FetchCtx when it exits.
+            // Was `.running` (or already abandoned — only one waiter). Worker frees ctx.
+            // std.http has no cancel; do not touch ctx after this.
             thread.detach();
             return error.Timeout;
         }
@@ -115,16 +120,7 @@ fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) !
         io.sleep(pause, .awake) catch {};
     }
     thread.join();
-
-    if (!tryTakeCleanup(ctx)) return error.FetchStateCorrupt;
-
-    const err = ctx.err;
-    const body = ctx.body;
-    ctx.body = null;
-    destroyCtx(ctx);
-
-    if (err) |e| return e;
-    return body orelse error.EmptySubscriptionBody;
+    return takeFinishedResult(ctx);
 }
 
 fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
@@ -281,4 +277,19 @@ test "ensureHttpsScheme rejects http redirect targets" {
     try ensureHttpsScheme("HTTPS");
     try std.testing.expectError(error.InsecureSubscriptionUrl, ensureHttpsScheme("http"));
     try std.testing.expectError(error.InsecureSubscriptionUrl, ensureHttpsScheme("HTTP"));
+}
+
+test "fetch state: waiter recovers result when worker finishes first" {
+    var state: std.atomic.Value(FetchState) = .init(.running);
+    // Worker publishes done while waiter still running.
+    try std.testing.expect(state.swap(.done, .acq_rel) == .running);
+    // Waiter timeout swap observes done — must join and take body, not Timeout.
+    try std.testing.expect(state.swap(.abandoned, .acq_rel) == .done);
+}
+
+test "fetch state: worker frees when waiter abandons first" {
+    var state: std.atomic.Value(FetchState) = .init(.running);
+    try std.testing.expect(state.swap(.abandoned, .acq_rel) == .running);
+    // Worker finish sees abandon — owns cleanup.
+    try std.testing.expect(state.swap(.done, .acq_rel) == .abandoned);
 }
