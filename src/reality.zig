@@ -780,6 +780,10 @@ fn connect(
                 if (!std.mem.eql(u8, msg[4..], &expected)) return error.TlsFinishedVerifyFailed;
                 rc.transcript.update(msg);
                 saw_finished = true;
+                off += 4 + hl;
+                // Client Finished covers messages through Server Finished only — do not
+                // hash any further handshake bytes that may follow in this buffer.
+                break;
             } else {
                 rc.transcript.update(msg);
             }
