@@ -80,17 +80,17 @@ pub fn classify(line: []const u8) Kind {
 
 fn parseTransport(type_param: ?[]const u8) Transport {
     const t = type_param orelse return .tcp;
-    if (std.mem.eql(u8, t, "tcp") or t.len == 0) return .tcp;
-    if (std.mem.eql(u8, t, "ws")) return .ws;
-    if (std.mem.eql(u8, t, "grpc")) return .grpc;
+    if (std.ascii.eqlIgnoreCase(t, "tcp") or t.len == 0) return .tcp;
+    if (std.ascii.eqlIgnoreCase(t, "ws")) return .ws;
+    if (std.ascii.eqlIgnoreCase(t, "grpc")) return .grpc;
     return .other;
 }
 
 fn parseSecurity(sec: ?[]const u8) Security {
     const s = sec orelse return .none;
-    if (std.mem.eql(u8, s, "none") or s.len == 0) return .none;
-    if (std.mem.eql(u8, s, "tls")) return .tls;
-    if (std.mem.eql(u8, s, "reality")) return .reality;
+    if (std.ascii.eqlIgnoreCase(s, "none") or s.len == 0) return .none;
+    if (std.ascii.eqlIgnoreCase(s, "tls")) return .tls;
+    if (std.ascii.eqlIgnoreCase(s, "reality")) return .reality;
     return .other;
 }
 
@@ -290,6 +290,17 @@ test "classify case-insensitive scheme" {
     try std.testing.expect(classify("VLESS://x") == .vless);
     try std.testing.expect(classify("SS://x") == .shadowsocks);
     try std.testing.expect(classify("Trojan://x") == .trojan);
+}
+
+test "parse type security case-insensitive" {
+    const gpa = std.testing.allocator;
+    const line =
+        \\vless://00000000-1111-2222-3333-444444444444@192.0.2.10:8444?security=Reality&type=TCP&flow=xtls-rprx-vision&sni=example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef
+    ;
+    var p = try parse(gpa, line);
+    defer p.deinit(gpa);
+    try std.testing.expect(p.transport == .tcp);
+    try std.testing.expect(p.security == .reality);
 }
 
 test "parse ss sip002" {
