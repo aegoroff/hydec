@@ -225,11 +225,11 @@ fn atLeastRatio(a: u64, b: u64, ratio: u64) bool {
 ///
 /// Policy:
 /// 1. Prefer fastest VLESS² (gRPC).
-/// 2. Prefer VLESS³ over VLESS² when VLESS² is strictly more than 3× slower.
-/// 3. Prefer SS over VLESS² only when there is no VLESS², or VLESS² is ≥5× slower than SS.
-///    When SS is eligible and VLESS³ exists, apply the 3× rule (as in 4) even if VLESS²
-///    was not demoted to VLESS³.
-/// 4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is strictly more than 3× slower than SS.
+/// 2. Prefer VLESS³ over VLESS² when VLESS² is strictly more than 2× slower.
+/// 3. Prefer SS over VLESS² only when there is no VLESS², or VLESS² is ≥3× slower than SS.
+///    When SS is eligible and VLESS³ exists, prefer VLESS³ unless it is >3× slower than SS
+///    (even if VLESS² was not demoted to VLESS³).
+/// 4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is strictly more than 2× slower than SS.
 /// 5. Trojan only when no VLESS² / VLESS³ / SS succeeded.
 pub fn selectBestClass(
     vless2_ms: ?u64,
@@ -240,12 +240,12 @@ pub fn selectBestClass(
     if (vless2_ms) |v2| {
         var class: PrefClass = .vless2;
         if (vless3_ms) |v3| {
-            if (exceedsRatio(v2, v3, 3)) {
+            if (exceedsRatio(v2, v3, 2)) {
                 class = .vless3;
             }
         }
         if (ss_ms) |ss_lat| {
-            if (atLeastRatio(v2, ss_lat, 5)) {
+            if (atLeastRatio(v2, ss_lat, 3)) {
                 // SS eligible vs VLESS²: prefer VLESS³ unless it is >3× slower than SS.
                 if (vless3_ms) |v3| {
                     if (exceedsRatio(v3, ss_lat, 3)) return .shadowsocks;
@@ -259,7 +259,7 @@ pub fn selectBestClass(
 
     if (vless3_ms) |v3| {
         if (ss_ms) |ss_lat| {
-            if (exceedsRatio(v3, ss_lat, 3)) return .shadowsocks;
+            if (exceedsRatio(v3, ss_lat, 2)) return .shadowsocks;
         }
         return .vless3;
     }
@@ -600,25 +600,25 @@ test "PrefClass.fromProxy maps vless transport and protocols" {
     try std.testing.expect(PrefClass.fromProxy(tj) == .trojan);
 }
 
-test "selectBestClass prefers VLESS2 then demotes on 3x / SS on 5x" {
+test "selectBestClass prefers VLESS2 then demotes on 2x / SS on 3x" {
     // Fastest VLESS² wins when close to others.
     try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(100, 90, 80, 50));
-    // Exactly 3×: keep VLESS² ("больше чем в три раза").
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(300, 100, null, null));
-    // Strictly more than 3× → VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(301, 100, null, null));
-    // SS needs ≥5× vs VLESS².
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(499, null, 100, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(500, null, 100, null));
-    // Demoted to VLESS³; SS eligible via VLESS²≥5×SS, then 3× vs VLESS³.
+    // Exactly 2×: keep VLESS² ("больше чем в два раза").
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(200, 100, null, null));
+    // Strictly more than 2× → VLESS³.
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(201, 100, null, null));
+    // SS needs ≥3× vs VLESS².
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(299, null, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(300, null, 100, null));
+    // Demoted to VLESS³; SS eligible via VLESS²≥3×SS, then 3× vs VLESS³.
     try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(600, 100, 40, null)); // 100 ≯ 3×40
     try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(600, 100, 30, null)); // 100 > 3×30
-    // VLESS² kept vs VLESS³, but SS eligible (≥5×); still apply 3× to VLESS³.
+    // VLESS² kept vs VLESS³, but SS eligible (≥3×); still apply 3× to VLESS³.
     try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(100, 40, 20, null)); // 40 ≯ 3×20
     try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(100, 70, 20, null)); // 70 > 3×20
-    // No VLESS²: VLESS³ vs SS at 3×.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(null, 300, 100, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(null, 301, 100, null));
+    // No VLESS²: VLESS³ vs SS at 2×.
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(null, 200, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(null, 201, 100, null));
     // SS without VLESS.
     try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(null, null, 40, 10));
     // Trojan only as last resort.
