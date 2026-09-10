@@ -18,6 +18,17 @@ const Result = struct {
     }
 };
 
+/// Ranking strategy for `best` (CLI `--strategy`). Default `hydec` is the current tree.
+pub const Strategy = enum {
+    hydec,
+    fastest,
+    strict,
+
+    pub fn parse(s: []const u8) ?Strategy {
+        return std.meta.stringToEnum(Strategy, s);
+    }
+};
+
 /// Preference class for `best` ranking (higher = preferred when latencies are comparable).
 /// VLESS² = REALITY gRPC; VLESS³ = REALITY TCP vision — matching HyNet subscription labels.
 pub const PrefClass = enum {
@@ -222,8 +233,21 @@ fn atLeastRatio(a: u64, b: u64, ratio: u64) bool {
 }
 
 /// Pick the winning preference class from per-class fastest latencies.
-///
-/// Policy:
+pub fn selectBestClass(
+    strategy: Strategy,
+    vless2_ms: ?u64,
+    vless3_ms: ?u64,
+    ss_ms: ?u64,
+    trojan_ms: ?u64,
+) ?PrefClass {
+    return switch (strategy) {
+        .hydec => selectHydecClass(vless2_ms, vless3_ms, ss_ms, trojan_ms),
+        .fastest => selectFastestClass(vless2_ms, vless3_ms, ss_ms, trojan_ms),
+        .strict => selectStrictClass(vless2_ms, vless3_ms, ss_ms, trojan_ms),
+    };
+}
+
+/// Default `hydec` policy:
 /// 1. Prefer fastest VLESS² (gRPC).
 /// 2. Prefer VLESS³ over VLESS² when VLESS² is strictly more than 2× slower.
 /// 3. Prefer SS over VLESS² only when there is no VLESS², or VLESS² is ≥3× slower than SS.
@@ -231,7 +255,7 @@ fn atLeastRatio(a: u64, b: u64, ratio: u64) bool {
 ///    (even if VLESS² was not demoted to VLESS³).
 /// 4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is strictly more than 2× slower than SS.
 /// 5. Trojan only when no VLESS² / VLESS³ / SS succeeded.
-pub fn selectBestClass(
+fn selectHydecClass(
     vless2_ms: ?u64,
     vless3_ms: ?u64,
     ss_ms: ?u64,
@@ -264,6 +288,45 @@ pub fn selectBestClass(
         return .vless3;
     }
 
+    if (ss_ms != null) return .shadowsocks;
+    if (trojan_ms != null) return .trojan;
+    return null;
+}
+
+/// Minimum latency; on a tie keep the higher preference class (VLESS² → … → Trojan).
+fn selectFastestClass(
+    vless2_ms: ?u64,
+    vless3_ms: ?u64,
+    ss_ms: ?u64,
+    trojan_ms: ?u64,
+) ?PrefClass {
+    const candidates = [_]struct { class: PrefClass, ms: ?u64 }{
+        .{ .class = .vless2, .ms = vless2_ms },
+        .{ .class = .vless3, .ms = vless3_ms },
+        .{ .class = .shadowsocks, .ms = ss_ms },
+        .{ .class = .trojan, .ms = trojan_ms },
+    };
+    var best_class: ?PrefClass = null;
+    var best_ms: u64 = undefined;
+    for (candidates) |c| {
+        const ms = c.ms orelse continue;
+        if (best_class == null or ms < best_ms) {
+            best_class = c.class;
+            best_ms = ms;
+        }
+    }
+    return best_class;
+}
+
+/// Never demote: first class that succeeded in preference order.
+fn selectStrictClass(
+    vless2_ms: ?u64,
+    vless3_ms: ?u64,
+    ss_ms: ?u64,
+    trojan_ms: ?u64,
+) ?PrefClass {
+    if (vless2_ms != null) return .vless2;
+    if (vless3_ms != null) return .vless3;
     if (ss_ms != null) return .shadowsocks;
     if (trojan_ms != null) return .trojan;
     return null;
@@ -460,6 +523,7 @@ pub fn findBest(
     verbose: bool,
     timeout_secs: u32,
     bind: ?[]const u8,
+    strategy: Strategy,
     stats: *Stats,
 ) !?Result {
     var groups = try collectGroups(gpa, lines, stats, verbose);
@@ -498,6 +562,7 @@ pub fn findBest(
     }
 
     const chosen = selectBestClass(
+        strategy,
         if (shared.best.get(.vless2)) |r| r.latency_ms else null,
         if (shared.best.get(.vless3)) |r| r.latency_ms else null,
         if (shared.best.get(.shadowsocks)) |r| r.latency_ms else null,
@@ -600,28 +665,53 @@ test "PrefClass.fromProxy maps vless transport and protocols" {
     try std.testing.expect(PrefClass.fromProxy(tj) == .trojan);
 }
 
-test "selectBestClass prefers VLESS2 then demotes on 2x / SS on 3x" {
+test "selectBestClass hydec prefers VLESS2 then demotes on 2x / SS on 3x" {
     // Fastest VLESS² wins when close to others.
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(100, 90, 80, 50));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 100, 90, 80, 50));
     // Exactly 2×: keep VLESS² ("больше чем в два раза").
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(200, 100, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 200, 100, null, null));
     // Strictly more than 2× → VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(201, 100, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 201, 100, null, null));
     // SS needs ≥3× vs VLESS².
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(299, null, 100, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(300, null, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 299, null, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 300, null, 100, null));
     // Demoted to VLESS³; SS eligible via VLESS²≥3×SS, then 3× vs VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(600, 100, 40, null)); // 100 ≯ 3×40
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(600, 100, 30, null)); // 100 > 3×30
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 600, 100, 40, null)); // 100 ≯ 3×40
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 600, 100, 30, null)); // 100 > 3×30
     // VLESS² kept vs VLESS³, but SS eligible (≥3×); still apply 3× to VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(100, 40, 20, null)); // 40 ≯ 3×20
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(100, 70, 20, null)); // 70 > 3×20
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 100, 40, 20, null)); // 40 ≯ 3×20
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 100, 70, 20, null)); // 70 > 3×20
     // No VLESS²: VLESS³ vs SS at 2×.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(null, 200, 100, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(null, 201, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 200, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, 201, 100, null));
     // SS without VLESS.
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(null, null, 40, 10));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, null, 40, 10));
     // Trojan only as last resort.
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(null, null, null, 10));
-    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(null, null, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, null, null, 10));
+    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.hydec, null, null, null, null));
+}
+
+test "selectBestClass fastest picks minimum latency" {
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.fastest, 100, 90, 80, 50));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.fastest, 300, 100, 40, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.fastest, 201, 100, null, null));
+    // Tie: keep the higher preference class.
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.fastest, 100, 100, 100, 100));
+    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.fastest, null, null, null, null));
+}
+
+test "selectBestClass strict never demotes" {
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.strict, 500, 10, 5, 1));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.strict, null, 200, 10, 1));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.strict, null, null, 40, 10));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.strict, null, null, null, 10));
+    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.strict, null, null, null, null));
+}
+
+test "Strategy.parse accepts known names" {
+    try std.testing.expectEqual(@as(?Strategy, .hydec), Strategy.parse("hydec"));
+    try std.testing.expectEqual(@as(?Strategy, .fastest), Strategy.parse("fastest"));
+    try std.testing.expectEqual(@as(?Strategy, .strict), Strategy.parse("strict"));
+    try std.testing.expectEqual(@as(?Strategy, null), Strategy.parse("unknown"));
+    try std.testing.expectEqual(@as(?Strategy, null), Strategy.parse(""));
 }

@@ -31,6 +31,10 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("invalid --timeout", .{});
             std.process.exit(2);
         },
+        error.InvalidStrategy => {
+            std.log.err("invalid --strategy (use hydec, fastest, or strict)", .{});
+            std.process.exit(2);
+        },
         error.EmptyInterfaceName => {
             std.log.err("invalid --interface/-I: empty", .{});
             std.process.exit(2);
@@ -95,7 +99,7 @@ fn runBest(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     try subscription.iterLines(decoded, Ctx.on, &ctx);
 
     var stats: probe.Stats = .{};
-    var best = try probe.findBest(gpa, io, lines.items, opts.verbose, opts.timeout_secs, opts.interface, &stats);
+    var best = try probe.findBest(gpa, io, lines.items, opts.verbose, opts.timeout_secs, opts.interface, opts.strategy, &stats);
     defer if (best) |*b| b.deinit(gpa);
 
     std.log.info("Tested: {d}, passed: {d}, skipped vmess: {d}, skipped other: {d}, parse failed: {d}", .{

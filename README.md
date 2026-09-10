@@ -10,7 +10,7 @@ Requires **Zig 0.16.0** ([mise](https://mise.jdx.dev/) pin in `mise.toml`, or in
 - Probes **Shadowsocks** (AEAD), **Trojan** (TLS / WebSocket), **VLESS REALITY** (TCP vision and gRPC gun)
 - Skips VMess (counted in stats)
 - Groups by host/IP: different IPs in parallel, same IP sequentially
-- Ranks by **protocol preference** (VLESS gRPC → VLESS TCP → SS → Trojan), demoting a preferred tier only when a lower tier is much faster (2× / 3× rules)
+- Ranks by **protocol preference** (VLESS gRPC → VLESS TCP → SS → Trojan), demoting a preferred tier only when a lower tier is much faster (2× / 3× rules); override with `--strategy fastest` or `strict`
 - Optional `--interface` / `-I` binds probe sockets to a source IP or Linux device name
 - Logs progress to **stderr**; prints the winning URI to **stdout**
 
@@ -42,6 +42,7 @@ hydec best <SUBSCRIPTION_URL>
 hydec best -v -t 5 https://example.com/sub
 hydec best -I 192.168.1.10 https://example.com/sub
 hydec best -I eth0 https://example.com/sub          # Linux; needs CAP_NET_RAW / root
+hydec best --strategy fastest https://example.com/sub
 hydec ping 'ss://...#remark'
 hydec ping -t 10 -I wlan0 'vless://...'
 ```
@@ -56,12 +57,21 @@ hydec ping -t 10 -I wlan0 'vless://...'
 | `-t`, `--timeout` | Per-operation timeout in seconds (default: `5`) |
 | `-I`, `--interface` | Bind probe sockets to a source IP or interface name (default: kernel chooses). Device names use `SO_BINDTODEVICE` on Linux (`CAP_NET_RAW`). Not supported on Windows (warns and ignores). Affects probes only — subscription fetch is unchanged |
 | `-v`, `--verbose` | `best` only: log each probe (Testing / OK / FAIL) |
+| `--strategy` | `best` only: ranking policy (`hydec`, `fastest`, `strict`). Default: `hydec` |
 | `-V`, `--version` | Print version |
 | `-h`, `--help` | Help |
 
 ### Ranking (`best`)
 
-Each candidate is probed **3 times** (fail-fast); the average latency is kept per preference class. Winner selection:
+Each candidate is probed **3 times** (fail-fast); the average latency is kept per preference class. `--strategy` picks the winner:
+
+| Strategy | Behavior |
+|----------|----------|
+| `hydec` (default) | Protocol preference with 2× / 3× demotion (below) |
+| `fastest` | Lowest latency; on a tie prefer VLESS² → VLESS³ → SS → Trojan |
+| `strict` | Never demote: first successful class in VLESS² → VLESS³ → SS → Trojan |
+
+`hydec` winner selection:
 
 1. Prefer **VLESS²** (REALITY gRPC)
 2. Prefer **VLESS³** (REALITY TCP vision) over VLESS² when VLESS² is **>2×** slower

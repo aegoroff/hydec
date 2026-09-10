@@ -1,6 +1,7 @@
 const std = @import("std");
 const zig_cli = @import("zig_cli");
 const build_options = @import("build_options");
+const probe = @import("probe.zig");
 
 const Io = std.Io;
 
@@ -16,6 +17,8 @@ pub const Options = struct {
     /// Optional owned interface/source-IP spec forwarded to probe sockets.
     /// `null` = kernel chooses. Free with `gpa.free`.
     interface: ?[]u8,
+    /// Ranking policy for `best`; ignored by `ping`.
+    strategy: probe.Strategy,
 };
 
 const Capture = struct {
@@ -36,6 +39,11 @@ fn parseTimeout(ctx: *zig_cli.BaseCommand.ParseContext) !u32 {
     return timeout_secs;
 }
 
+fn parseStrategy(value: ?[]const u8) !probe.Strategy {
+    const s = value orelse return .hydec;
+    return probe.Strategy.parse(s) orelse error.InvalidStrategy;
+}
+
 fn onBest(ctx: *zig_cli.BaseCommand.ParseContext) !void {
     const uri_arg = ctx.getArgument(0) orelse return error.MissingRequiredArgument;
     const uri = try capture.gpa.dupe(u8, uri_arg);
@@ -50,6 +58,7 @@ fn onBest(ctx: *zig_cli.BaseCommand.ParseContext) !void {
         .timeout_secs = try parseTimeout(ctx),
         .verbose = ctx.hasOption("verbose"),
         .interface = interface,
+        .strategy = try parseStrategy(ctx.getOption("strategy")),
     };
 }
 
@@ -67,6 +76,7 @@ fn onPing(ctx: *zig_cli.BaseCommand.ParseContext) !void {
         .timeout_secs = try parseTimeout(ctx),
         .verbose = false,
         .interface = interface,
+        .strategy = .hydec,
     };
 }
 
@@ -209,6 +219,14 @@ fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseComm
                 "Log each probe result to stderr",
                 .bool,
             ).withShort('v'),
+        );
+        _ = try best.addOption(
+            zig_cli.Option.init(
+                "strategy",
+                "strategy",
+                "Ranking strategy: hydec (default), fastest, strict",
+                .string,
+            ),
         );
         _ = best.setAction(onBest);
         _ = try root.addCommand(best);
@@ -448,4 +466,13 @@ test "normalizeArgs expands attached interface" {
     try std.testing.expectEqual(@as(usize, 3), normalized.len);
     try std.testing.expectEqualStrings("-I", normalized[0]);
     try std.testing.expectEqualStrings("eth0", normalized[1]);
+}
+
+test "parseStrategy defaults to hydec and rejects unknown names" {
+    try std.testing.expectEqual(probe.Strategy.hydec, try parseStrategy(null));
+    try std.testing.expectEqual(probe.Strategy.hydec, try parseStrategy("hydec"));
+    try std.testing.expectEqual(probe.Strategy.fastest, try parseStrategy("fastest"));
+    try std.testing.expectEqual(probe.Strategy.strict, try parseStrategy("strict"));
+    try std.testing.expectError(error.InvalidStrategy, parseStrategy("unknown"));
+    try std.testing.expectError(error.InvalidStrategy, parseStrategy(""));
 }

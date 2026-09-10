@@ -28,7 +28,7 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 2. Base64-decode body; iterate URI lines.
 3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**.
 4. Each candidate: **3 probes**, fail-fast on first error; keep **average** latency per preference class.
-5. Rank with `selectBestClass`: prefer VLESS² (gRPC) → VLESS³ (TCP) → SS → Trojan. Demote VLESS²→VLESS³ when VLESS² is **>2×** slower; VLESS²→SS when **≥3×** (then keep VLESS³ unless it is **>3×** slower than SS); with no VLESS², demote VLESS³→SS when **>2×** slower. Trojan only if no VLESS² / VLESS³ / SS succeeded.
+5. Rank with `selectBestClass` according to `--strategy` (`hydec` default, `fastest`, `strict`). `hydec`: prefer VLESS² (gRPC) → VLESS³ (TCP) → SS → Trojan. Demote VLESS²→VLESS³ when VLESS² is **>2×** slower; VLESS²→SS when **≥3×** (then keep VLESS³ unless it is **>3×** slower than SS); with no VLESS², demote VLESS³→SS when **>2×** slower. Trojan only if no VLESS² / VLESS³ / SS succeeded. `fastest`: lowest latency (tie → higher class). `strict`: never demote.
 6. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
 
 **Behavior (`ping`)**
@@ -53,7 +53,7 @@ Optional bind spec for **probe** sockets only (subscription fetch unchanged):
 | Path | Role |
 |------|------|
 | `src/main.zig` | Entry, orchestration |
-| `src/cli.zig` | Commands: `best <URI>`, `ping <PROXY>`; `-t/--timeout`, `-I/--interface`, `-v/--verbose` (`best`), `-V/--version` |
+| `src/cli.zig` | Commands: `best <URI>`, `ping <PROXY>`; `-t/--timeout`, `-I/--interface`, `-v/--verbose` (`best`), `--strategy` (`best`; default `hydec`), `-V/--version` |
 | `src/fetch.zig` | Download subscription (HTTPS-only gate) |
 | `src/subscription.zig` | Base64 decode, line iteration |
 | `src/proxy_uri.zig` | URI parse (kind, host/port, query, `#name`) |
