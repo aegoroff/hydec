@@ -10,7 +10,7 @@ Requires **Zig 0.16.0** ([mise](https://mise.jdx.dev/) pin in `mise.toml`, or in
 - Probes **Shadowsocks** (AEAD), **Trojan** (TLS / WebSocket), **VLESS REALITY** (TCP vision and gRPC gun)
 - Skips VMess (counted in stats)
 - Groups by host/IP: different IPs in parallel, same IP sequentially
-- Ranks by **protocol preference** (VLESS gRPC → VLESS TCP → SS → Trojan), demoting a preferred tier only when a lower tier is much faster (3× / 5× rules)
+- Ranks by **protocol preference** (VLESS gRPC → VLESS TCP → SS → Trojan), demoting a preferred tier only when a lower tier is much faster (2× / 3× rules)
 - Optional `--interface` / `-I` binds probe sockets to a source IP or Linux device name
 - Logs progress to **stderr**; prints the winning URI to **stdout**
 
@@ -64,9 +64,9 @@ hydec ping -t 10 -I wlan0 'vless://...'
 Each candidate is probed **3 times** (fail-fast); the average latency is kept per preference class. Winner selection:
 
 1. Prefer **VLESS²** (REALITY gRPC)
-2. Prefer **VLESS³** (REALITY TCP vision) over VLESS² when VLESS² is **>3×** slower
-3. Prefer **Shadowsocks** over VLESS² when VLESS² is **≥5×** slower (and vs demoted VLESS³, the **>3×** rule)
-4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is **>3×** slower than SS
+2. Prefer **VLESS³** (REALITY TCP vision) over VLESS² when VLESS² is **>2×** slower
+3. Prefer **Shadowsocks** over VLESS² when VLESS² is **≥3×** slower. If SS is eligible and VLESS³ exists, keep VLESS³ unless it is **>3×** slower than SS (even if VLESS² was not demoted to VLESS³)
+4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is **>2×** slower than SS
 5. **Trojan** only if no VLESS² / VLESS³ / SS succeeded
 
 ### Output (`best`)
