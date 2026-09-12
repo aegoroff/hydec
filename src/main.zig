@@ -43,6 +43,15 @@ pub fn main(init: std.process.Init) !void {
             std.log.err("unknown command (try 'hydec --help')", .{});
             std.process.exit(2);
         },
+        // zig-cli already prints a human-readable diagnostic for its own
+        // ParseError set, so only fix up the exit code to match the other
+        // usage errors instead of printing a second message.
+        error.UnknownOption,
+        error.MissingOptionValue,
+        error.MissingRequiredOption,
+        error.InvalidOptionValue,
+        error.TooManyArguments,
+        => std.process.exit(2),
         else => |e| return e,
     };
 
