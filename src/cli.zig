@@ -46,6 +46,12 @@ fn parseStrategy(value: ?[]const u8) !probe.Strategy {
 
 fn onBest(ctx: *zig_cli.BaseCommand.ParseContext) !void {
     const uri_arg = ctx.getArgument(0) orelse return error.MissingRequiredArgument;
+    // Validate before allocating, and keep `try` out of the `capture.options`
+    // literal: result-location semantics would publish a half-built Options
+    // (non-null tag + owned `uri`) that the caller then frees a second time.
+    const timeout_secs = try parseTimeout(ctx);
+    const strategy = try parseStrategy(ctx.getOption("strategy"));
+
     const uri = try capture.gpa.dupe(u8, uri_arg);
     errdefer capture.gpa.free(uri);
 
@@ -55,15 +61,18 @@ fn onBest(ctx: *zig_cli.BaseCommand.ParseContext) !void {
     capture.options = .{
         .command = .best,
         .uri = uri,
-        .timeout_secs = try parseTimeout(ctx),
+        .timeout_secs = timeout_secs,
         .verbose = ctx.hasOption("verbose"),
         .interface = interface,
-        .strategy = try parseStrategy(ctx.getOption("strategy")),
+        .strategy = strategy,
     };
 }
 
 fn onPing(ctx: *zig_cli.BaseCommand.ParseContext) !void {
     const uri_arg = ctx.getArgument(0) orelse return error.MissingRequiredArgument;
+    // See `onBest`: validate first so no fallible call runs inside the literal.
+    const timeout_secs = try parseTimeout(ctx);
+
     const uri = try capture.gpa.dupe(u8, uri_arg);
     errdefer capture.gpa.free(uri);
 
@@ -73,7 +82,7 @@ fn onPing(ctx: *zig_cli.BaseCommand.ParseContext) !void {
     capture.options = .{
         .command = .ping,
         .uri = uri,
-        .timeout_secs = try parseTimeout(ctx),
+        .timeout_secs = timeout_secs,
         .verbose = false,
         .interface = interface,
         .strategy = .hydec,
