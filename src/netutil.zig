@@ -560,11 +560,6 @@ pub fn classifyIoErr(err: anyerror, writer_err: ?anyerror, reader_err: ?anyerror
     return classifyDeadlineErr(cause, fired);
 }
 
-/// Flush a TLS write all the way to the wire.
-///
-/// Zig's TLS client only encrypts into the socket writer's buffer — `Client.flush`
-/// ends in `output.advance` — so flushing the TLS writer alone leaves the record
-/// inside the process while the peer waits for it.
 /// Whole seconds left of `timeout_secs` since `start_ns`, rounded up so a partial
 /// second still buys an attempt. Zero once the budget is spent.
 pub fn remainingTimeoutSecs(start_ns: i128, io: Io, timeout_secs: u32) u32 {
@@ -573,6 +568,11 @@ pub fn remainingTimeoutSecs(start_ns: i128, io: Io, timeout_secs: u32) u32 {
     return @intCast((ns + std.time.ns_per_s - 1) / std.time.ns_per_s);
 }
 
+/// Flush a TLS write all the way to the wire.
+///
+/// Zig's TLS client only encrypts into the socket writer's buffer — `Client.flush`
+/// ends in `output.advance` — so flushing the TLS writer alone leaves the record
+/// inside the process while the peer waits for it.
 pub fn flushTls(tls_writer: *Io.Writer, socket_writer: *Io.Writer) !void {
     try tls_writer.flush();
     try socket_writer.flush();
