@@ -27,6 +27,11 @@ pub fn connectHostPort(
     return connectHostnameTimed(io, host, port, timeout_secs, bind);
 }
 
+/// How long the resolver poll loop naps between non-blocking queue reads.
+/// Small enough that DNS latency dominates it, large enough that dozens of host
+/// workers waiting at once cost nothing measurable.
+const dns_poll_interval_ns: u64 = 5 * std.time.ns_per_ms;
+
 fn connectHostnameTimed(
     io: Io,
     host: []const u8,
@@ -45,102 +50,99 @@ fn connectHostnameTimed(
     const deadline = deadlineNs(io, timeout_secs);
 
     var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
+    // `lookup` is documented never to block with a capacity of at least 16, so the
+    // resolver task never waits on this side of the queue, and it closes the queue
+    // before returning — which is what ends the poll loop below.
     var lookup_buffer: [32]Io.net.HostName.LookupResult = undefined;
     var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
 
-    var lookup_future = io.async(Io.net.HostName.lookup, .{
-        hostname,
-        io,
-        &lookup_queue,
-        .{
-            .port = port,
-            .canonical_name_buffer = &canonical_name_buffer,
-        },
-    });
+    const lookup_options: Io.net.HostName.LookupOptions = .{
+        .port = port,
+        .canonical_name_buffer = &canonical_name_buffer,
+    };
+    // `Io.async` is not enough here: `Io.Threaded.async_limit` defaults to one less
+    // than the CPU count, and past that `async` silently runs the task inline, which
+    // blocks this thread for as long as DNS takes with no way to honour `deadline` —
+    // and `findBest` keeps far more host workers in flight than that limit. No
+    // `async` fallback for the same reason: `concurrent` gives up on OOM or a failed
+    // spawn, exactly where `async` would hit the same wall and stall inline.
+    // `concurrent` is also the only interruptible option: its `cancel` signals the
+    // worker (SIGIO) out of a blocking resolver syscall, which a plain `std.Thread`
+    // cannot do — a joined lookup thread would stall for the resolver's own timeout.
+    // Cost: the Io pool it grows lives until exit, bounded by `max_parallel_hosts`
+    // since each host worker resolves one name at a time; IP-literal lines never
+    // reach here. Worst case measured (all 64 hung at once): 129 threads, 44 MB RSS.
+    const lookup_args = .{ hostname, io, &lookup_queue, lookup_options };
+    var lookup_future = io.concurrent(Io.net.HostName.lookup, lookup_args) catch
+        return error.SystemResources;
     defer {
         lookup_future.cancel(io) catch {};
         while (lookup_queue.getOneUncancelable(io)) |_| {} else |_| {}
     }
 
-    // Race DNS queue reads against the absolute deadline so a hung resolver
-    // cannot stall past timeout_secs (getOne alone has no timeout).
-    const DnsWait = union(enum) {
-        item: (Io.QueueClosedError || Io.Cancelable)!Io.net.HostName.LookupResult,
-        timed_out: void,
-    };
-    var wait_buf: [4]DnsWait = undefined;
-    var select = Io.Select(DnsWait).init(io, &wait_buf);
-    defer select.cancelDiscard();
-
-    if (deadline) |d| {
-        select.async(.timed_out, sleepUntilDeadline, .{ io, d });
-    }
-    select.async(.item, recvDnsOne, .{ &lookup_queue, io });
-
     var last_err: anyerror = error.UnknownHostName;
     var saw_address = false;
 
     while (true) {
-        const winner = select.await() catch |err| switch (err) {
-            error.Canceled => return error.Timeout,
-        };
-        switch (winner) {
-            .timed_out => return error.Timeout,
-            .item => |get_result| {
-                const dns_result = get_result catch |err| switch (err) {
-                    error.Canceled => return error.Timeout,
-                    error.Closed => {
-                        if (saw_address) {
-                            // Addresses were tried; connect failures beat lookup status.
-                            lookup_future.await(io) catch {};
-                            return last_err;
-                        }
-                        // No addresses: surface the real DNS/lookup error (do not keep the
-                        // UnknownHostName placeholder when await carries NameServerFailure etc.).
-                        lookup_future.await(io) catch |lookup_err| return lookup_err;
-                        return error.NoAddressReturned;
-                    },
-                };
-                switch (dns_result) {
-                    .canonical_name => {},
-                    .address => |address| {
-                        saw_address = true;
-                        if (deadline) |d| {
-                            if (monoNow(io) >= d) return error.Timeout;
-                        }
-                        if (connectIpUntil(io, address, deadline, bind)) |stream| {
-                            setTcpNoDelay(stream);
-                            return stream;
-                        } else |err| {
-                            last_err = err;
-                            if (err == error.Timeout) return error.Timeout;
-                        }
-                    },
+        // Poll with `min = 0` (guaranteed not to block) and nap against the absolute
+        // deadline, so a hung resolver cannot stall past `timeout_secs`. A blocking
+        // `getOne` has no deadline of its own, and racing it against a sleeper task
+        // would again depend on that task actually getting a unit of concurrency.
+        var results: [8]Io.net.HostName.LookupResult = undefined;
+        const n = lookup_queue.getUncancelable(io, &results, 0) catch |err| switch (err) {
+            error.Closed => {
+                if (saw_address) {
+                    // Addresses were tried; connect failures beat lookup status.
+                    lookup_future.await(io) catch {};
+                    return last_err;
                 }
-                select.async(.item, recvDnsOne, .{ &lookup_queue, io });
+                // No addresses: surface the real DNS/lookup error (do not keep the
+                // UnknownHostName placeholder when await carries NameServerFailure etc.).
+                lookup_future.await(io) catch |lookup_err| return lookup_err;
+                return error.NoAddressReturned;
             },
+        };
+
+        if (n == 0) {
+            var nap = dns_poll_interval_ns;
+            if (deadline) |d| {
+                const now = monoNow(io);
+                if (now >= d) return error.Timeout;
+                nap = @min(nap, @as(u64, @intCast(d - now)));
+            }
+            io.sleep(.fromNanoseconds(nap), .awake) catch {};
+            continue;
         }
+
+        for (results[0..n]) |dns_result| switch (dns_result) {
+            .canonical_name => {},
+            .address => |address| {
+                saw_address = true;
+                if (deadline) |d| {
+                    if (monoNow(io) >= d) return error.Timeout;
+                }
+                if (connectIpUntil(io, address, deadline, bind)) |stream| {
+                    setTcpNoDelay(stream);
+                    return stream;
+                } else |err| {
+                    last_err = err;
+                    if (err == error.Timeout) return error.Timeout;
+                }
+            },
+        };
     }
 }
 
-fn recvDnsOne(
-    queue: *Io.Queue(Io.net.HostName.LookupResult),
-    io: Io,
-) (Io.QueueClosedError || Io.Cancelable)!Io.net.HostName.LookupResult {
-    return queue.getOne(io);
-}
-
-fn sleepUntilDeadline(io: Io, deadline_ns: i128) void {
-    const now = monoNow(io);
-    if (now >= deadline_ns) return;
-    const rem: Io.Duration = .fromNanoseconds(@intCast(deadline_ns - now));
-    io.sleep(rem, .awake) catch {};
-}
-
-test "sleepUntilDeadline is no-op when already past" {
+test "hostname dial fails fast when no unit of concurrency is available" {
+    // `global_single_threaded` sets concurrent_limit = .nothing, so `io.concurrent`
+    // reports ConcurrencyUnavailable. That path must not resolve inline: an inline
+    // resolver ignores `deadline`, which is the stall this whole dial exists to
+    // bound. Returns before touching DNS, so the test needs no network.
     const io = std.Io.Threaded.global_single_threaded.io();
-    const past = monoNow(io) - std.time.ns_per_s;
-    sleepUntilDeadline(io, past);
+    try std.testing.expectError(
+        error.SystemResources,
+        connectHostPort(io, "localhost", 1, 3, null),
+    );
 }
 
 test "applyBind treats null as no-op and empty spec as an error" {
