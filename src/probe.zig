@@ -349,6 +349,29 @@ fn considerBest(shared: *Shared, class: PrefClass, latency: u64, raw: []const u8
     if (prev_host) |h| shared.gpa.free(h);
 }
 
+/// `" — name"` when the proxy is named, otherwise nothing.
+pub const NameSuffix = struct {
+    name: ?[]const u8,
+
+    pub fn format(self: NameSuffix, w: *Io.Writer) Io.Writer.Error!void {
+        if (self.name) |n| try w.print(" — {s}", .{n});
+    }
+};
+
+/// `name (host)` when the proxy is named, otherwise bare `host`.
+pub const HostIdent = struct {
+    name: ?[]const u8,
+    host: []const u8,
+
+    pub fn format(self: HostIdent, w: *Io.Writer) Io.Writer.Error!void {
+        if (self.name) |n| {
+            try w.print("{s} ({s})", .{ n, self.host });
+        } else {
+            try w.print("{s}", .{self.host});
+        }
+    }
+};
+
 /// Short hint for FAIL logs (why the probe likely failed).
 pub fn failHint(err: anyerror) []const u8 {
     return switch (err) {
@@ -411,11 +434,7 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
         // Three probes, fail-fast; ranking uses the average of all three.
         const latency = probeAverage(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind) catch |err| {
             if (shared.verbose) {
-                if (proxy.name) |n| {
-                    std.log.warn("FAIL: {s} ({s}): {s} ({})", .{ n, proxy.host, failHint(err), err });
-                } else {
-                    std.log.warn("FAIL: {s}: {s} ({})", .{ proxy.host, failHint(err), err });
-                }
+                std.log.warn("FAIL: {f}: {s} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, failHint(err), err });
             }
             continue;
         };
@@ -427,11 +446,7 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
         }
 
         if (shared.verbose) {
-            if (proxy.name) |n| {
-                std.log.info("OK: {d}ms {s} — {s}", .{ latency, proxy.host, n });
-            } else {
-                std.log.info("OK: {d}ms {s}", .{ latency, proxy.host });
-            }
+            std.log.info("OK: {d}ms {s}{f}", .{ latency, proxy.host, NameSuffix{ .name = proxy.name } });
         }
 
         const class = PrefClass.fromProxy(proxy) orelse continue;
@@ -571,6 +586,30 @@ pub fn findBest(
         shared.best.set(class, null);
     }
     return winner;
+}
+
+test "OK/FAIL log formatters render both named and unnamed proxies" {
+    var buf: [128]u8 = undefined;
+
+    // OK: shared by `best -v` (probe.zig) and `ping` (main.zig).
+    try std.testing.expectEqualStrings(
+        "OK: 42ms 1.2.3.4 \u{2014} \u{1f1f3}\u{1f1f1} NL",
+        try std.fmt.bufPrint(&buf, "OK: {d}ms {s}{f}", .{ 42, "1.2.3.4", NameSuffix{ .name = "\u{1f1f3}\u{1f1f1} NL" } }),
+    );
+    try std.testing.expectEqualStrings(
+        "OK: 42ms 1.2.3.4",
+        try std.fmt.bufPrint(&buf, "OK: {d}ms {s}{f}", .{ 42, "1.2.3.4", NameSuffix{ .name = null } }),
+    );
+
+    // FAIL: same two call sites.
+    try std.testing.expectEqualStrings(
+        "FAIL: \u{1f1f3}\u{1f1f1} NL (1.2.3.4): slow/timeout",
+        try std.fmt.bufPrint(&buf, "FAIL: {f}: {s}", .{ HostIdent{ .name = "\u{1f1f3}\u{1f1f1} NL", .host = "1.2.3.4" }, failHint(error.Timeout) }),
+    );
+    try std.testing.expectEqualStrings(
+        "FAIL: 1.2.3.4: slow/timeout",
+        try std.fmt.bufPrint(&buf, "FAIL: {f}: {s}", .{ HostIdent{ .name = null, .host = "1.2.3.4" }, failHint(error.Timeout) }),
+    );
 }
 
 test "averageMs rounds half up via integer bias" {

@@ -146,19 +146,11 @@ fn runPing(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     defer proxy.deinit(gpa);
 
     const latency = probe.probeAverage(gpa, io, proxy, opts.timeout_secs, opts.interface) catch |err| {
-        if (proxy.name) |n| {
-            std.log.warn("FAIL: {s} ({s}): {s} ({})", .{ n, proxy.host, probe.failHint(err), err });
-        } else {
-            std.log.warn("FAIL: {s}: {s} ({})", .{ proxy.host, probe.failHint(err), err });
-        }
+        std.log.warn("FAIL: {f}: {s} ({})", .{ probe.HostIdent{ .name = proxy.name, .host = proxy.host }, probe.failHint(err), err });
         std.process.exit(1);
     };
 
-    if (proxy.name) |n| {
-        std.log.info("OK: {d}ms {s} — {s}", .{ latency, proxy.host, n });
-    } else {
-        std.log.info("OK: {d}ms {s}", .{ latency, proxy.host });
-    }
+    std.log.info("OK: {d}ms {s}{f}", .{ latency, proxy.host, probe.NameSuffix{ .name = proxy.name } });
 }
 
 test {
