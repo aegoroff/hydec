@@ -220,18 +220,6 @@ pub fn probeAverage(
     return averageMs(&samples);
 }
 
-/// `a > ratio * b`, saturating on mul overflow (treat as not exceeding).
-fn exceedsRatio(a: u64, b: u64, ratio: u64) bool {
-    const limit = std.math.mul(u64, ratio, b) catch return false;
-    return a > limit;
-}
-
-/// `a >= ratio * b`, saturating on mul overflow.
-fn atLeastRatio(a: u64, b: u64, ratio: u64) bool {
-    const limit = std.math.mul(u64, ratio, b) catch return false;
-    return a >= limit;
-}
-
 /// Pick the winning preference class from per-class fastest latencies.
 pub fn selectBestClass(
     strategy: Strategy,
@@ -264,15 +252,15 @@ fn selectHydecClass(
     if (vless2_ms) |v2| {
         var class: PrefClass = .vless2;
         if (vless3_ms) |v3| {
-            if (exceedsRatio(v2, v3, 2)) {
+            if (v2 > v3 *| 2) {
                 class = .vless3;
             }
         }
         if (ss_ms) |ss_lat| {
-            if (atLeastRatio(v2, ss_lat, 3)) {
+            if (v2 >= ss_lat *| 3) {
                 // SS eligible vs VLESS²: prefer VLESS³ unless it is >3× slower than SS.
                 if (vless3_ms) |v3| {
-                    if (exceedsRatio(v3, ss_lat, 3)) return .shadowsocks;
+                    if (v3 > ss_lat *| 3) return .shadowsocks;
                     return .vless3;
                 }
                 return .shadowsocks;
@@ -283,7 +271,7 @@ fn selectHydecClass(
 
     if (vless3_ms) |v3| {
         if (ss_ms) |ss_lat| {
-            if (exceedsRatio(v3, ss_lat, 2)) return .shadowsocks;
+            if (v3 > ss_lat *| 2) return .shadowsocks;
         }
         return .vless3;
     }
