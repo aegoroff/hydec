@@ -220,9 +220,13 @@ fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?usize {
         const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_tok, " \t"), 16) catch return null;
         pos = line_end + 2;
         if (size == 0) {
+            // No trailers: the terminating CRLF follows the last-chunk line directly.
+            // Check this before scanning for trailers, otherwise a pipelined next
+            // response's own "\r\n\r\n" is mistaken for the trailer terminator and the
+            // reported length runs past the end of this response.
+            if (pos + 2 <= buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') return pos + 2;
             // Optional trailers, then terminating CRLF.
             if (std.mem.indexOfPos(u8, buf, pos, "\r\n\r\n")) |end| return end + 4;
-            if (pos + 2 <= buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') return pos + 2;
             return null;
         }
         if (pos + size + 2 > buf.len) return null;
@@ -382,4 +386,16 @@ test "httpResponseTotalLen chunked body" {
     try std.testing.expect(httpResponseTotalLen(partial) == null);
     const full = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     try std.testing.expectEqual(@as(usize, full.len), httpResponseTotalLen(full).?);
+}
+
+test "httpResponseTotalLen chunked stops at its own terminator" {
+    const first = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    // A pipelined second response must not extend the first one's reported length.
+    const second = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expectEqual(@as(usize, first.len), httpResponseTotalLen(first ++ second).?);
+    // Trailers are still honoured when present.
+    const trailered = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-A: 1\r\nX-B: 2\r\n\r\n";
+    try std.testing.expectEqual(@as(usize, trailered.len), httpResponseTotalLen(trailered ++ second).?);
+    // Half-written terminator is still incomplete.
+    try std.testing.expect(httpResponseTotalLen("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n") == null);
 }
