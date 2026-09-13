@@ -108,22 +108,21 @@ fn readHttpUntilReady(
     http_len: *usize,
     frame_buf: []u8,
     transport_ws: bool,
-    tls_reader: *Io.Reader,
-    tls_writer: *Io.Writer,
+    conn: ws.Conn,
     stream_reader: *const Io.net.Stream.Reader,
-    stream_writer: *const Io.net.Stream.Writer,
+    stream_writer: *Io.net.Stream.Writer,
     io: Io,
     fired: *const std.atomic.Value(bool),
 ) !void {
     while (util.httpResponseTotalLen(http_buf[0..http_len.*]) == null) {
         const n = if (transport_ws)
-            ws.readBinaryFrame(tls_reader, tls_writer, io, frame_buf) catch |err| {
+            ws.readBinaryFrame(conn, io, frame_buf) catch |err| {
                 const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
                 if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
                 return e;
             }
         else blk: {
-            const got = tls_reader.readSliceShort(frame_buf) catch |err| {
+            const got = conn.reader.readSliceShort(frame_buf) catch |err| {
                 const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
                 if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
                 return e;
@@ -155,6 +154,8 @@ pub fn probe(
     timeout_secs: u32,
     bind: ?[]const u8,
 ) !u64 {
+    const sni_use = if (sni.len > 0) sni else host;
+
     const start = netutil.monoNow(io);
     const stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind);
     defer stream.close(io);
@@ -181,7 +182,6 @@ pub fn probe(
     var stream_reader = stream.reader(io, &sock_read_buf);
 
     const now = Io.Clock.real.now(io);
-    const sni_use = if (sni.len > 0) sni else host;
 
     var tls_client = std.crypto.tls.Client.init(
         &stream_reader.interface,
@@ -189,13 +189,17 @@ pub fn probe(
         tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, allow_insecure, bundle),
     ) catch |err| return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
 
-    const tls_reader = &tls_client.reader;
     const tls_writer = &tls_client.writer;
+    const conn: ws.Conn = .{
+        .reader = &tls_client.reader,
+        .tls = tls_writer,
+        .socket = &stream_writer.interface,
+    };
 
     if (transport_ws) {
         const path = if (ws_path.len > 0) ws_path else "/";
         const host_hdr = if (ws_host.len > 0) ws_host else sni_use;
-        ws.performUpgrade(tls_reader, tls_writer, io, path, host_hdr) catch |err| {
+        ws.performUpgrade(conn, io, path, host_hdr) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     }
@@ -204,14 +208,14 @@ pub fn probe(
     const req_len = try buildRequest(password, &req_buf);
 
     if (transport_ws) {
-        ws.writeBinaryFrame(tls_writer, io, req_buf[0..req_len]) catch |err| {
+        ws.writeBinaryFrame(conn, io, req_buf[0..req_len]) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     } else {
         tls_writer.writeAll(req_buf[0..req_len]) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
-        tls_writer.flush() catch |err| {
+        netutil.flushTls(tls_writer, &stream_writer.interface) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     }
@@ -222,26 +226,26 @@ pub fn probe(
     var http_len: usize = 0;
     const frame_buf = try gpa.alloc(u8, 16384);
     defer gpa.free(frame_buf);
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, tls_reader, tls_writer, &stream_reader, &stream_writer, io, &fired);
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
         return error.ProbeResponseMismatch;
 
     // Steady-state: require a real keep-alive reply (same fail-closed policy as gRPC/Vision).
     const steady_start = netutil.monoNow(io);
     if (transport_ws) {
-        ws.writeBinaryFrame(tls_writer, io, util.probe_http_steady) catch |err| {
+        ws.writeBinaryFrame(conn, io, util.probe_http_steady) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     } else {
         tls_writer.writeAll(util.probe_http_steady) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
-        tls_writer.flush() catch |err| {
+        netutil.flushTls(tls_writer, &stream_writer.interface) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     }
     http_len = 0;
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, tls_reader, tls_writer, &stream_reader, &stream_writer, io, &fired);
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
         return error.ProbeResponseMismatch;
 

@@ -1014,7 +1014,8 @@ pub fn probeVless(
 /// the first complete Application Data write, then raw TCP (xray UnwrapRawConn).
 /// Downlink: PaddingDirect enables `xtls_raw_read` — one `recv` per read (not
 /// `readSliceShort`, which fills the whole buffer and stalls on a blocking socket).
-/// Always `pipe.writer.flush()` after TLS writes — Zig's TLS client only advances the buffer.
+/// Always flush through to the socket after TLS writes (`netutil.flushTls`) — Zig's
+/// TLS client only advances the buffer.
 const VisionPipe = struct {
     rc: *RealityConn,
     uuid: [16]u8,
@@ -1248,8 +1249,7 @@ fn unwrapPipeErr(pipe: *const VisionPipe, err: anyerror) anyerror {
 
 fn flushTlsApp(tls_client: *tls.Client, pipe: *VisionPipe, request: []const u8) !void {
     tls_client.writer.writeAll(request) catch |err| return unwrapPipeErr(pipe, err);
-    tls_client.writer.flush() catch |err| return unwrapPipeErr(pipe, err);
-    pipe.writer.flush() catch |err| return unwrapPipeErr(pipe, err);
+    netutil.flushTls(&tls_client.writer, &pipe.writer) catch |err| return unwrapPipeErr(pipe, err);
 }
 
 fn readCloudflareTrace(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8, require_uag: []const u8) !usize {

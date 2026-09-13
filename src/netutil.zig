@@ -558,6 +558,16 @@ pub fn classifyIoErr(err: anyerror, writer_err: ?anyerror, reader_err: ?anyerror
     return classifyDeadlineErr(cause, fired);
 }
 
+/// Flush a TLS write all the way to the wire.
+///
+/// Zig's TLS client only encrypts into the socket writer's buffer — `Client.flush`
+/// ends in `output.advance` — so flushing the TLS writer alone leaves the record
+/// inside the process while the peer waits for it.
+pub fn flushTls(tls_writer: *Io.Writer, socket_writer: *Io.Writer) !void {
+    try tls_writer.flush();
+    try socket_writer.flush();
+}
+
 test "classifyDeadlineErr: genuine timeouts always map to Timeout" {
     try std.testing.expect(classifyDeadlineErr(error.ConnectionTimedOut, false) == error.Timeout);
     try std.testing.expect(classifyDeadlineErr(error.Timeout, false) == error.Timeout);

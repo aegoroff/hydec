@@ -1,5 +1,19 @@
 const std = @import("std");
+const netutil = @import("netutil.zig");
 const Io = std.Io;
+
+/// One TLS-backed WebSocket: `tls` encrypts, `socket` puts the ciphertext on the wire.
+/// They travel together because every write has to reach both — Zig's TLS client only
+/// advances the socket writer's buffer.
+pub const Conn = struct {
+    reader: *Io.Reader,
+    tls: *Io.Writer,
+    socket: *Io.Writer,
+
+    fn flush(self: Conn) !void {
+        return netutil.flushTls(self.tls, self.socket);
+    }
+};
 
 const ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -81,8 +95,7 @@ fn consumeUpgradeResponse(reader: *Io.Reader, key_b64: []const u8) !void {
 }
 
 pub fn performUpgrade(
-    reader: *Io.Reader,
-    writer: *Io.Writer,
+    conn: Conn,
     io: Io,
     path: []const u8,
     host_header: []const u8,
@@ -102,13 +115,14 @@ pub fn performUpgrade(
         "GET {s} HTTP/1.1\r\nHost: {s}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n\r\n",
         .{ path, host_header, key_b64 },
     );
-    try writer.writeAll(req);
-    try writer.flush();
+    try conn.tls.writeAll(req);
+    try conn.flush();
 
-    try consumeUpgradeResponse(reader, key_b64);
+    try consumeUpgradeResponse(conn.reader, key_b64);
 }
 
-fn writeControlFrame(writer: *Io.Writer, io: Io, opcode: u8, payload: []const u8) !void {
+fn writeControlFrame(conn: Conn, io: Io, opcode: u8, payload: []const u8) !void {
+    const writer = conn.tls;
     if (payload.len > 125) return error.PayloadTooLarge;
     var mask: [4]u8 = undefined;
     io.random(&mask);
@@ -122,10 +136,11 @@ fn writeControlFrame(writer: *Io.Writer, io: Io, opcode: u8, payload: []const u8
     while (i < payload.len) : (i += 1) {
         try writer.writeByte(payload[i] ^ mask[i % 4]);
     }
-    try writer.flush();
+    try conn.flush();
 }
 
-pub fn writeBinaryFrame(writer: *Io.Writer, io: Io, payload: []const u8) !void {
+pub fn writeBinaryFrame(conn: Conn, io: Io, payload: []const u8) !void {
+    const writer = conn.tls;
     var mask: [4]u8 = undefined;
     io.random(&mask);
 
@@ -149,12 +164,13 @@ pub fn writeBinaryFrame(writer: *Io.Writer, io: Io, payload: []const u8) !void {
     while (i < payload.len) : (i += 1) {
         try writer.writeByte(payload[i] ^ mask[i % 4]);
     }
-    try writer.flush();
+    try conn.flush();
 }
 
 /// Read the next complete binary data frame (FIN), answering ping and ignoring pong.
 /// Empty or text frames are rejected so Trojan-over-WS matches TCP's ≥1-byte bar.
-pub fn readBinaryFrame(reader: *Io.Reader, writer: *Io.Writer, io: Io, out: []u8) !usize {
+pub fn readBinaryFrame(conn: Conn, io: Io, out: []u8) !usize {
+    const reader = conn.reader;
     while (true) {
         var hdr: [2]u8 = undefined;
         try reader.readSliceAll(&hdr);
@@ -196,7 +212,7 @@ pub fn readBinaryFrame(reader: *Io.Reader, writer: *Io.Writer, io: Io, out: []u8
         switch (opcode) {
             0x8 => return error.WebSocketClosed,
             0x9 => {
-                try writeControlFrame(writer, io, 0xA, out[0..len]);
+                try writeControlFrame(conn, io, 0xA, out[0..len]);
                 continue;
             },
             0xA => continue,
@@ -258,14 +274,15 @@ test "readBinaryFrame BufferTooSmall drains payload" {
         0x82, 0x01, 'Z',
     };
     var reader: Io.Reader = .fixed(&wire);
-    var sink_buf: [64]u8 = undefined;
-    var writer: Io.Writer = .fixed(&sink_buf);
+    var out_buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&out_buf);
+    const conn: Conn = .{ .reader = &reader, .tls = &writer, .socket = &writer };
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var small: [2]u8 = undefined;
-    try std.testing.expectError(error.BufferTooSmall, readBinaryFrame(&reader, &writer, io, &small));
+    try std.testing.expectError(error.BufferTooSmall, readBinaryFrame(conn, io, &small));
     var out: [8]u8 = undefined;
-    const n = try readBinaryFrame(&reader, &writer, io, &out);
+    const n = try readBinaryFrame(conn, io, &out);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
 }
@@ -277,13 +294,14 @@ test "readBinaryFrame drains 64-bit length frame for alignment" {
         'a',  'b',  'c',  0x82, 0x01, 'Z',
     };
     var reader: Io.Reader = .fixed(&wire);
-    var sink_buf: [64]u8 = undefined;
-    var writer: Io.Writer = .fixed(&sink_buf);
+    var out_buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&out_buf);
+    const conn: Conn = .{ .reader = &reader, .tls = &writer, .socket = &writer };
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var out: [8]u8 = undefined;
-    try std.testing.expectError(error.PayloadTooLarge, readBinaryFrame(&reader, &writer, io, &out));
-    const n = try readBinaryFrame(&reader, &writer, io, &out);
+    try std.testing.expectError(error.PayloadTooLarge, readBinaryFrame(conn, io, &out));
+    const n = try readBinaryFrame(conn, io, &out);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
 }
@@ -297,13 +315,66 @@ test "readBinaryFrame drains masked 64-bit length frame" {
         0x82, 0x01, 'Z',
     };
     var reader: Io.Reader = .fixed(&wire);
-    var sink_buf: [64]u8 = undefined;
-    var writer: Io.Writer = .fixed(&sink_buf);
+    var out_buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&out_buf);
+    const conn: Conn = .{ .reader = &reader, .tls = &writer, .socket = &writer };
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var out: [8]u8 = undefined;
-    try std.testing.expectError(error.PayloadTooLarge, readBinaryFrame(&reader, &writer, io, &out));
-    const n = try readBinaryFrame(&reader, &writer, io, &out);
+    try std.testing.expectError(error.PayloadTooLarge, readBinaryFrame(conn, io, &out));
+    const n = try readBinaryFrame(conn, io, &out);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
+}
+
+/// Stands in for the socket writer beneath the TLS writer, recording `flush`.
+const FlushSpy = struct {
+    interface: Io.Writer = .{ .buffer = &.{}, .vtable = &vtable },
+    flushes: usize = 0,
+
+    const vtable: Io.Writer.VTable = .{ .drain = drain, .flush = flush };
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        _ = splat;
+        w.end = 0;
+        var n: usize = 0;
+        for (data) |d| n += d.len;
+        return n;
+    }
+
+    fn flush(w: *Io.Writer) Io.Writer.Error!void {
+        const spy: *FlushSpy = @alignCast(@fieldParentPtr("interface", w));
+        spy.flushes += 1;
+    }
+};
+
+test "writeBinaryFrame flushes through to the socket writer" {
+    // Regression: Zig's TLS writer only encrypts into the socket writer's buffer,
+    // so without the socket flush the frame never leaves the process.
+    var spy: FlushSpy = .{};
+    var buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const conn: Conn = .{ .reader = undefined, .tls = &writer, .socket = &spy.interface };
+    try writeBinaryFrame(conn, io, "hi");
+
+    try std.testing.expectEqual(@as(usize, 1), spy.flushes);
+}
+
+test "performUpgrade flushes through to the socket writer before reading" {
+    var spy: FlushSpy = .{};
+    var buf: [512]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    var reader: Io.Reader = .fixed("");
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    // Empty response: the read fails, but only after the request was pushed out.
+    const conn: Conn = .{ .reader = &reader, .tls = &writer, .socket = &spy.interface };
+    try std.testing.expectError(
+        error.UnexpectedEndOfStream,
+        performUpgrade(conn, io, "/", "example.com"),
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), spy.flushes);
 }
