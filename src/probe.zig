@@ -398,6 +398,18 @@ pub fn failHint(err: anyerror) []const u8 {
         error.UnsupportedVlessEncryption => "unsupported-encryption",
         error.BufferTooSmall, error.RecordTooLarge => "buffer/overflow",
         error.SystemResources => "sys/resources",
+        // Hostname resolution (netutil.connectHostnameTimed). Split three ways because
+        // the fixes differ: a dead subscription entry, a broken local resolver, and a
+        // hostname the URI got wrong.
+        error.UnknownHostName, error.NoAddressReturned => "dns/no-address",
+        error.NameServerFailure,
+        error.ResolvConfParseFailed,
+        error.DetectingNetworkConfigurationFailed,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        => "dns/failure",
+        error.InvalidHostName, error.NameTooLong => "dns/bad-name",
         // --interface binding failures (interface name / source IP).
         error.NoSuchInterface => "iface/missing",
         error.EmptyInterfaceName => "iface/empty",
@@ -741,4 +753,21 @@ test "Strategy.parse accepts known names" {
     try std.testing.expectEqual(@as(?Strategy, .strict), Strategy.parse("strict"));
     try std.testing.expectEqual(@as(?Strategy, null), Strategy.parse("unknown"));
     try std.testing.expectEqual(@as(?Strategy, null), Strategy.parse(""));
+}
+
+test "failHint names DNS failures instead of falling through to error" {
+    // Io.net.HostName.LookupError plus the ValidateError from HostName.init, both
+    // reachable through netutil.connectHostnameTimed for a hostname-based proxy.
+    try std.testing.expectEqualStrings("dns/no-address", failHint(error.NoAddressReturned));
+    try std.testing.expectEqualStrings("dns/no-address", failHint(error.UnknownHostName));
+    try std.testing.expectEqualStrings("dns/failure", failHint(error.NameServerFailure));
+    try std.testing.expectEqualStrings("dns/failure", failHint(error.ResolvConfParseFailed));
+    try std.testing.expectEqualStrings("dns/failure", failHint(error.DetectingNetworkConfigurationFailed));
+    try std.testing.expectEqualStrings("dns/failure", failHint(error.InvalidDnsARecord));
+    try std.testing.expectEqualStrings("dns/failure", failHint(error.InvalidDnsAAAARecord));
+    try std.testing.expectEqualStrings("dns/failure", failHint(error.InvalidDnsCnameRecord));
+    try std.testing.expectEqualStrings("dns/bad-name", failHint(error.InvalidHostName));
+    try std.testing.expectEqualStrings("dns/bad-name", failHint(error.NameTooLong));
+    // A resolver timeout stays a timeout: netutil maps the deadline race to Timeout.
+    try std.testing.expectEqualStrings("slow/timeout", failHint(error.Timeout));
 }
