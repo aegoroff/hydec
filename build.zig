@@ -82,20 +82,6 @@ const pinned_glibc: std.Target.Query.SemanticVersion = .{
     .patch = 0,
 };
 
-fn materializeHostTriple(query: *std.Target.Query) void {
-    if (query.cpu_arch == null) query.cpu_arch = builtin.cpu.arch;
-    if (query.os_tag == null) query.os_tag = builtin.target.os.tag;
-    if (query.abi == null) query.abi = builtin.target.abi;
-}
-
-fn needsHostTripleMaterialization(query: std.Target.Query) bool {
-    if (query.cpu_arch != null or query.os_tag != null) return false;
-    return switch (query.cpu_model) {
-        .native, .explicit => true,
-        .baseline, .determined_by_arch_os => false,
-    };
-}
-
 fn resolveTarget(b: *std.Build) std.Build.ResolvedTarget {
     const default_target: std.Target.Query = .{
         .abi = .gnu,
@@ -106,9 +92,16 @@ fn resolveTarget(b: *std.Build) std.Build.ResolvedTarget {
         .default_target = default_target,
     });
 
-    if (needsHostTripleMaterialization(query)) {
-        materializeHostTriple(&query);
-    }
+    // A -Dcpu without -Dtarget must not silently switch the build over to native
+    // OS-version detection: spell out the host triple so it matches -Dtarget.
+    if (query.cpu_arch == null and query.os_tag == null) switch (query.cpu_model) {
+        .native, .explicit => {
+            query.cpu_arch = builtin.cpu.arch;
+            query.os_tag = builtin.target.os.tag;
+            query.abi = query.abi orelse builtin.target.abi;
+        },
+        .baseline, .determined_by_arch_os => {},
+    };
 
     if (query.glibc_version == null) {
         const os = query.os_tag orelse builtin.target.os.tag;
