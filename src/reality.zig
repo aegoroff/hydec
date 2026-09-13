@@ -912,25 +912,31 @@ pub fn probeVless(
             const payload = gather[off + 9 .. off + 9 + frame_len];
             const inflight = warmup_done and off < discard_data_before;
 
-            if (ftyp == 0x04 and (fflags & 0x01) == 0 and !settings_seen) {
-                settings_seen = true;
+            if (ftyp == 0x04 and (fflags & 0x01) == 0) {
+                // RFC 9113 6.5.3: *every* SETTINGS without ACK must be acknowledged,
+                // not just the first. Peers send more mid-connection and time the ACK
+                // out with a GOAWAY, so the ack is unconditional; only the first one
+                // also opens the gun stream.
                 var flight: [1536]u8 = undefined;
                 var fl: usize = 0;
                 fl += try grpc_gun.buildSettingsAck(flight[fl..]);
-                // Open the flow-control window generously (some peers start at 0).
-                fl += try grpc_gun.buildWindowUpdate(flight[fl..], 0, 1 << 20);
-                fl += try grpc_gun.buildWindowUpdate(flight[fl..], 1, 1 << 20);
-                fl += try grpc_gun.buildGunHeaders(flight[fl..], service_name, authority);
-                var hunk: [640]u8 = undefined;
-                const hunk_len = try grpc_gun.wrapHunk(&hunk, vless_buf[0..vless_len]);
-                var grpc_msg: [704]u8 = undefined;
-                const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
-                // Keep the stream open — gun-lite is bidirectional; END_STREAM yields empty 200s.
-                fl += try grpc_gun.buildDataFrame(flight[fl..], 1, grpc_msg[0..glen], false);
+                if (!settings_seen) {
+                    settings_seen = true;
+                    // Open the flow-control window generously (some peers start at 0).
+                    fl += try grpc_gun.buildWindowUpdate(flight[fl..], 0, 1 << 20);
+                    fl += try grpc_gun.buildWindowUpdate(flight[fl..], 1, 1 << 20);
+                    fl += try grpc_gun.buildGunHeaders(flight[fl..], service_name, authority);
+                    var hunk: [640]u8 = undefined;
+                    const hunk_len = try grpc_gun.wrapHunk(&hunk, vless_buf[0..vless_len]);
+                    var grpc_msg: [704]u8 = undefined;
+                    const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
+                    // Keep the stream open — gun-lite is bidirectional; END_STREAM yields empty 200s.
+                    fl += try grpc_gun.buildDataFrame(flight[fl..], 1, grpc_msg[0..glen], false);
+                    request_sent = true;
+                    saw_headers_ok = false;
+                    saw_grpc_data = false;
+                }
                 try rc.writeApp(flight[0..fl]);
-                request_sent = true;
-                saw_headers_ok = false;
-                saw_grpc_data = false;
             } else if (ftyp == 0x06 and (fflags & 0x01) == 0 and frame_len == 8) {
                 var pong: [17]u8 = undefined;
                 const pong_len = try grpc_gun.buildPingAck(&pong, payload[0..8]);

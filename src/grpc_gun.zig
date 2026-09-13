@@ -426,6 +426,20 @@ test "preface starts correctly" {
     try std.testing.expect(std.mem.startsWith(u8, out[0..n], "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"));
 }
 
+test "buildSettingsAck is an empty ACK frame on stream 0" {
+    // RFC 9113 6.5: length 0, type SETTINGS, ACK flag, stream 0. The gRPC loop now
+    // emits this for every non-ACK SETTINGS, so the shape is load-bearing: a peer
+    // that cannot match it answers a missed acknowledgement with GOAWAY.
+    var out: [16]u8 = undefined;
+    const n = try buildSettingsAck(&out);
+    try std.testing.expectEqual(@as(usize, 9), n);
+    try std.testing.expectEqualSlices(
+        u8,
+        &[_]u8{ 0, 0, 0, 0x04, 0x01, 0, 0, 0, 0 },
+        out[0..n],
+    );
+}
+
 test "headersIndicateStatus200 skips padding" {
     // PADDED + indexed :status 200
     const payload = [_]u8{ 2, 0x88, 0xaa, 0xbb };
