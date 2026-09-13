@@ -105,6 +105,12 @@ fn stripFragment(s: []const u8) []const u8 {
     return s;
 }
 
+/// Drop the path component of an authority (`host:port/...` → `host:port`).
+fn stripPath(s: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, s, '/')) |i| return s[0..i];
+    return s;
+}
+
 /// URL-decoded `#remark` from a subscription line, or null if absent/empty.
 pub fn parseName(gpa: std.mem.Allocator, line: []const u8) !?[]const u8 {
     const hash = std.mem.indexOfScalar(u8, line, '#') orelse return null;
@@ -135,7 +141,9 @@ fn parseUserAtHost(gpa: std.mem.Allocator, rest: []const u8, default_port: u16) 
 
     const at = std.mem.indexOfScalar(u8, address_part, '@') orelse return error.InvalidProxyUri;
     const raw_user = address_part[0..at];
-    const hostport = address_part[at + 1 ..];
+    // Drop any path after the authority (`trojan://pw@host:443/?type=ws`); only
+    // the userinfo may legally contain '/', so cut after the '@'.
+    const hostport = stripPath(address_part[at + 1 ..]);
     const hp = try util.splitHostPortOrDefault(hostport, default_port);
     const userinfo = try util.urlDecodeStrict(gpa, raw_user);
     return .{
@@ -208,8 +216,11 @@ fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     // SIP002: base64(method:password)@host:port
     if (std.mem.indexOfScalar(u8, rest0, '@')) |at| {
         const encoded_user = rest0[0..at];
+        // SIP002 allows a bare path between the port and the query:
+        // `ss://<b64>@host:port/?plugin=...`.
         var hostport = rest0[at + 1 ..];
         if (std.mem.indexOfScalar(u8, hostport, '?')) |q| hostport = hostport[0..q];
+        hostport = stripPath(hostport);
         const hp = try util.splitHostPortOrDefault(hostport, 8388);
 
         const decoded = try decodeUserinfo(gpa, encoded_user);
@@ -237,7 +248,9 @@ fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     }
 
     // Legacy: entire rest is base64(method:password@host:port)
-    const decoded = try decodeUserinfo(gpa, rest0);
+    var encoded = rest0;
+    if (std.mem.indexOfScalar(u8, encoded, '?')) |q| encoded = encoded[0..q];
+    const decoded = try decodeLegacyBlob(gpa, encoded);
     defer gpa.free(decoded);
     // Last '@' separates userinfo from host — passwords may contain '@'.
     const at = std.mem.lastIndexOfScalar(u8, decoded, '@') orelse return error.InvalidProxyUri;
@@ -267,6 +280,36 @@ fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
         .owns_method_password = true,
         .name = name,
     };
+}
+
+/// Decode a legacy `ss://` blob into `method:password@host:port`.
+///
+/// The blob is tried unmodified first, then once more without a trailing '/', so
+/// anything that parses today keeps parsing the same way and the retry only widens
+/// acceptance to blobs carrying SIP002's optional path separator.
+///
+/// The retry cannot silently change a reading, because a well-formed legacy blob
+/// never ends in '/': its plaintext ends in a decimal port or a host character, and
+/// alphabet index 63 requires a final byte with six low one-bits. For the same
+/// reason an appended '/' decodes to a 0x3F/0x7F/0xBF/0xFF byte, never a digit, so
+/// the shape check below always rejects the spurious reading.
+fn decodeLegacyBlob(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    if (decodeLegacyBlobExact(gpa, encoded)) |decoded| return decoded else |err| {
+        if (encoded.len == 0 or encoded[encoded.len - 1] != '/') return err;
+        return decodeLegacyBlobExact(gpa, encoded[0 .. encoded.len - 1]);
+    }
+}
+
+/// base64 → `method:password@host:port`, rejecting blobs without that shape so
+/// `decodeLegacyBlob` can tell a stray path separator from real base64 data.
+fn decodeLegacyBlobExact(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const decoded = try decodeUserinfo(gpa, encoded);
+    errdefer gpa.free(decoded);
+    // Last '@' separates userinfo from host — passwords may contain '@'.
+    const at = std.mem.lastIndexOfScalar(u8, decoded, '@') orelse return error.InvalidProxyUri;
+    if (std.mem.indexOfScalar(u8, decoded[0..at], ':') == null) return error.InvalidProxyUri;
+    _ = try util.splitHostPortOrDefault(decoded[at + 1 ..], 8388);
+    return decoded;
 }
 
 fn decodeUserinfo(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
@@ -415,4 +458,95 @@ test "parseName keeps plus in fragment" {
     const name = try parseName(gpa, "ss://x#foo+bar");
     defer if (name) |n| gpa.free(n);
     try std.testing.expectEqualStrings("foo+bar", name.?);
+}
+
+test "parse strips path after the authority" {
+    const gpa = std.testing.allocator;
+    // SIP002 allows a bare "/" between port and query; trojan/vless URIs carry one too.
+    const lines = [_][]const u8{
+        "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3Jk@192.0.2.10:2060/#tag",
+        "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3Jk@192.0.2.10:2060/?plugin=obfs-local#tag",
+        "trojan://test-password@192.0.2.10:2060/?security=tls&type=ws#tag",
+        "vless://00000000-1111-2222-3333-444444444444@192.0.2.10:2060/?security=reality&type=grpc&pbk=AAAA#tag",
+    };
+    for (lines) |line| {
+        var p = try parse(gpa, line);
+        defer p.deinit(gpa);
+        try std.testing.expectEqualStrings("192.0.2.10", p.host);
+        try std.testing.expectEqual(@as(u16, 2060), p.port);
+        try std.testing.expectEqualStrings("tag", p.name.?);
+    }
+}
+
+test "parse keeps query and transport past a path" {
+    const gpa = std.testing.allocator;
+    var p = try parse(gpa, "trojan://pw@192.0.2.10:2058/some/path?security=tls&type=ws&sni=example.com#tag");
+    defer p.deinit(gpa);
+    try std.testing.expectEqualStrings("192.0.2.10", p.host);
+    try std.testing.expectEqual(@as(u16, 2058), p.port);
+    try std.testing.expect(p.transport == .ws);
+    try std.testing.expect(p.security == .tls);
+    try std.testing.expectEqualStrings("example.com", p.getParam("sni").?);
+}
+
+test "stripPath does not touch a slash inside userinfo" {
+    const gpa = std.testing.allocator;
+    // A literal '/' in a trojan password must survive: only bytes after '@' are cut.
+    // Percent-encoded (%2F) would not exercise this — stripPath never sees the slash.
+    var p = try parse(gpa, "trojan://pa/ss@192.0.2.10:443/?security=tls");
+    defer p.deinit(gpa);
+    try std.testing.expectEqualStrings("pa/ss", p.userinfo);
+    try std.testing.expectEqualStrings("192.0.2.10", p.host);
+}
+
+test "parse ss keeps a slash inside base64 userinfo when a path follows" {
+    const gpa = std.testing.allocator;
+    // base64("aes-256-gcm:q\xc3\xbf") ends in '/': stripPath must only cut after '@'.
+    var p = try parse(gpa, "ss://YWVzLTI1Ni1nY206ccO/@192.0.2.10:2060/#tag");
+    defer p.deinit(gpa);
+    try std.testing.expectEqualStrings("aes-256-gcm", p.method.?);
+    try std.testing.expectEqualStrings("q\xc3\xbf", p.password.?);
+    try std.testing.expectEqualStrings("192.0.2.10", p.host);
+    try std.testing.expectEqual(@as(u16, 2060), p.port);
+}
+
+test "parse ss legacy accepts a trailing path and query" {
+    const gpa = std.testing.allocator;
+    // base64("chacha20-ietf-poly1305:test-password@192.0.2.10:2060")
+    const blob = "Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3JkQDE5Mi4wLjIuMTA6MjA2MA";
+    const lines = [_][]const u8{
+        "ss://" ++ blob ++ "#tag",
+        "ss://" ++ blob ++ "/#tag",
+        "ss://" ++ blob ++ "/?plugin=x#tag",
+        "ss://" ++ blob ++ "?plugin=x#tag",
+    };
+    for (lines) |line| {
+        var p = try parse(gpa, line);
+        defer p.deinit(gpa);
+        try std.testing.expect(p.owns_host);
+        try std.testing.expectEqualStrings("192.0.2.10", p.host);
+        try std.testing.expectEqual(@as(u16, 2060), p.port);
+        try std.testing.expectEqualStrings("chacha20-ietf-poly1305", p.method.?);
+        try std.testing.expectEqualStrings("test-password", p.password.?);
+    }
+}
+
+test "parse ss legacy trailing slash is not swallowed as base64 data" {
+    const gpa = std.testing.allocator;
+    // base64("aes-256-gcm:p@192.0.2.10:2060") is 39 chars, so the blob *plus* '/' is
+    // also a decodable length: it yields "...:2060?" and only the host:port shape
+    // check rejects that reading, letting the retry find the real one.
+    var p = try parse(gpa, "ss://YWVzLTI1Ni1nY206cEAxOTIuMC4yLjEwOjIwNjA/#tag");
+    defer p.deinit(gpa);
+    try std.testing.expectEqualStrings("192.0.2.10", p.host);
+    try std.testing.expectEqual(@as(u16, 2060), p.port);
+    try std.testing.expectEqualStrings("aes-256-gcm", p.method.?);
+    try std.testing.expectEqualStrings("p", p.password.?);
+}
+
+test "parse ss legacy still rejects a blob that is not method:password@host:port" {
+    const gpa = std.testing.allocator;
+    // base64("nonsense") — no '@', so neither reading has the legacy shape.
+    try std.testing.expectError(error.InvalidProxyUri, parse(gpa, "ss://bm9uc2Vuc2U"));
+    try std.testing.expectError(error.InvalidProxyUri, parse(gpa, "ss://bm9uc2Vuc2U/"));
 }
