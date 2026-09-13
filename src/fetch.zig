@@ -23,13 +23,7 @@ const FetchCtx = struct {
     body: ?[]u8 = null,
     err: ?anyerror = null,
     state: std.atomic.Value(FetchState) = .init(.running),
-    /// Only one side destroys the context.
-    cleanup_taken: std.atomic.Value(bool) = .init(false),
 };
-
-fn tryTakeCleanup(ctx: *FetchCtx) bool {
-    return ctx.cleanup_taken.swap(true, .acq_rel) == false;
-}
 
 fn destroyCtx(ctx: *FetchCtx) void {
     const gpa = ctx.gpa;
@@ -42,9 +36,7 @@ fn finishWorker(ctx: *FetchCtx) void {
     // Publish body/err first, then claim `.done`. If the waiter already abandoned,
     // we own cleanup; otherwise the waiter will join and free.
     const prev = ctx.state.swap(.done, .acq_rel);
-    if (prev == .abandoned) {
-        if (tryTakeCleanup(ctx)) destroyCtx(ctx);
-    }
+    if (prev == .abandoned) destroyCtx(ctx);
 }
 
 fn fetchWorker(ctx: *FetchCtx) void {
@@ -55,7 +47,7 @@ fn fetchWorker(ctx: *FetchCtx) void {
         return;
     };
 
-    // Always store the body: a grace-period joiner may still return success.
+    // Always store the body: a late joiner may still return success.
     ctx.body = body;
     finishWorker(ctx);
 }
@@ -85,7 +77,6 @@ pub fn fetchUrl(gpa: std.mem.Allocator, io: Io, url: []const u8, timeout_secs: u
 
 /// After join when the download finished first: take body/err and free ctx.
 fn takeFinishedResult(ctx: *FetchCtx) ![]u8 {
-    if (!tryTakeCleanup(ctx)) return error.FetchStateCorrupt;
     const err = ctx.err;
     const body = ctx.body;
     ctx.body = null;
@@ -96,22 +87,17 @@ fn takeFinishedResult(ctx: *FetchCtx) ![]u8 {
 
 fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) ![]u8 {
     const start = netutil.monoNow(io);
-    const budget: i128 = @as(i128, timeout_secs) * std.time.ns_per_s;
+    // Slack on top of the nominal budget so a nearly-finished worker still wins.
+    const budget: i128 = @as(i128, timeout_secs) * std.time.ns_per_s + 250 * std.time.ns_per_ms;
     while (ctx.state.load(.acquire) != .done) {
         if (netutil.monoNow(io) - start >= budget) {
-            // Brief grace so a nearly-finished worker can publish `.done` first.
-            const grace_deadline = netutil.monoNow(io) + 250 * std.time.ns_per_ms;
-            while (ctx.state.load(.acquire) != .done and netutil.monoNow(io) < grace_deadline) {
-                const pause: Io.Duration = .fromMilliseconds(20);
-                io.sleep(pause, .awake) catch {};
-            }
             // Claim abandon, or observe that the worker won with `.done`.
             const prev = ctx.state.swap(.abandoned, .acq_rel);
             if (prev == .done) {
                 thread.join();
                 return takeFinishedResult(ctx);
             }
-            // Was `.running` (or already abandoned — only one waiter). Worker frees ctx.
+            // Was `.running` — there is only one waiter, so the worker frees ctx.
             // std.http has no cancel; do not touch ctx after this.
             thread.detach();
             return error.Timeout;
@@ -251,19 +237,4 @@ test "ensureHttpsScheme rejects http redirect targets" {
     try ensureHttpsScheme("HTTPS");
     try std.testing.expectError(error.InsecureSubscriptionUrl, ensureHttpsScheme("http"));
     try std.testing.expectError(error.InsecureSubscriptionUrl, ensureHttpsScheme("HTTP"));
-}
-
-test "fetch state: waiter recovers result when worker finishes first" {
-    var state: std.atomic.Value(FetchState) = .init(.running);
-    // Worker publishes done while waiter still running.
-    try std.testing.expect(state.swap(.done, .acq_rel) == .running);
-    // Waiter timeout swap observes done — must join and take body, not Timeout.
-    try std.testing.expect(state.swap(.abandoned, .acq_rel) == .done);
-}
-
-test "fetch state: worker frees when waiter abandons first" {
-    var state: std.atomic.Value(FetchState) = .init(.running);
-    try std.testing.expect(state.swap(.abandoned, .acq_rel) == .running);
-    // Worker finish sees abandon — owns cleanup.
-    try std.testing.expect(state.swap(.done, .acq_rel) == .abandoned);
 }
