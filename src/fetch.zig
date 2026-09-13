@@ -136,8 +136,6 @@ fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
     };
     defer client.deinit();
 
-    try ensureTlsReady(&client);
-
     while (true) {
         const uri = try requireHttpsUri(current_url);
 
@@ -239,30 +237,6 @@ fn requireHttpsUri(url: []const u8) (std.Uri.ParseError || error{InsecureSubscri
 
 fn ensureHttpsScheme(scheme: []const u8) error{InsecureSubscriptionUrl}!void {
     if (!std.ascii.eqlIgnoreCase(scheme, "https")) return error.InsecureSubscriptionUrl;
-}
-
-fn ensureTlsReady(client: *http.Client) !void {
-    if (http.Client.disable_tls) return;
-
-    const io = client.io;
-    {
-        try client.ca_bundle_lock.lockShared(io);
-        defer client.ca_bundle_lock.unlockShared(io);
-        if (client.now != null) return;
-    }
-
-    var bundle: std.crypto.Certificate.Bundle = .empty;
-    defer bundle.deinit(client.allocator);
-    const now = Io.Clock.real.now(io);
-    bundle.rescan(client.allocator, io, now) catch |err| switch (err) {
-        error.Canceled => |e| return e,
-        else => return error.CertificateBundleLoadFailure,
-    };
-    try client.ca_bundle_lock.lock(io);
-    defer client.ca_bundle_lock.unlock(io);
-    if (client.now != null) return;
-    client.now = now;
-    std.mem.swap(std.crypto.Certificate.Bundle, &client.ca_bundle, &bundle);
 }
 
 test "requireHttpsUri rejects plaintext and normalizes scheme case" {
