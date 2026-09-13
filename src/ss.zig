@@ -119,6 +119,12 @@ const AeadCtx = struct {
 /// Shadowsocks AEAD max payload length (SIP004).
 const max_chunk_payload: u16 = 0x3FFF;
 
+/// Probe response buffer. One maximal chunk of headroom on top of `max_chunk_payload`:
+/// `takeResponse` carries pipelined leftovers at the front, and without the headroom
+/// that leftover would shrink the destination below one full chunk and turn the next
+/// `readOpenChunk` into `error.BufferTooSmall`.
+const http_buf_len: usize = @as(usize, max_chunk_payload) * 2;
+
 fn sealChunk(ctx: *AeadCtx, out: []u8, plaintext: []const u8) error{ BufferTooSmall, InvalidSsChunk }!usize {
     // [len_ct(2)][len_tag(16)][payload_ct][payload_tag(16)]
     if (plaintext.len == 0 or plaintext.len > max_chunk_payload) return error.InvalidSsChunk;
@@ -178,6 +184,48 @@ fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8, scratch: []u8) !u
     try reader.readSliceAll(&payload_tag);
     try ctx.open(out[0..payload_len], scratch[0..payload_len], &payload_tag);
     return payload_len;
+}
+
+/// Consume one complete HTTP response from the front of `http_buf`.
+///
+/// Returns false while the response is still short. On completion the echoed UA is
+/// checked against that response only (not the whole buffer, which may already hold
+/// the pipelined next one), and any leftover bytes are shifted down to offset 0 so
+/// the following call continues from them.
+fn takeResponse(http_buf: []u8, http_len: *usize, require_uag: []const u8) error{ProbeResponseMismatch}!bool {
+    const total = util.httpResponseTotalLen(http_buf[0..http_len.*]) orelse return false;
+    if (!util.looksLikeCloudflareTraceUag(http_buf[0..total], require_uag))
+        return error.ProbeResponseMismatch;
+    const remain = http_len.* - total;
+    if (remain > 0) std.mem.copyForwards(u8, http_buf[0..remain], http_buf[total..http_len.*]);
+    http_len.* = remain;
+    return true;
+}
+
+/// Read AEAD chunks until `takeResponse` consumes one response echoing `require_uag`.
+fn readProbeResponse(
+    server_ctx: *AeadCtx,
+    sr: *Io.net.Stream.Reader,
+    fired: *const std.atomic.Value(bool),
+    http_buf: []u8,
+    http_len: *usize,
+    chunk_buf: []u8,
+    require_uag: []const u8,
+) !void {
+    while (!try takeResponse(http_buf, http_len, require_uag)) {
+        const n = readOpenChunk(server_ctx, &sr.interface, http_buf[http_len.*..], chunk_buf) catch |err| {
+            const e = netutil.classifyIoErr(err, null, sr.err, fired.load(.acquire));
+            // HTTP/1.0 close-delimited only — truncated CL/chunked must fail.
+            if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) {
+                if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len.*], require_uag))
+                    return error.ProbeResponseMismatch;
+                http_len.* = 0;
+                return;
+            }
+            return e;
+        };
+        http_len.* += n;
+    }
 }
 
 /// Probe SS AEAD: warmup + pipelined steady HTTP (Cloudflare `/cdn-cgi/trace`).
@@ -268,35 +316,16 @@ pub fn probe(
 
     const chunk_buf = try gpa.alloc(u8, max_chunk_payload);
     defer gpa.free(chunk_buf);
-    const http_buf = try gpa.alloc(u8, max_chunk_payload);
+    const http_buf = try gpa.alloc(u8, http_buf_len);
     defer gpa.free(http_buf);
     var http_len: usize = 0;
 
-    // Warmup response (request was in the initial flight).
-    while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-        const n = readOpenChunk(&server_ctx, &r.interface, http_buf[http_len..], chunk_buf) catch |err| {
-            const e = netutil.classifyIoErr(err, null, r.err, fired.load(.acquire));
-            // HTTP/1.0 close-delimited only — truncated CL/chunked must fail.
-            if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
-            return e;
-        };
-        http_len += n;
-    }
-    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
-        return error.ProbeResponseMismatch;
-
-    // Steady response (pipelined write above).
-    http_len = 0;
-    while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
-        const n = readOpenChunk(&server_ctx, &r.interface, http_buf[http_len..], chunk_buf) catch |err| {
-            const e = netutil.classifyIoErr(err, null, r.err, fired.load(.acquire));
-            if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) break;
-            return e;
-        };
-        http_len += n;
-    }
-    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
-        return error.ProbeResponseMismatch;
+    // Warmup response (request was in the initial flight), then the steady response.
+    // The steady request is pipelined above, so one AEAD chunk may carry the tail of
+    // the warmup response together with the head of the steady one — `takeResponse`
+    // keeps that leftover instead of dropping it.
+    try readProbeResponse(&server_ctx, &r, &fired, http_buf, &http_len, chunk_buf, util.probe_ua_warmup);
+    try readProbeResponse(&server_ctx, &r, &fired, http_buf, &http_len, chunk_buf, util.probe_ua_steady);
 
     return netutil.elapsedMs(steady_start, io);
 }
@@ -380,4 +409,80 @@ test "aead open rejects bad tag" {
 
 test "method from name" {
     try std.testing.expect(Method.fromName("chacha20-ietf-poly1305") == .chacha20_ietf_poly1305);
+}
+
+const test_warm_resp =
+    "HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\nvisit_scheme=http\nuag=hydec-warmup\n";
+const test_steady_resp =
+    "HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\nvisit_scheme=http\nuag=hydec-steady\n";
+
+test "takeResponse keeps bytes of the pipelined next response" {
+    var buf: [512]u8 = undefined;
+    // One read delivered the whole warmup response plus the head of the steady one.
+    const head = test_steady_resp[0..20];
+    @memcpy(buf[0..test_warm_resp.len], test_warm_resp);
+    @memcpy(buf[test_warm_resp.len..][0..head.len], head);
+    var len: usize = test_warm_resp.len + head.len;
+
+    try std.testing.expect(try takeResponse(&buf, &len, util.probe_ua_warmup));
+    // Steady head survives at offset 0 instead of being dropped.
+    try std.testing.expectEqual(head.len, len);
+    try std.testing.expectEqualStrings(head, buf[0..len]);
+    try std.testing.expect(!try takeResponse(&buf, &len, util.probe_ua_steady));
+
+    const tail = test_steady_resp[20..];
+    @memcpy(buf[len..][0..tail.len], tail);
+    len += tail.len;
+    try std.testing.expect(try takeResponse(&buf, &len, util.probe_ua_steady));
+    try std.testing.expectEqual(@as(usize, 0), len);
+}
+
+test "takeResponse validates the UA of the response, not of trailing bytes" {
+    var buf: [512]u8 = undefined;
+    // Steady response first, warmup pipelined behind it: asking for the warmup UA
+    // must fail rather than match the buffer tail.
+    @memcpy(buf[0..test_steady_resp.len], test_steady_resp);
+    @memcpy(buf[test_steady_resp.len..][0..test_warm_resp.len], test_warm_resp);
+    var len: usize = test_steady_resp.len + test_warm_resp.len;
+    try std.testing.expectError(error.ProbeResponseMismatch, takeResponse(&buf, &len, util.probe_ua_warmup));
+}
+
+test "one AEAD chunk straddling both responses yields both" {
+    const key = [_]u8{0x44} ** 32;
+    var seal_ctx: AeadCtx = .{ .method = .chacha20_ietf_poly1305, .key = key };
+
+    // Chunk boundary deliberately falls inside the steady response's *body*, so the
+    // trailing fragment alone cannot be mistaken for a complete response.
+    const split = 60;
+    var first: [256]u8 = undefined;
+    @memcpy(first[0..test_warm_resp.len], test_warm_resp);
+    @memcpy(first[test_warm_resp.len..][0..split], test_steady_resp[0..split]);
+
+    var wire: [1024]u8 = undefined;
+    var off: usize = 0;
+    off += try sealChunk(&seal_ctx, wire[off..], first[0 .. test_warm_resp.len + split]);
+    off += try sealChunk(&seal_ctx, wire[off..], test_steady_resp[split..]);
+
+    var open_ctx: AeadCtx = .{ .method = .chacha20_ietf_poly1305, .key = key };
+    var reader: Io.Reader = .fixed(wire[0..off]);
+    var http: [512]u8 = undefined;
+    var scratch: [512]u8 = undefined;
+    var http_len: usize = 0;
+
+    // Mirrors readProbeResponse's loop; only the socket error mapping is left out.
+    while (!try takeResponse(&http, &http_len, util.probe_ua_warmup)) {
+        http_len += try readOpenChunk(&open_ctx, &reader, http[http_len..], &scratch);
+    }
+    while (!try takeResponse(&http, &http_len, util.probe_ua_steady)) {
+        http_len += try readOpenChunk(&open_ctx, &reader, http[http_len..], &scratch);
+    }
+    // Both responses recovered from the two chunks, nothing left over.
+    try std.testing.expectEqual(@as(usize, 0), http_len);
+}
+
+test "http_buf_len leaves room for a full chunk behind a carried leftover" {
+    // Bound check, not behaviour: `takeResponse` may leave up to `max_chunk_payload`
+    // bytes at the front of `http_buf`, and `openLength` rejects a chunk that does not
+    // fit in what remains. Shrinking `http_buf_len` back to one chunk reintroduces that.
+    try std.testing.expect(http_buf_len - max_chunk_payload >= max_chunk_payload);
 }
