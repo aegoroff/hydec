@@ -152,6 +152,34 @@ fn readHttpUntilReady(
     }
 }
 
+/// How much of the caller's `-t` budget the ALPN side check may spend.
+///
+/// The check dials its own connection before the real probe, so whatever it burns is
+/// taken from the probe that actually decides the verdict — and a check that times
+/// out would otherwise leave nothing, failing the candidate as `Timeout` without ever
+/// testing it. Half the budget is ample for one ClientHello/ServerHello round trip;
+/// below two seconds there is no room to split, so the probe keeps everything.
+const AlpnBudget = union(enum) {
+    /// Nothing to split: run no check, leaving the whole budget to the probe.
+    skip,
+    /// Seconds the check may spend.
+    secs: u32,
+
+    fn forTimeout(timeout_secs: u32) AlpnBudget {
+        const half = timeout_secs / 2;
+        return if (half == 0) .skip else .{ .secs = half };
+    }
+
+    /// The `timeout_secs` argument for `alpn.negotiated`, or `null` when no check
+    /// may run. Never 0, which `alpn.negotiated` would read as "no limit".
+    fn negotiateSecs(self: AlpnBudget) ?u32 {
+        return switch (self) {
+            .skip => null,
+            .secs => |s| s,
+        };
+    }
+};
+
 pub fn probe(
     gpa: std.mem.Allocator,
     io: Io,
@@ -169,17 +197,19 @@ pub fn probe(
     // transport is dead for them even though a no-ALPN handshake would succeed.
     // Only h2 can break it, so an offer without h2 skips the extra round trip.
     if (opts.transport_ws and alpn.offersH2(opts.alpn)) {
-        var selected_buf: [64]u8 = undefined;
-        // Only a confirmed h2 pick is evidence against the node. If the side connection
-        // cannot answer at all — a transient failure, or a TLS 1.3-only server that
-        // rejects the 1.2 hello — fall through and let the real probe judge it, rather
-        // than failing a candidate whose transport may well work.
-        const selected = alpn.negotiated(io, host, port, sni_use, opts.alpn, timeout_secs, bind, &selected_buf) catch |err| skipped: {
-            std.log.debug("ALPN check skipped for {s}:{d}: {t}", .{ host, port, err });
-            break :skipped null;
-        };
-        if (selected) |proto| {
-            if (std.mem.eql(u8, proto, "h2")) return error.WsAlpnHttp2;
+        if (AlpnBudget.forTimeout(timeout_secs).negotiateSecs()) |alpn_secs| {
+            var selected_buf: [64]u8 = undefined;
+            // Only a confirmed h2 pick is evidence against the node. If the side connection
+            // cannot answer at all — a transient failure, or a TLS 1.3-only server that
+            // rejects the 1.2 hello — fall through and let the real probe judge it, rather
+            // than failing a candidate whose transport may well work.
+            const selected = alpn.negotiated(io, host, port, sni_use, opts.alpn, alpn_secs, bind, &selected_buf) catch |err| skipped: {
+                std.log.debug("ALPN check skipped for {s}:{d}: {t}", .{ host, port, err });
+                break :skipped null;
+            };
+            if (selected) |proto| {
+                if (std.mem.eql(u8, proto, "h2")) return error.WsAlpnHttp2;
+            }
         }
     }
 
@@ -280,6 +310,21 @@ pub fn probe(
         return error.ProbeResponseMismatch;
 
     return netutil.elapsedMs(steady_start, io);
+}
+
+test "AlpnBudget always leaves the probe part of the budget" {
+    // Too small to split: the probe that decides the verdict keeps everything.
+    try std.testing.expectEqual(@as(AlpnBudget, .skip), AlpnBudget.forTimeout(0));
+    try std.testing.expectEqual(@as(AlpnBudget, .skip), AlpnBudget.forTimeout(1));
+    // Otherwise half, so `remainingTimeoutSecs` can never reach 0 on the check alone.
+    try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 1 }), AlpnBudget.forTimeout(2));
+    try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 1 }), AlpnBudget.forTimeout(3));
+    try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 2 }), AlpnBudget.forTimeout(5));
+    try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 15 }), AlpnBudget.forTimeout(30));
+
+    // Skipping is `null`, never 0 — `alpn.negotiated` reads 0 as "no limit".
+    try std.testing.expectEqual(@as(?u32, null), AlpnBudget.forTimeout(1).negotiateSecs());
+    try std.testing.expectEqual(@as(?u32, 2), AlpnBudget.forTimeout(5).negotiateSecs());
 }
 
 test "trojanHash matches SHA-224 hex (lowercase)" {
