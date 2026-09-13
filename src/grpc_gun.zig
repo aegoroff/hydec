@@ -157,7 +157,9 @@ pub fn buildGunHeaders(out: []u8, service_name: []const u8, authority: []const u
 
 /// True if an HTTP/2 HEADERS block indicates `:status: 200`.
 /// Accepts indexed static-table form (`0x88`) and literal forms with indexed or
-/// literal `:status` name and raw value `200`. Skips PADDED / PRIORITY framing.
+/// literal `:status` name and raw value `200`. Every index is read as an RFC 7541
+/// §5.1 prefix integer, so representations whose index overflows the prefix stay in
+/// sync. Skips PADDED / PRIORITY framing.
 pub fn headersIndicateStatus200(payload: []const u8, flags: u8) bool {
     var p = payload;
     if ((flags & 0x08) != 0) { // PADDED
@@ -179,44 +181,13 @@ fn hpackHasStatus200(block: []const u8) bool {
     while (p.len > 0) {
         const b = p[0];
         if ((b & 0x80) != 0) {
-            // Indexed header field representation.
-            const idx = b & 0x7f;
-            if (idx == 0) return false;
+            // §6.1 Indexed Header Field. A 7-bit prefix saturates at 127 and then
+            // continues into further bytes, so read the integer rather than stepping
+            // over one byte — otherwise the continuation is misread as a new field.
+            const idx = hpackReadInt(&p, 7) catch return false;
+            if (idx == 0) return false; // §6.1 forbids index 0
             if (idx == 8) return true; // static :status 200
-            p = p[1..];
             continue;
-        }
-        if ((b & 0xc0) == 0x40) {
-            // Literal with incremental indexing.
-            const name_idx = b & 0x3f;
-            p = p[1..];
-            const is_status = if (name_idx == 8)
-                true
-            else if (name_idx == 0)
-                hpackStringEql(&p, ":status")
-            else
-                false;
-            if (!is_status) {
-                if (!hpackSkipString(&p)) return false;
-                continue;
-            }
-            return hpackStringEql(&p, "200");
-        }
-        if ((b & 0xf0) == 0x00 or (b & 0xf0) == 0x10) {
-            // Without indexing / never indexed — 4-bit name index.
-            const name_idx = b & 0x0f;
-            p = p[1..];
-            const is_status = if (name_idx == 8)
-                true
-            else if (name_idx == 0)
-                hpackStringEql(&p, ":status")
-            else
-                false;
-            if (!is_status) {
-                if (!hpackSkipString(&p)) return false;
-                continue;
-            }
-            return hpackStringEql(&p, "200");
         }
         if ((b & 0xe0) == 0x20) {
             // Dynamic table size update (RFC 7541 §4.2). We keep no dynamic table,
@@ -225,10 +196,42 @@ fn hpackHasStatus200(block: []const u8) bool {
             _ = hpackReadInt(&p, 5) catch return false;
             continue;
         }
-        // Unknown representation — stop.
-        return false;
+        // §6.2 literal header field, differing only in name-index width: 6 bits with
+        // incremental indexing (§6.2.1), 4 bits without indexing (§6.2.2) and never
+        // indexed (§6.2.3). 4 bits already overflow at static index 15
+        // (`accept-charset`), so the extended form is ordinary traffic.
+        const verdict = if ((b & 0xc0) == 0x40)
+            hpackLiteralStatus200(&p, 6)
+        else
+            hpackLiteralStatus200(&p, 4);
+        if (verdict) |v| return v;
     }
     return false;
+}
+
+/// Scan one §6.2 literal header field for `:status: 200`. Four outcomes in three
+/// channels: `true` when the field is `:status: 200`; `false` both when it is
+/// `:status` with some other value and when the field is malformed, since the caller
+/// answers a fail-closed predicate and cannot act on the difference; `null` when the
+/// field names something else and scanning should continue. Advances `p` past the
+/// whole field in every case, so the caller's loop always makes progress.
+fn hpackLiteralStatus200(p: *[]const u8, comptime prefix_bits: u3) ?bool {
+    const name_idx = hpackReadInt(p, prefix_bits) catch return false;
+    // A §6.2 representation takes only the *name* from the static entry; the value is
+    // the literal that follows. Static 8..14 are all `:status` (200, 204, 206, 304,
+    // 400, 404, 500), so any of them names the field and the value decides. Index 0
+    // means the name itself follows as a literal, which `hpackStringEql` consumes
+    // whatever it returns, leaving `p` on the value. Above 61 is the dynamic table,
+    // which we do not keep, so those fields stay unresolved.
+    const is_status = if (name_idx == 0)
+        hpackStringEql(p, ":status")
+    else
+        name_idx >= 8 and name_idx <= 14;
+    if (!is_status) {
+        if (!hpackSkipString(p)) return false;
+        return null;
+    }
+    return hpackStringEql(p, "200");
 }
 
 /// RFC 7541 §5.1 integer with an N-bit prefix. Advances `p` past the integer.
@@ -515,4 +518,58 @@ test "readVarint rejects overflow past usize" {
         try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), v);
         try std.testing.expectEqual(@as(usize, 10), n);
     }
+}
+
+test "headersIndicateStatus200 follows indices past the prefix width" {
+    // §6.1 indexed field with index 200 (0x7f prefix + 73), then indexed :status 200.
+    // Stepping over one byte instead of reading the integer would read 0x49 as a new
+    // field and desync the rest of the block.
+    try std.testing.expect(headersIndicateStatus200(&.{ 0xff, 0x49, 0x88 }, 0));
+
+    // §6.2.2 without indexing, name index 31 (`content-type`): the 4-bit prefix
+    // overflows at 15, so this is 0x0f + 16. Value "x", then indexed :status 200.
+    try std.testing.expect(headersIndicateStatus200(&.{ 0x0f, 0x10, 0x01, 'x', 0x88 }, 0));
+
+    // §6.2.1 with incremental indexing, name index 63 (dynamic table): 0x3f prefix + 0.
+    try std.testing.expect(headersIndicateStatus200(&.{ 0x7f, 0x00, 0x01, 'x', 0x88 }, 0));
+
+    // Same, but :status arrives as a literal field rather than an indexed one.
+    try std.testing.expect(headersIndicateStatus200(
+        &.{ 0x0f, 0x10, 0x01, 'x', 0x08, 0x03, '2', '0', '0' },
+        0,
+    ));
+    // ...and a non-200 literal value after an extended index still reads as false.
+    try std.testing.expect(!headersIndicateStatus200(
+        &.{ 0x0f, 0x10, 0x01, 'x', 0x08, 0x03, '4', '0', '4' },
+        0,
+    ));
+}
+
+test "headersIndicateStatus200 rejects a truncated prefix integer" {
+    // Prefix maxed out with no continuation byte: §6.1 indexed and both literal widths.
+    try std.testing.expect(!headersIndicateStatus200(&.{0xff}, 0));
+    try std.testing.expect(!headersIndicateStatus200(&.{0x0f}, 0));
+    try std.testing.expect(!headersIndicateStatus200(&.{0x7f}, 0));
+    // Continuation that never terminates.
+    try std.testing.expect(!headersIndicateStatus200(&.{ 0xff, 0xff }, 0));
+}
+
+test "headersIndicateStatus200 resolves :status via any of static names 8..14" {
+    // A §6.2 literal takes only the name from the static entry, so indices 8..14 all
+    // mean `:status` and the following literal is the value — index 9's own 204 does
+    // not make the field a 204.
+    inline for (.{ 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e }) |first| {
+        // Incremental indexing (§6.2.1), value "200".
+        try std.testing.expect(headersIndicateStatus200(&.{ first, 0x03, '2', '0', '0' }, 0));
+        // ...and the same name with a non-200 value is decided negatively.
+        try std.testing.expect(!headersIndicateStatus200(&.{ first, 0x03, '4', '0', '4' }, 0));
+    }
+    inline for (.{ 0x08, 0x09, 0x0e }) |first| {
+        // Without indexing (§6.2.2) / never indexed shares the 4-bit width.
+        try std.testing.expect(headersIndicateStatus200(&.{ first, 0x03, '2', '0', '0' }, 0));
+        try std.testing.expect(!headersIndicateStatus200(&.{ first, 0x03, '5', '0', '0' }, 0));
+    }
+    // Index 15 is `accept-charset`, not a status: skip the value and keep scanning.
+    try std.testing.expect(headersIndicateStatus200(&.{ 0x0f, 0x00, 0x01, 'x', 0x88 }, 0));
+    try std.testing.expect(!headersIndicateStatus200(&.{ 0x0f, 0x00, 0x01, 'x' }, 0));
 }
