@@ -398,6 +398,20 @@ pub fn failHint(err: anyerror) []const u8 {
         error.UnsupportedVlessEncryption => "unsupported-encryption",
         error.BufferTooSmall, error.RecordTooLarge => "buffer/overflow",
         error.SystemResources => "sys/resources",
+        // Socket creation / bind failures: netutil.openSocket for our own probe
+        // sockets, std's Io.net.IpAddress.BindError for the resolver's. Split from
+        // sys/resources because the operator fix differs — raise the fd limit, or cut
+        // max_parallel_hosts, rather than free memory.
+        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => "sys/fd-limit",
+        // Ephemeral source ports exhausted (bind with port 0 finding none free).
+        error.AddressInUse => "addr/in-use",
+        // The platform or Io implementation cannot do what the probe asked for; a
+        // build/target problem, not a network one.
+        error.ProtocolUnsupportedBySystem,
+        error.ProtocolUnsupportedByAddressFamily,
+        error.SocketModeUnsupported,
+        error.OptionUnsupported,
+        => "sys/unsupported",
         // Hostname resolution (netutil.connectHostnameTimed). Split three ways because
         // the fixes differ: a dead subscription entry, a broken local resolver, and a
         // hostname the URI got wrong.
@@ -415,7 +429,11 @@ pub fn failHint(err: anyerror) []const u8 {
         error.EmptyInterfaceName => "iface/empty",
         error.InterfaceBindingUnsupported => "iface/unsupported",
         error.InterfaceNameTooLong => "iface/toolong",
-        error.AddressNotAvailable => "iface/addr",
+        // Two spellings of "not a local address / nonexistent interface": our own
+        // bindSrcIp maps ADDRNOTAVAIL to the first, std's Io.net.IpAddress.BindError
+        // uses the second (reached via the resolver's own socket, and the Windows
+        // connect paths in netutil).
+        error.AddressNotAvailable, error.AddressUnavailable => "iface/addr",
         error.AccessDenied => "denied",
         error.AddressFamilyUnsupported => "family",
         // Opaque Io wrappers — Reality/Vision should unwrap socket causes first.
@@ -675,6 +693,8 @@ test "failHint classifies write and buffer errors" {
     try std.testing.expectEqualStrings("rejected/closed", failHint(error.ConnectionResetByPeer));
     try std.testing.expectEqualStrings("unreachable", failHint(error.NetworkDown));
     try std.testing.expectEqualStrings("iface/addr", failHint(error.AddressNotAvailable));
+    // std spells the same condition AddressUnavailable in Io.net.IpAddress.BindError.
+    try std.testing.expectEqualStrings("iface/addr", failHint(error.AddressUnavailable));
     try std.testing.expectEqualStrings("iface/empty", failHint(error.EmptyInterfaceName));
 }
 
@@ -770,4 +790,22 @@ test "failHint names DNS failures instead of falling through to error" {
     try std.testing.expectEqualStrings("dns/bad-name", failHint(error.NameTooLong));
     // A resolver timeout stays a timeout: netutil maps the deadline race to Timeout.
     try std.testing.expectEqualStrings("slow/timeout", failHint(error.Timeout));
+}
+
+test "failHint covers every Io.net.IpAddress.BindError member" {
+    // Reflected rather than listed, so a future std release adding a member breaks
+    // this test instead of silently regressing that member to the bare `error` hint.
+    // Two stay deliberately generic: `Unexpected` is an errno netutil could not map,
+    // and `Canceled` cannot reach a probe (connectHostnameTimed turns cancellation
+    // into Timeout) — for both, "error" is the honest answer.
+    const members = @typeInfo(Io.net.IpAddress.BindError).error_set.?;
+    inline for (members) |m| {
+        if (comptime std.mem.eql(u8, m.name, "Unexpected")) continue;
+        if (comptime std.mem.eql(u8, m.name, "Canceled")) continue;
+        const hint = failHint(@field(anyerror, m.name));
+        std.testing.expect(!std.mem.eql(u8, hint, "error")) catch |err| {
+            std.debug.print("BindError.{s} has no failHint\n", .{m.name});
+            return err;
+        };
+    }
 }
