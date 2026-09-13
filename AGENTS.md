@@ -59,6 +59,7 @@ Optional bind spec for **probe** sockets only (subscription fetch unchanged):
 | `src/proxy_uri.zig` | URI parse (kind, host/port, query, `#name`) |
 | `src/probe.zig` | Group-by-host parallel `findBest`, preference ranking, `probeOne` / `probeAverage` |
 | `src/ss.zig` / `trojan.zig` / `reality.zig` | Protocol probes |
+| `src/alpn.zig` | `alpn=` parsing, ALPN negotiation check (TLS 1.2 ClientHello) |
 | `src/vless.zig` / `grpc_gun.zig` / `ws.zig` | Framing helpers |
 | `src/netutil.zig` | Timed connect, optional source bind, poll deadlines, TLS watchdog |
 | `src/util.zig` | Shared helpers (URL decode, query params, …) |

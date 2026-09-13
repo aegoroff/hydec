@@ -2,6 +2,7 @@ const std = @import("std");
 const util = @import("util.zig");
 const netutil = @import("netutil.zig");
 const ws = @import("ws.zig");
+const alpn = @import("alpn.zig");
 const Io = std.Io;
 const Certificate = std.crypto.Certificate;
 
@@ -38,6 +39,17 @@ fn buildRequest(password: []const u8, out: []u8) !usize {
     i += util.probe_http.len;
     return i;
 }
+
+/// Everything one Trojan endpoint's URI says about how to reach it.
+pub const Options = struct {
+    password: []const u8,
+    sni: []const u8,
+    transport_ws: bool,
+    ws_path: []const u8,
+    ws_host: []const u8,
+    alpn: []const []const u8,
+    allow_insecure: bool,
+};
 
 const CaState = struct {
     mutex: Io.Mutex = .init,
@@ -145,19 +157,37 @@ pub fn probe(
     io: Io,
     host: []const u8,
     port: u16,
-    password: []const u8,
-    sni: []const u8,
-    transport_ws: bool,
-    ws_path: []const u8,
-    ws_host: []const u8,
-    allow_insecure: bool,
+    opts: Options,
     timeout_secs: u32,
     bind: ?[]const u8,
 ) !u64 {
-    const sni_use = if (sni.len > 0) sni else host;
-
     const start = netutil.monoNow(io);
-    const stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind);
+    const sni_use = if (opts.sni.len > 0) opts.sni else host;
+
+    // Xray-family clients negotiate ALPN before the WebSocket upgrade. A server that
+    // answers "h2" then speaks HTTP/2 where the upgrade expects HTTP/1.1, so the
+    // transport is dead for them even though a no-ALPN handshake would succeed.
+    // Only h2 can break it, so an offer without h2 skips the extra round trip.
+    if (opts.transport_ws and alpn.offersH2(opts.alpn)) {
+        var selected_buf: [64]u8 = undefined;
+        // Only a confirmed h2 pick is evidence against the node. If the side connection
+        // cannot answer at all — a transient failure, or a TLS 1.3-only server that
+        // rejects the 1.2 hello — fall through and let the real probe judge it, rather
+        // than failing a candidate whose transport may well work.
+        const selected = alpn.negotiated(io, host, port, sni_use, opts.alpn, timeout_secs, bind, &selected_buf) catch |err| skipped: {
+            std.log.debug("ALPN check skipped for {s}:{d}: {t}", .{ host, port, err });
+            break :skipped null;
+        };
+        if (selected) |proto| {
+            if (std.mem.eql(u8, proto, "h2")) return error.WsAlpnHttp2;
+        }
+    }
+
+    // The ALPN check already spent part of the caller's budget; the rest of the probe
+    // gets what is left, so `-t` still bounds the whole attempt.
+    const connect_secs = netutil.remainingTimeoutSecs(start, io, timeout_secs);
+    if (connect_secs == 0) return error.Timeout;
+    const stream = try netutil.connectHostPort(io, host, port, connect_secs, bind);
     defer stream.close(io);
 
     const remain = netutil.remainingTimeoutNs(start, io, timeout_secs);
@@ -169,7 +199,7 @@ pub fn probe(
     var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
 
-    const bundle: ?*Certificate.Bundle = if (allow_insecure) null else try ensureCaBundle(gpa, io);
+    const bundle: ?*Certificate.Bundle = if (opts.allow_insecure) null else try ensureCaBundle(gpa, io);
 
     var sock_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
     var sock_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
@@ -186,7 +216,7 @@ pub fn probe(
     var tls_client = std.crypto.tls.Client.init(
         &stream_reader.interface,
         &stream_writer.interface,
-        tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, allow_insecure, bundle),
+        tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, opts.allow_insecure, bundle),
     ) catch |err| return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
 
     const tls_writer = &tls_client.writer;
@@ -196,18 +226,18 @@ pub fn probe(
         .socket = &stream_writer.interface,
     };
 
-    if (transport_ws) {
-        const path = if (ws_path.len > 0) ws_path else "/";
-        const host_hdr = if (ws_host.len > 0) ws_host else sni_use;
+    if (opts.transport_ws) {
+        const path = if (opts.ws_path.len > 0) opts.ws_path else "/";
+        const host_hdr = if (opts.ws_host.len > 0) opts.ws_host else sni_use;
         ws.performUpgrade(conn, io, path, host_hdr) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     }
 
     var req_buf: [256]u8 = undefined;
-    const req_len = try buildRequest(password, &req_buf);
+    const req_len = try buildRequest(opts.password, &req_buf);
 
-    if (transport_ws) {
+    if (opts.transport_ws) {
         ws.writeBinaryFrame(conn, io, req_buf[0..req_len]) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
@@ -226,13 +256,13 @@ pub fn probe(
     var http_len: usize = 0;
     const frame_buf = try gpa.alloc(u8, 16384);
     defer gpa.free(frame_buf);
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
         return error.ProbeResponseMismatch;
 
     // Steady-state: require a real keep-alive reply (same fail-closed policy as gRPC/Vision).
     const steady_start = netutil.monoNow(io);
-    if (transport_ws) {
+    if (opts.transport_ws) {
         ws.writeBinaryFrame(conn, io, util.probe_http_steady) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
@@ -245,7 +275,7 @@ pub fn probe(
         };
     }
     http_len = 0;
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
         return error.ProbeResponseMismatch;
 

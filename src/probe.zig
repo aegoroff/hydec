@@ -3,6 +3,7 @@ const proxy_uri = @import("proxy_uri.zig");
 const util = @import("util.zig");
 const ss = @import("ss.zig");
 const trojan = @import("trojan.zig");
+const alpn = @import("alpn.zig");
 const reality = @import("reality.zig");
 const Io = std.Io;
 
@@ -123,23 +124,22 @@ pub fn probeOne(
             const host_owned = try proxy.getParamDecoded(gpa, "host");
             defer if (host_owned) |h| gpa.free(h);
             const host_hdr = host_owned orelse sni;
+            const alpn_owned = try proxy.getParamDecoded(gpa, "alpn");
+            defer if (alpn_owned) |a| gpa.free(a);
+            var alpn_storage: [alpn.max_protocols][]const u8 = undefined;
+            const alpn_list = try alpn.parseList(alpn_owned, &alpn_storage);
             const allow_insecure = util.queryParamTruthy(proxy.query, "allowInsecure") or
                 util.queryParamTruthy(proxy.query, "allow_insecure") or
                 util.queryParamTruthy(proxy.query, "insecure");
-            break :blk try trojan.probe(
-                gpa,
-                io,
-                proxy.host,
-                proxy.port,
-                proxy.userinfo,
-                sni,
-                proxy.transport == .ws,
-                path,
-                host_hdr,
-                allow_insecure,
-                timeout_secs,
-                bind,
-            );
+            break :blk try trojan.probe(gpa, io, proxy.host, proxy.port, .{
+                .password = proxy.userinfo,
+                .sni = sni,
+                .transport_ws = proxy.transport == .ws,
+                .ws_path = path,
+                .ws_host = host_hdr,
+                .alpn = alpn_list,
+                .allow_insecure = allow_insecure,
+            }, timeout_secs, bind);
         },
         .vless => blk: {
             if (proxy.security != .reality) return error.UnsupportedSecurity;
@@ -392,6 +392,10 @@ pub fn failHint(err: anyerror) []const u8 {
         error.NetworkDown,
         => "unreachable",
         error.GrpcEmptyResponse => "empty/no-data",
+        // Server picked h2 for a ws transport: the HTTP/1.1 upgrade gets HTTP/2 frames.
+        error.WsAlpnHttp2 => "alpn/h2-breaks-ws",
+        // The URI listed more ALPN protocols than a probe will carry.
+        error.TooManyAlpnProtocols => "alpn/too-many",
         error.ProbeResponseMismatch => "bad/response",
         error.ExpectedVisionPadding => "vision/framing",
         error.InvalidSsChunk => "ss/chunk",
@@ -808,4 +812,9 @@ test "failHint covers every Io.net.IpAddress.BindError member" {
             return err;
         };
     }
+}
+
+test "failHint names the ALPN failures" {
+    try std.testing.expectEqualStrings("alpn/h2-breaks-ws", failHint(error.WsAlpnHttp2));
+    try std.testing.expectEqualStrings("alpn/too-many", failHint(error.TooManyAlpnProtocols));
 }
