@@ -575,50 +575,59 @@ const RealityConn = struct {
     /// `out` and return its length. Returns null when there is not a full record yet,
     /// or when buffered bytes are not Reality ciphertext (raw TCP after splice).
     /// Peek-decrypts first so a failed AEAD leaves bytes for the raw TCP path.
+    ///
+    /// Iterative rather than recursive: the ignorable inner types (NewSessionTicket,
+    /// CCS) let a peer chain one skippable record per ~23 buffered bytes, so the
+    /// earlier recursive form let the peer pick the call depth. Measured, the current
+    /// backend turns that tail call into a jump and the 16 KiB `plain` frame is not
+    /// re-stacked, so nothing overflowed — but a depth the peer chooses should not
+    /// rest on an optimisation holding.
     fn tryDecryptBufferedRealityApp(self: *RealityConn, out: []u8) !?usize {
-        const r = self.conn.reader;
-        const avail = r.end - r.seek;
-        if (avail < 5) return null;
-        const buf = r.buffer[r.seek..r.end];
-        if (buf[0] != 23 or buf[1] != 0x03 or buf[2] != 0x03) return null;
-        const length: usize = (@as(usize, buf[3]) << 8) | buf[4];
-        if (length < 16 or length > 16640) return null;
-        if (avail < 5 + length) return null;
+        while (true) {
+            const r = self.conn.reader;
+            const avail = r.end - r.seek;
+            if (avail < 5) return null;
+            const buf = r.buffer[r.seek..r.end];
+            if (buf[0] != 23 or buf[1] != 0x03 or buf[2] != 0x03) return null;
+            const length: usize = (@as(usize, buf[3]) << 8) | buf[4];
+            if (length < 16 or length > 16640) return null;
+            if (avail < 5 + length) return null;
 
-        const payload = buf[5 .. 5 + length];
-        const ct_len = length - 16;
-        const nonce = RecordConn.xorNonce(&self.conn.server_iv, self.conn.read_seq);
-        var aad: [5]u8 = .{ 23, 0x03, 0x03, 0, 0 };
-        std.mem.writeInt(u16, aad[3..5], @intCast(length), .big);
-        var plain: [16640]u8 = undefined;
-        var tag: [16]u8 = undefined;
-        @memcpy(&tag, payload[ct_len..][0..16]);
-        Aes128Gcm.decrypt(plain[0..ct_len], payload[0..ct_len], tag, &aad, nonce, self.conn.server_key) catch {
-            return null; // not Reality — leave bytes for raw read
-        };
+            const payload = buf[5 .. 5 + length];
+            const ct_len = length - 16;
+            const nonce = RecordConn.xorNonce(&self.conn.server_iv, self.conn.read_seq);
+            var aad: [5]u8 = .{ 23, 0x03, 0x03, 0, 0 };
+            std.mem.writeInt(u16, aad[3..5], @intCast(length), .big);
+            var plain: [16640]u8 = undefined;
+            var tag: [16]u8 = undefined;
+            @memcpy(&tag, payload[ct_len..][0..16]);
+            Aes128Gcm.decrypt(plain[0..ct_len], payload[0..ct_len], tag, &aad, nonce, self.conn.server_key) catch {
+                return null; // not Reality — leave bytes for raw read
+            };
 
-        // Commit: consume ciphertext and advance seq.
-        r.seek += 5 + length;
-        self.conn.read_seq += 1;
+            // Commit: consume ciphertext and advance seq.
+            r.seek += 5 + length;
+            self.conn.read_seq += 1;
 
-        var end = ct_len;
-        while (end > 0 and plain[end - 1] == 0) end -= 1;
-        if (end == 0) return error.TlsDecodeError;
-        const inner_type = plain[end - 1];
-        const msg_len = end - 1;
-        switch (inner_type) {
-            23 => {
-                if (msg_len > out.len) return error.BufferTooSmall;
-                @memcpy(out[0..msg_len], plain[0..msg_len]);
-                return msg_len;
-            },
-            22 => {
-                try rejectPostHandshakeKeyUpdate(plain[0..msg_len]);
-                return try self.tryDecryptBufferedRealityApp(out);
-            },
-            20 => return try self.tryDecryptBufferedRealityApp(out),
-            21 => return error.TlsAlert,
-            else => return error.TlsUnexpectedMessage,
+            var end = ct_len;
+            while (end > 0 and plain[end - 1] == 0) end -= 1;
+            if (end == 0) return error.TlsDecodeError;
+            const inner_type = plain[end - 1];
+            const msg_len = end - 1;
+            switch (inner_type) {
+                23 => {
+                    if (msg_len > out.len) return error.BufferTooSmall;
+                    @memcpy(out[0..msg_len], plain[0..msg_len]);
+                    return msg_len;
+                },
+                22 => {
+                    try rejectPostHandshakeKeyUpdate(plain[0..msg_len]);
+                    continue;
+                },
+                20 => continue,
+                21 => return error.TlsAlert,
+                else => return error.TlsUnexpectedMessage,
+            }
         }
     }
 };
@@ -1380,6 +1389,124 @@ fn appendServerHelloMinimal(buf: []u8, key_share: *const [32]u8, ext_len_overrid
     @memcpy(buf[i..][0..32], key_share);
     i += 32;
     return i;
+}
+
+/// Seal one record the way a REALITY peer would: inner = content || content_type,
+/// AEAD keyed by the server traffic secret over the 5-byte ciphertext header.
+/// Mirrors `RecordConn.writeRecord`, which seals with the *client* keys.
+fn appendSealedRecord(
+    out: []u8,
+    key: *const [16]u8,
+    iv: *const [12]u8,
+    seq: u64,
+    content_type: u8,
+    content: []const u8,
+) usize {
+    var inner: [64]u8 = undefined;
+    @memcpy(inner[0..content.len], content);
+    inner[content.len] = content_type;
+    const inner_len = content.len + 1;
+
+    out[0] = 23;
+    out[1] = 0x03;
+    out[2] = 0x03;
+    std.mem.writeInt(u16, out[3..5], @intCast(inner_len + 16), .big);
+
+    var tag: [16]u8 = undefined;
+    Aes128Gcm.encrypt(
+        out[5..][0..inner_len],
+        &tag,
+        inner[0..inner_len],
+        out[0..5],
+        RecordConn.xorNonce(iv, seq),
+        key.*,
+    );
+    @memcpy(out[5 + inner_len ..][0..16], &tag);
+    return 5 + inner_len + 16;
+}
+
+/// A `RealityConn` wired to nothing but `reader`: `tryDecryptBufferedRealityApp`
+/// touches only the server-side record state, so the socket half stays `undefined`.
+fn testDecryptConn(reader: *Io.Reader, key: *const [16]u8, iv: *const [12]u8) RealityConn {
+    var rc: RealityConn = undefined;
+    rc.conn = .{ .reader = reader, .writer = undefined };
+    rc.conn.server_key = key.*;
+    rc.conn.server_iv = iv.*;
+    rc.conn.read_seq = 0;
+    return rc;
+}
+
+const test_record_key: [16]u8 = [_]u8{0x5a} ** 16;
+const test_record_iv: [12]u8 = [_]u8{0x31} ** 12;
+
+/// CCS and a zero-length NewSessionTicket: the two inner types the drain loop skips.
+fn ignorableRecord(index: usize) struct { typ: u8, content: []const u8 } {
+    return if (index % 2 == 0)
+        .{ .typ = 20, .content = &[_]u8{0x01} }
+    else
+        .{ .typ = 22, .content = &[_]u8{ 4, 0, 0, 0 } };
+}
+
+test "tryDecryptBufferedRealityApp drains an ignorable chain the size of sock_rbuf" {
+    // The longest chain a peer can stage in one `sock_rbuf`: skippable records at
+    // ~23 bytes each. Exercises the drain loop's bookkeeping at depth — every record
+    // consumed, the read sequence left in step with the peer's.
+    var wire: [tls.Client.min_buffer_len]u8 = undefined;
+    var wire_len: usize = 0;
+    var seq: u64 = 0;
+    while (true) {
+        const rec = ignorableRecord(seq);
+        // Leave room for the payload record that ends the chain.
+        if (wire_len + 5 + rec.content.len + 1 + 16 > wire.len - 64) break;
+        wire_len += appendSealedRecord(wire[wire_len..], &test_record_key, &test_record_iv, seq, rec.typ, rec.content);
+        seq += 1;
+    }
+    // Keep the premise honest: the chain has to be long to be worth the name.
+    try std.testing.expect(seq > 600);
+    wire_len += appendSealedRecord(wire[wire_len..], &test_record_key, &test_record_iv, seq, 23, "hello");
+
+    var reader: Io.Reader = .fixed(wire[0..wire_len]);
+    var rc = testDecryptConn(&reader, &test_record_key, &test_record_iv);
+
+    var out: [64]u8 = undefined;
+    const n = (try rc.tryDecryptBufferedRealityApp(&out)).?;
+
+    try std.testing.expectEqualStrings("hello", out[0..n]);
+    // Every record was consumed and counted, so the read sequence stays in step
+    // with the peer's — a skipped record would desync the next AEAD open.
+    try std.testing.expectEqual(seq + 1, rc.conn.read_seq);
+    try std.testing.expectEqual(@as(usize, 0), reader.end - reader.seek);
+}
+
+test "tryDecryptBufferedRealityApp fails closed on a KeyUpdate mid-chain" {
+    // A KeyUpdate behind other records must fail the whole drain, not just its own
+    // iteration: we keep no traffic secrets to rotate, so this stays fail-closed.
+    var wire: [512]u8 = undefined;
+    var wire_len: usize = 0;
+    const first = ignorableRecord(0);
+    wire_len += appendSealedRecord(wire[wire_len..], &test_record_key, &test_record_iv, 0, first.typ, first.content);
+    // Handshake record carrying KeyUpdate (handshake type 24, length 0).
+    wire_len += appendSealedRecord(wire[wire_len..], &test_record_key, &test_record_iv, 1, 22, &[_]u8{ 24, 0, 0, 0 });
+
+    var reader: Io.Reader = .fixed(wire[0..wire_len]);
+    var rc = testDecryptConn(&reader, &test_record_key, &test_record_iv);
+
+    var out: [64]u8 = undefined;
+    try std.testing.expectError(error.TlsKeyUpdateUnsupported, rc.tryDecryptBufferedRealityApp(&out));
+}
+
+test "tryDecryptBufferedRealityApp reports null on a partial record" {
+    // A partial trailing record must leave the buffer alone for the next fill.
+    var wire: [512]u8 = undefined;
+    const full = appendSealedRecord(&wire, &test_record_key, &test_record_iv, 0, 23, "hello");
+
+    var reader: Io.Reader = .fixed(wire[0 .. full - 1]);
+    var rc = testDecryptConn(&reader, &test_record_key, &test_record_iv);
+
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(?usize, null), try rc.tryDecryptBufferedRealityApp(&out));
+    try std.testing.expectEqual(@as(u64, 0), rc.conn.read_seq);
+    try std.testing.expectEqual(full - 1, reader.end - reader.seek);
 }
 
 test "appendStripVlessHeader handles NeedMore then body" {
