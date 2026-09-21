@@ -282,38 +282,42 @@ fn bindToDevice(sock: posix.socket_t, name: []const u8) !void {
     };
 }
 
+/// Kick off the connect. Never retries: the socket is non-blocking, so the call
+/// either finishes or leaves the attempt running in the kernel, and
+/// `waitConnectedUntil` is what waits for the outcome.
 fn startConnect(sock: posix.socket_t, address: Io.net.IpAddress) !void {
-    while (true) {
-        const rc = switch (address) {
-            .ip4 => |ip4| blk: {
-                const sa = posix.sockaddr.in{
-                    .port = std.mem.nativeToBig(u16, ip4.port),
-                    .addr = @bitCast(ip4.bytes),
-                };
-                break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in));
-            },
-            .ip6 => |ip6| blk: {
-                const sa = posix.sockaddr.in6{
-                    .port = std.mem.nativeToBig(u16, ip6.port),
-                    .flowinfo = ip6.flow,
-                    .addr = ip6.bytes,
-                    .scope_id = ip6.interface.index,
-                };
-                break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in6));
-            },
-        };
-        switch (posix.errno(rc)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            .INPROGRESS, .AGAIN => return,
-            .CONNREFUSED => return error.ConnectionRefused,
-            .NETUNREACH => return error.NetworkUnreachable,
-            .HOSTUNREACH => return error.HostUnreachable,
-            .TIMEDOUT => return error.Timeout,
-            .ADDRNOTAVAIL => return error.AddressNotAvailable,
-            .ACCES, .PERM => return error.AccessDenied,
-            else => return error.Unexpected,
-        }
+    const rc = switch (address) {
+        .ip4 => |ip4| blk: {
+            const sa = posix.sockaddr.in{
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            };
+            break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in));
+        },
+        .ip6 => |ip6| blk: {
+            const sa = posix.sockaddr.in6{
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = ip6.interface.index,
+            };
+            break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in6));
+        },
+    };
+    switch (posix.errno(rc)) {
+        .SUCCESS => return,
+        // EINTR does not undo the attempt — the kernel keeps connecting. Calling
+        // connect(2) again on the same socket answers EALREADY, which would surface
+        // as `Unexpected` and lose the real outcome, so treat it like EINPROGRESS
+        // and let the poll loop decide.
+        .INTR, .INPROGRESS, .AGAIN => return,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .NETUNREACH => return error.NetworkUnreachable,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .TIMEDOUT => return error.Timeout,
+        .ADDRNOTAVAIL => return error.AddressNotAvailable,
+        .ACCES, .PERM => return error.AccessDenied,
+        else => return error.Unexpected,
     }
 }
 
