@@ -183,8 +183,14 @@ fn parseFromServerHello(body: []const u8, out: []u8) !?[]const u8 {
         }
         const data = body[i..][0..el];
         if (data.len < 3) return error.MalformedServerHello;
+        // RFC 7301 §3.1: extension_data is a ProtocolNameList — a u16 list length
+        // followed by length-prefixed names, and a server selects exactly one. Check
+        // the list length too, not just the name length: a peer whose framing
+        // disagrees with itself is rejected rather than half-read into `out`.
+        const list_len: usize = std.mem.readInt(u16, data[0..2], .big);
+        if (list_len != data.len - 2) return error.MalformedServerHello;
         const name_len: usize = data[2];
-        if (3 + name_len > data.len) return error.MalformedServerHello;
+        if (name_len == 0 or name_len + 1 != list_len) return error.MalformedServerHello;
         if (name_len > out.len) return error.BufferTooSmall;
         @memcpy(out[0..name_len], data[3..][0..name_len]);
         return out[0..name_len];
@@ -360,6 +366,37 @@ test "parseFromServerHello rejects truncated input" {
         error.MalformedServerHello,
         parseFromServerHello(testServerHelloBody(&buf, &bad, true), &out),
     );
+}
+
+test "parseFromServerHello rejects self-inconsistent ALPN framing" {
+    var buf: [128]u8 = undefined;
+    var out: [16]u8 = undefined;
+
+    // List length says 3, but the extension carries 4 more bytes.
+    const long_ext = [_]u8{ 0x00, 0x10, 0x00, 0x06, 0x00, 0x03, 0x02, 'h', '2', 0x00 };
+    try std.testing.expectError(
+        error.MalformedServerHello,
+        parseFromServerHello(testServerHelloBody(&buf, &long_ext, true), &out),
+    );
+
+    // Name length disagrees with the list length (list 3, name 1).
+    const bad_name = [_]u8{ 0x00, 0x10, 0x00, 0x05, 0x00, 0x03, 0x01, 'h', '2' };
+    try std.testing.expectError(
+        error.MalformedServerHello,
+        parseFromServerHello(testServerHelloBody(&buf, &bad_name, true), &out),
+    );
+
+    // Empty protocol name.
+    const empty_name = [_]u8{ 0x00, 0x10, 0x00, 0x03, 0x00, 0x01, 0x00 };
+    try std.testing.expectError(
+        error.MalformedServerHello,
+        parseFromServerHello(testServerHelloBody(&buf, &empty_name, true), &out),
+    );
+
+    // The well-formed shape still reads back, one name only.
+    const good = [_]u8{ 0x00, 0x10, 0x00, 0x0b, 0x00, 0x09, 0x08, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+    const selected = try parseFromServerHello(testServerHelloBody(&buf, &good, true), &out);
+    try std.testing.expectEqualStrings("http/1.1", selected.?);
 }
 
 test "parseList splits and trims the URI value" {
