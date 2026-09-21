@@ -145,6 +145,23 @@ test "hostname dial fails fast when no unit of concurrency is available" {
     );
 }
 
+test "classifyConnectPoll keeps a bare hangup out of the connected path" {
+    const OUT = std.posix.POLL.OUT;
+    const ERR = std.posix.POLL.ERR;
+    const HUP = std.posix.POLL.HUP;
+    const NVAL = std.posix.POLL.NVAL;
+
+    try std.testing.expectEqual(ConnectPoll.connected, classifyConnectPoll(OUT));
+    // A refused connect: the error bits ride along with POLLOUT and SO_ERROR decides.
+    try std.testing.expectEqual(ConnectPoll.connected, classifyConnectPoll(OUT | ERR | HUP));
+    // Hangup alone used to reach `checkSocketError` and, with SO_ERROR clear, return
+    // a torn-down socket as a successful dial.
+    try std.testing.expectEqual(ConnectPoll.hangup, classifyConnectPoll(HUP));
+    try std.testing.expectEqual(ConnectPoll.hangup, classifyConnectPoll(ERR));
+    try std.testing.expectEqual(ConnectPoll.hangup, classifyConnectPoll(NVAL));
+    try std.testing.expectEqual(ConnectPoll.pending, classifyConnectPoll(0));
+}
+
 test "applyBind treats null as no-op and empty spec as an error" {
     // Neither touches the (invalid) socket fd: they return before any syscall.
     try applyBind(0, null);
@@ -340,12 +357,40 @@ fn waitConnectedUntil(io: Io, sock: posix.socket_t, deadline: ?i128) !void {
         const n = try posix.poll(&fds, timeout_ms);
         if (n == 0) return error.Timeout;
 
-        const re = fds[0].revents;
-        if ((re & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL | posix.POLL.OUT)) != 0) {
-            try checkSocketError(sock);
-            return;
+        switch (classifyConnectPoll(fds[0].revents)) {
+            .pending => continue,
+            .connected => {
+                // A failed connect sets POLLERR alongside POLLOUT, so SO_ERROR still
+                // decides; clear means the socket is usable.
+                try checkSocketError(sock);
+                return;
+            },
+            .hangup => {
+                try checkSocketError(sock);
+                // SO_ERROR was clear, so the dial itself did not fail — but a hangup
+                // without POLLOUT is a socket the peer already tore down. Reporting it
+                // beats handing back a dead socket as a successful connect.
+                return error.ConnectionResetByPeer;
+            },
         }
     }
+}
+
+/// What one `poll` wake-up says about a pending connect, before SO_ERROR is read.
+const ConnectPoll = enum {
+    /// Nothing decisive yet — keep polling until the deadline.
+    pending,
+    /// Writable: the attempt finished, one way or the other.
+    connected,
+    /// Error or hangup with no POLLOUT: no usable socket came out of this dial.
+    hangup,
+};
+
+fn classifyConnectPoll(revents: i16) ConnectPoll {
+    const err_bits = posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL;
+    if ((revents & posix.POLL.OUT) != 0) return .connected;
+    if ((revents & err_bits) != 0) return .hangup;
+    return .pending;
 }
 
 fn checkSocketError(sock: posix.socket_t) !void {
