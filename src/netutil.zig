@@ -145,21 +145,31 @@ test "hostname dial fails fast when no unit of concurrency is available" {
     );
 }
 
-test "classifyConnectPoll keeps a bare hangup out of the connected path" {
+test "classifyPoll lets the requested event win and splits hangup from error" {
     const OUT = std.posix.POLL.OUT;
+    const IN = std.posix.POLL.IN;
     const ERR = std.posix.POLL.ERR;
     const HUP = std.posix.POLL.HUP;
     const NVAL = std.posix.POLL.NVAL;
 
-    try std.testing.expectEqual(ConnectPoll.connected, classifyConnectPoll(OUT));
-    // A refused connect: the error bits ride along with POLLOUT and SO_ERROR decides.
-    try std.testing.expectEqual(ConnectPoll.connected, classifyConnectPoll(OUT | ERR | HUP));
-    // Hangup alone used to reach `checkSocketError` and, with SO_ERROR clear, return
-    // a torn-down socket as a successful dial.
-    try std.testing.expectEqual(ConnectPoll.hangup, classifyConnectPoll(HUP));
-    try std.testing.expectEqual(ConnectPoll.hangup, classifyConnectPoll(ERR));
-    try std.testing.expectEqual(ConnectPoll.hangup, classifyConnectPoll(NVAL));
-    try std.testing.expectEqual(ConnectPoll.pending, classifyConnectPoll(0));
+    // The ready bit decides wherever it is set: a refused connect carries the error
+    // bits alongside POLLOUT, and SO_ERROR settles it afterwards.
+    try std.testing.expectEqual(PollVerdict.ready, classifyPoll(OUT, OUT));
+    try std.testing.expectEqual(PollVerdict.ready, classifyPoll(OUT | ERR | HUP, OUT));
+    try std.testing.expectEqual(PollVerdict.ready, classifyPoll(IN | HUP, IN));
+
+    // Each loop asks about its own event, so the other one is never decisive.
+    try std.testing.expectEqual(PollVerdict.pending, classifyPoll(IN, OUT));
+    try std.testing.expectEqual(PollVerdict.pending, classifyPoll(OUT, IN));
+
+    // The split the two callers need: the read loop returns on a hangup and fails on
+    // a broken socket, the connect loop rejects both.
+    try std.testing.expectEqual(PollVerdict.hangup, classifyPoll(HUP, IN));
+    try std.testing.expectEqual(PollVerdict.failed, classifyPoll(ERR, IN));
+    try std.testing.expectEqual(PollVerdict.failed, classifyPoll(NVAL, IN));
+    try std.testing.expectEqual(PollVerdict.failed, classifyPoll(ERR | HUP, IN));
+
+    try std.testing.expectEqual(PollVerdict.pending, classifyPoll(0, OUT));
 }
 
 test "applyBind treats null as no-op and empty spec as an error" {
@@ -357,39 +367,49 @@ fn waitConnectedUntil(io: Io, sock: posix.socket_t, deadline: ?i128) !void {
         const n = try posix.poll(&fds, timeout_ms);
         if (n == 0) return error.Timeout;
 
-        switch (classifyConnectPoll(fds[0].revents)) {
+        switch (classifyPoll(fds[0].revents, posix.POLL.OUT)) {
             .pending => continue,
-            .connected => {
+            .ready => {
                 // A failed connect sets POLLERR alongside POLLOUT, so SO_ERROR still
                 // decides; clear means the socket is usable.
                 try checkSocketError(sock);
                 return;
             },
-            .hangup => {
+            .hangup, .failed => {
                 try checkSocketError(sock);
-                // SO_ERROR was clear, so the dial itself did not fail — but a hangup
-                // without POLLOUT is a socket the peer already tore down. Reporting it
-                // beats handing back a dead socket as a successful connect.
+                // SO_ERROR was clear, so the dial itself did not fail — but without
+                // POLLOUT there is no usable socket to hand back. Reporting it beats
+                // passing a torn-down socket off as a successful connect.
                 return error.ConnectionResetByPeer;
             },
         }
     }
 }
 
-/// What one `poll` wake-up says about a pending connect, before SO_ERROR is read.
-const ConnectPoll = enum {
+/// What one `poll` wake-up says about a socket, before SO_ERROR is read.
+///
+/// `hangup` is kept apart from `failed` because the two wait loops disagree about
+/// POLLHUP: a half-closed socket is nothing to a reader, which goes on to collect
+/// whatever arrived and then EndOfStream, but it is a dead dial for a connect that
+/// never saw its ready event.
+const PollVerdict = enum {
     /// Nothing decisive yet — keep polling until the deadline.
     pending,
-    /// Writable: the attempt finished, one way or the other.
-    connected,
-    /// Error or hangup with no POLLOUT: no usable socket came out of this dial.
+    /// The event the caller asked for fired.
+    ready,
+    /// POLLHUP with no error pending: the peer tore the connection down.
     hangup,
+    /// POLLERR / POLLNVAL: the socket itself is broken.
+    failed,
 };
 
-fn classifyConnectPoll(revents: i16) ConnectPoll {
-    const err_bits = posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL;
-    if ((revents & posix.POLL.OUT) != 0) return .connected;
-    if ((revents & err_bits) != 0) return .hangup;
+/// `ready_bit` is the event the caller waits on — POLL.OUT for a pending connect,
+/// POLL.IN for a pending read. It wins wherever it is set, because a failed connect
+/// reports POLLERR alongside POLLOUT and SO_ERROR is what settles that case.
+fn classifyPoll(revents: i16, ready_bit: i16) PollVerdict {
+    if ((revents & ready_bit) != 0) return .ready;
+    if ((revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) return .failed;
+    if ((revents & posix.POLL.HUP) != 0) return .hangup;
     return .pending;
 }
 
@@ -482,10 +502,13 @@ pub fn waitReadableUntil(stream: Io.net.Stream, io: Io, deadline_ns: ?i128) !voi
         }};
         const n = try std.posix.poll(&fds, timeout_ms);
         if (n == 0) return error.Timeout;
-        if ((fds[0].revents & std.posix.POLL.IN) != 0) return;
-        if ((fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.NVAL)) != 0)
-            return error.ConnectionResetByPeer;
-        if ((fds[0].revents & std.posix.POLL.HUP) != 0) return;
+        switch (classifyPoll(fds[0].revents, std.posix.POLL.IN)) {
+            .pending => continue,
+            // A hangup still leaves whatever the peer sent before closing, and the
+            // read that follows reports EndOfStream on its own.
+            .ready, .hangup => return,
+            .failed => return error.ConnectionResetByPeer,
+        }
     }
 }
 
