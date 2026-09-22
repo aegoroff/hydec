@@ -417,16 +417,17 @@ test "httpResponseTotalLen survives peer-controlled lengths that would overflow"
         "HTTP/1.1 200 OK\r\nContent-Length: " ++ max_cl ++ "\r\n\r\nhello";
     try std.testing.expectEqual(@as(?usize, null), httpResponseTotalLen(cl));
 
-    // maxInt(usize) - 1: `size + 2` alone wraps to 0, which used to leave `pos`
-    // unmoved and spin the chunk loop forever.
-    const spin_size = std.fmt.comptimePrint("{x}", .{std.math.maxInt(usize) - 1});
-    const spin =
-        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++ spin_size ++ "\r\nAAAA\r\n";
-    try std.testing.expectEqual(@as(?usize, null), httpResponseTotalLen(spin));
+    // Two chunk sizes that differ in how they wrap: maxInt(usize) - 1 takes
+    // `size + 2` to zero, maxInt(usize) takes it to one. Neither may be measured by
+    // adding it to `pos`, so both have to be turned away on the space left.
+    const wrap_to_zero = std.fmt.comptimePrint("{x}", .{std.math.maxInt(usize) - 1});
+    const chunk_zero =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++ wrap_to_zero ++ "\r\nAAAA\r\n";
+    try std.testing.expectEqual(@as(?usize, null), httpResponseTotalLen(chunk_zero));
 
-    const huge_chunk =
+    const chunk_one =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nAAAA\r\n";
-    try std.testing.expectEqual(@as(?usize, null), httpResponseTotalLen(huge_chunk));
+    try std.testing.expectEqual(@as(?usize, null), httpResponseTotalLen(chunk_one));
 
     // A chunk-size line with no room left for even the trailing CRLF.
     const truncated = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n";

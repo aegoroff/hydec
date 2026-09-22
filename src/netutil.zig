@@ -146,11 +146,11 @@ test "hostname dial fails fast when no unit of concurrency is available" {
 }
 
 test "classifyPoll lets the requested event win and splits hangup from error" {
-    const OUT = std.posix.POLL.OUT;
-    const IN = std.posix.POLL.IN;
-    const ERR = std.posix.POLL.ERR;
-    const HUP = std.posix.POLL.HUP;
-    const NVAL = std.posix.POLL.NVAL;
+    const OUT = posix.POLL.OUT;
+    const IN = posix.POLL.IN;
+    const ERR = posix.POLL.ERR;
+    const HUP = posix.POLL.HUP;
+    const NVAL = posix.POLL.NVAL;
 
     // The ready bit decides wherever it is set: a refused connect carries the error
     // bits alongside POLLOUT, and SO_ERROR settles it afterwards.
