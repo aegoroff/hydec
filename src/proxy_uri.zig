@@ -139,7 +139,8 @@ fn parseUserAtHost(gpa: std.mem.Allocator, rest: []const u8, default_port: u16) 
         query = no_frag[q + 1 ..];
     }
 
-    const at = std.mem.indexOfScalar(u8, address_part, '@') orelse return error.InvalidProxyUri;
+    // Last '@', as Go's net/url does: an unencoded '@' in a password stays userinfo.
+    const at = std.mem.lastIndexOfScalar(u8, address_part, '@') orelse return error.InvalidProxyUri;
     const raw_user = address_part[0..at];
     // Drop any path after the authority (`trojan://pw@host:443/?type=ws`); only
     // the userinfo may legally contain '/', so cut after the '@'.
@@ -497,6 +498,15 @@ test "stripPath does not touch a slash inside userinfo" {
     defer p.deinit(gpa);
     try std.testing.expectEqualStrings("pa/ss", p.userinfo);
     try std.testing.expectEqualStrings("192.0.2.10", p.host);
+}
+
+test "parse keeps an unencoded at-sign inside userinfo" {
+    const gpa = std.testing.allocator;
+    var p = try parse(gpa, "trojan://p@ss@192.0.2.10:443?security=tls#tag");
+    defer p.deinit(gpa);
+    try std.testing.expectEqualStrings("p@ss", p.userinfo);
+    try std.testing.expectEqualStrings("192.0.2.10", p.host);
+    try std.testing.expectEqual(@as(u16, 443), p.port);
 }
 
 test "parse ss keeps a slash inside base64 userinfo when a path follows" {
