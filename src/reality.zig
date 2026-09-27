@@ -992,7 +992,7 @@ pub fn probeVless(
             } else if (ftyp == 0x03) {
                 if (frame_len >= 4) {
                     const code = std.mem.readInt(u32, payload[0..4], .big);
-                    std.log.warn("gRPC RST_STREAM error_code={d}", .{code});
+                    std.log.debug("gRPC RST_STREAM error_code={d}", .{code});
                 }
                 return error.GrpcRstStream;
             } else if (ftyp == 0x07) {
