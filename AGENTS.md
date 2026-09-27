@@ -83,7 +83,7 @@ zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
 Via **just** (mise-wrapped Zig):
 
 ```bash
-just build                                                      # ReleaseFast, x86_64-linux-musl, core2
+just build                                                      # ReleaseSmall, x86_64-linux-musl, core2
 just test
 just arch=x86_64 os=linux abi=musl ver=0.1.0 cpu=core2 release
 just ver=0.1.0 build-all                                        # all release targets + archives
@@ -187,4 +187,4 @@ build: zig 0.16
 1. `zig build` succeeds.
 2. `zig build test` passes.
 3. Changed Zig sources are `zig fmt`'d.
-4. No new compiler warnings in ReleaseFast (just/CI default).
+4. No new compiler warnings in ReleaseSmall (just/CI default).
