@@ -63,8 +63,9 @@ pub fn responseHeaderLen(buf: []const u8) error{ NeedMore, InvalidVlessResponse 
     if (buf.len < 2) return error.NeedMore;
     if (buf[0] != 0) return error.InvalidVlessResponse;
     const addon_len = buf[1];
-    // HTTP/2 SETTINGS: 00 00 xx 04 ... (VLESS empty header is only 00 00)
-    if (addon_len == 0 and buf.len >= 4 and buf[3] == 0x04) return error.InvalidVlessResponse;
+    // Nothing past the header is inspected: under Vision the next 16 bytes are the
+    // user's UUID, so any pattern there is legitimate. An h2 peer (REALITY dest
+    // fallback) still fails closed downstream, on the Vision frame or inner TLS.
     const total = 2 + @as(usize, addon_len);
     if (buf.len < total) return error.NeedMore;
     return total;
@@ -220,6 +221,18 @@ test "encodeProbeRequest is cleartext HTTP without Vision" {
     // No Vision UUID frame after the VLESS header — raw HTTP follows.
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], util.probe_http) != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "xtls-rprx-vision") == null);
+}
+
+test "responseHeaderLen consumes only the header in front of a Vision UUID" {
+    // The empty header is followed directly by the user's UUID. This one's second
+    // byte is 0x04, the type byte of an HTTP/2 SETTINGS frame header.
+    var uuid: [16]u8 = undefined;
+    try parseUuid("a104c3e2-0000-4000-8000-000000000001", &uuid);
+    var wire: [64]u8 = undefined;
+    wire[0] = 0;
+    wire[1] = 0;
+    const n = try appendVisionFrame(wire[2..], vision_cmd_continue, &uuid, "x", 0);
+    try std.testing.expectEqual(@as(usize, 2), try responseHeaderLen(wire[0 .. 2 + n]));
 }
 
 test "consumeVisionFrame NeedMore and content before padding" {

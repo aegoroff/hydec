@@ -1767,6 +1767,28 @@ test "drainVlessVisionStream rejects raw HTTP when Vision required" {
     );
 }
 
+test "drainVlessVisionStream rejects an HTTP/2 peer when Vision required" {
+    // A REALITY dest fallback that picked h2 opens with SETTINGS, whose first two bytes
+    // read as an empty VLESS header; the Vision frame check turns the rest away.
+    var uuid: [16]u8 = [_]u8{0x77} ** 16;
+    const settings = [_]u8{ 0x00, 0x00, 0x12, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 0x12;
+    var stream: [64]u8 = undefined;
+    @memcpy(stream[0..settings.len], &settings);
+    var stream_len: usize = settings.len;
+    var http_buf: [64]u8 = undefined;
+    var http_len: usize = 0;
+    var stripped = false;
+    var vision_raw = false;
+    var saw_vision = false;
+    var vision_state: vless.VisionUnpadState = .{};
+    var xtls_raw_read = false;
+
+    try std.testing.expectError(
+        error.ExpectedVisionPadding,
+        drainVlessVisionStream(&stream, &stream_len, &http_buf, &http_len, &uuid, &stripped, &vision_raw, &saw_vision, true, &vision_state, &xtls_raw_read),
+    );
+}
+
 test "drainVlessVisionStream Direct sets xtls_raw_read" {
     var uuid: [16]u8 = [_]u8{0x66} ** 16;
     const payload = "\x17\x03\x03\x00\x01\x00";
