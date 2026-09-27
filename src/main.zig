@@ -144,6 +144,10 @@ fn runPing(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
         std.process.exit(2);
     };
     defer proxy.deinit(gpa);
+    if (proxy.kind == .vmess) {
+        std.log.err("invalid proxy URI: vmess is not supported", .{});
+        std.process.exit(2);
+    }
 
     const latency = probe.probeAverage(gpa, io, proxy, opts.timeout_secs, opts.interface) catch |err| {
         std.log.warn("FAIL: {f}: {s} ({})", .{ probe.HostIdent{ .name = proxy.name, .host = proxy.host }, probe.failHint(err), err });
