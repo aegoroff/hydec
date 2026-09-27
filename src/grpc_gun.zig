@@ -43,7 +43,9 @@ fn unwrapHunk(msg: []const u8) error{InvalidHunk}![]const u8 {
     var pos: usize = 1;
     const len, const varint_bytes = readVarint(msg[pos..]) catch return error.InvalidHunk;
     pos += varint_bytes;
-    if (pos + len > msg.len) return error.InvalidHunk;
+    // `len` is peer-controlled: measure it against the bytes left rather than adding
+    // it to `pos`. The varint was read from inside `msg`, so `pos <= msg.len`.
+    if (len > msg.len - pos) return error.InvalidHunk;
     return msg[pos .. pos + len];
 }
 
@@ -514,6 +516,21 @@ test "headersIndicateStatus200 accepts Huffman literal :status 200" {
     try std.testing.expect(headersIndicateStatus200(&.{
         0x00, 0x85, 0xb8, 0x84, 0x8d, 0x36, 0xa3, 0x82, 0x10, 0x01,
     }, 0));
+}
+
+test "unwrapHunk rejects a length that would wrap past the message" {
+    // maxInt(usize) takes `pos + len` below `msg.len`, so only a comparison against
+    // the bytes left catches it. The raw gRPC payload is what vlessFromGrpcData keeps.
+    var msg: [16]u8 = undefined;
+    msg[0] = 0x0a;
+    const vn = writeVarint(msg[1..], std.math.maxInt(usize));
+    msg[1 + vn] = 'x';
+    const hunk = msg[0 .. 2 + vn];
+    try std.testing.expectError(error.InvalidHunk, unwrapHunk(hunk));
+
+    var frame: [32]u8 = undefined;
+    const fl = try wrapGrpc(&frame, hunk);
+    try std.testing.expectEqualSlices(u8, hunk, try vlessFromGrpcData(frame[0..fl]));
 }
 
 test "readVarint rejects overlong continuation" {
