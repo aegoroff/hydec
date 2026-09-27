@@ -931,16 +931,7 @@ pub fn probeVless(
                 fl += try grpc_gun.buildSettingsAck(flight[fl..]);
                 if (!settings_seen) {
                     settings_seen = true;
-                    // Open the flow-control window generously (some peers start at 0).
-                    fl += try grpc_gun.buildWindowUpdate(flight[fl..], 0, 1 << 20);
-                    fl += try grpc_gun.buildWindowUpdate(flight[fl..], 1, 1 << 20);
-                    fl += try grpc_gun.buildGunHeaders(flight[fl..], service_name, authority);
-                    var hunk: [640]u8 = undefined;
-                    const hunk_len = try grpc_gun.wrapHunk(&hunk, vless_buf[0..vless_len]);
-                    var grpc_msg: [704]u8 = undefined;
-                    const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
-                    // Keep the stream open — gun-lite is bidirectional; END_STREAM yields empty 200s.
-                    fl += try grpc_gun.buildDataFrame(flight[fl..], 1, grpc_msg[0..glen], false);
+                    fl += try grpc_gun.buildStreamOpen(flight[fl..], service_name, authority, vless_buf[0..vless_len]);
                     request_sent = true;
                     saw_headers_ok = false;
                     saw_grpc_data = false;

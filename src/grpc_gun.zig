@@ -382,6 +382,25 @@ pub fn buildWindowUpdate(out: []u8, stream_id: u31, increment: u32) error{Buffer
     return 13;
 }
 
+/// Open the gun stream after the peer's first SETTINGS: connection WINDOW_UPDATE,
+/// HEADERS for stream 1, then its WINDOW_UPDATE and the first DATA carrying `request`.
+/// The stream update must follow HEADERS: RFC 9113 §5.1 makes any other frame on an
+/// idle stream a connection PROTOCOL_ERROR, which Go's HTTP/2 server answers with GOAWAY.
+pub fn buildStreamOpen(out: []u8, service_name: []const u8, authority: []const u8, request: []const u8) !usize {
+    var n: usize = 0;
+    // Open the flow-control window generously (some peers start at 0).
+    n += try buildWindowUpdate(out[n..], 0, 1 << 20);
+    n += try buildGunHeaders(out[n..], service_name, authority);
+    n += try buildWindowUpdate(out[n..], 1, 1 << 20);
+    var hunk: [640]u8 = undefined;
+    const hunk_len = try wrapHunk(&hunk, request);
+    var grpc_msg: [704]u8 = undefined;
+    const glen = try wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
+    // Keep the stream open — gun-lite is bidirectional; END_STREAM yields empty 200s.
+    n += try buildDataFrame(out[n..], 1, grpc_msg[0..glen], false);
+    return n;
+}
+
 pub fn formatAuthority(buf: []u8, sni: []const u8, port: u16, explicit: []const u8) ![]const u8 {
     if (explicit.len > 0) return explicit;
     // Match sing-box v2raygrpclite: Host = SNI:port
@@ -440,6 +459,27 @@ test "buildSettingsAck is an empty ACK frame on stream 0" {
         &[_]u8{ 0, 0, 0, 0x04, 0x01, 0, 0, 0, 0 },
         out[0..n],
     );
+}
+
+test "buildStreamOpen sends HEADERS before any other stream-1 frame" {
+    var out: [1536]u8 = undefined;
+    const n = try buildStreamOpen(&out, "", "example.com", "request");
+
+    var types: [4]u8 = undefined;
+    var streams: [4]u32 = undefined;
+    var count: usize = 0;
+    var off: usize = 0;
+    while (off < n) : (count += 1) {
+        if (count == types.len) return error.TestUnexpectedResult;
+        types[count] = out[off + 3];
+        streams[count] = std.mem.readInt(u32, out[off + 5 ..][0..4], .big);
+        off += 9 + std.mem.readInt(u24, out[off..][0..3], .big);
+    }
+    try std.testing.expectEqual(n, off);
+    try std.testing.expectEqual(types.len, count);
+    // WINDOW_UPDATE(0), HEADERS(1), WINDOW_UPDATE(1), DATA(1).
+    try std.testing.expectEqualSlices(u8, &.{ 0x08, 0x01, 0x08, 0x00 }, &types);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 1, 1 }, &streams);
 }
 
 test "headersIndicateStatus200 skips padding" {
