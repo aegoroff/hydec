@@ -863,12 +863,14 @@ pub fn probeVless(
 ) !u64 {
     const sni_use = if (sni.len > 0) sni else host;
 
+    // Full attempt: dial, REALITY handshake and the tunneled requests.
+    const start = netutil.monoNow(io);
     var rc: RealityConn = undefined;
     try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind);
     defer rc.deinit();
 
     if (!grpc) {
-        return probeVlessTcpHttps(&rc, io, uuid, flow);
+        return probeVlessTcpHttps(&rc, io, uuid, flow, start);
     }
 
     var vless_buf: [1024]u8 = undefined;
@@ -895,7 +897,6 @@ pub fn probeVless(
     // already buffered when the steady request was written. Ignoring them avoids false-OK;
     // keeping them in `gather` preserves HTTP/2 frame alignment (unlike wiping the buffer).
     var discard_data_before: usize = 0;
-    var steady_start: ?i128 = null;
     var http_buf: [16384]u8 = undefined;
     var http_len: usize = 0;
     // gRPC messages may span multiple HTTP/2 DATA frames — assemble before unwrap.
@@ -974,12 +975,11 @@ pub fn probeVless(
                             var data_frame: [384]u8 = undefined;
                             const dlen = try grpc_gun.buildDataFrame(&data_frame, 1, grpc_msg[0..glen], false);
                             try rc.writeApp(data_frame[0..dlen]);
-                            steady_start = netutil.monoNow(io);
                             // Bytes already in `gather` cannot be a reply to the steady write.
                             discard_data_before = gather_len;
                         }
                     } else if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.PROBE_UA_STEADY)) {
-                        return netutil.elapsedMs(steady_start.?, io);
+                        return netutil.elapsedMs(start, io);
                     }
                     // Drop any pipelined leftover after warmup (same as ignoring trailing
                     // bytes in a single DATA frame before reassembly).
@@ -1190,7 +1190,7 @@ const VisionPipe = struct {
     }
 };
 
-fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []const u8) !u64 {
+fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []const u8, start: i128) !u64 {
     const use_vision = std.mem.indexOf(u8, flow, "vision") != null;
     var uuid: [16]u8 = undefined;
     try vless.parseUuid(uuid_text, &uuid);
@@ -1232,11 +1232,10 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
     // One CF HTTPS request after inner TLS — fail-closed on distinct steady UA.
     // Nested handshake dominates wall time; a separate warmup RTT is not needed.
     var http_buf: [8192]u8 = undefined;
-    const steady_start = netutil.monoNow(io);
     try flushTlsApp(&tls_client, &pipe, util.PROBE_HTTP_STEADY);
     _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf, util.PROBE_UA_STEADY);
     if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
-    return netutil.elapsedMs(steady_start, io);
+    return netutil.elapsedMs(start, io);
 }
 
 /// Prefer VisionPipe / socket causes over opaque `WriteFailed` / `ReadFailed` wrappers.

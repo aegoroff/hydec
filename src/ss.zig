@@ -310,7 +310,6 @@ pub fn probe(
     // first Cloudflare response if the second request is not already in flight.
     var steady_pkt: [512]u8 = undefined;
     const steady_len = try sealChunk(&ctx, &steady_pkt, util.PROBE_HTTP_STEADY);
-    const steady_start = netutil.monoNow(io);
     w.interface.writeAll(steady_pkt[0..steady_len]) catch |err| return netutil.classifyIoErr(err, w.err, null, fired.load(.acquire));
     w.interface.flush() catch |err| return netutil.classifyIoErr(err, w.err, null, fired.load(.acquire));
 
@@ -327,7 +326,8 @@ pub fn probe(
     try readProbeResponse(&server_ctx, &r, &fired, http_buf, &http_len, chunk_buf, util.PROBE_UA_WARMUP);
     try readProbeResponse(&server_ctx, &r, &fired, http_buf, &http_len, chunk_buf, util.PROBE_UA_STEADY);
 
-    return netutil.elapsedMs(steady_start, io);
+    // Full attempt: dial, salt exchange and both requests.
+    return netutil.elapsedMs(start, io);
 }
 
 test "evpBytesToKey chacha length" {

@@ -213,10 +213,16 @@ pub fn probe(
         }
     }
 
+    // Loaded once per process; keep it out of the measured time like the ALPN check.
+    const bundle: ?*Certificate.Bundle = if (opts.allow_insecure) null else try ensureCaBundle(gpa, io);
+
     // The ALPN check already spent part of the caller's budget; the rest of the probe
     // gets what is left, so `-t` still bounds the whole attempt.
     const connect_secs = netutil.remainingTimeoutSecs(start, io, timeout_secs);
     if (connect_secs == 0) return error.Timeout;
+    // Measured from the real dial: a client negotiates ALPN inside its own handshake,
+    // so the side check's extra connection is not part of the latency.
+    const attempt_start = netutil.monoNow(io);
     const stream = try netutil.connectHostPort(io, host, port, connect_secs, bind);
     defer stream.close(io);
 
@@ -228,8 +234,6 @@ pub fn probe(
     var fired = std.atomic.Value(bool).init(false);
     var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
     defer guard.disarm();
-
-    const bundle: ?*Certificate.Bundle = if (opts.allow_insecure) null else try ensureCaBundle(gpa, io);
 
     var sock_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
     var sock_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
@@ -291,7 +295,6 @@ pub fn probe(
         return error.ProbeResponseMismatch;
 
     // Steady-state: require a real keep-alive reply (same fail-closed policy as gRPC/Vision).
-    const steady_start = netutil.monoNow(io);
     if (opts.transport_ws) {
         ws.writeBinaryFrame(conn, io, util.PROBE_HTTP_STEADY) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
@@ -309,7 +312,7 @@ pub fn probe(
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.PROBE_UA_STEADY))
         return error.ProbeResponseMismatch;
 
-    return netutil.elapsedMs(steady_start, io);
+    return netutil.elapsedMs(attempt_start, io);
 }
 
 test "AlpnBudget always leaves the probe part of the budget" {

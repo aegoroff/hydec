@@ -63,7 +63,7 @@ hydec ping -t 10 -I wlan0 'vless://...'
 
 ### Ranking (`best`)
 
-Each candidate is probed **3 times**; one timeout or dropped connection is retried once, any other failure drops the candidate. The median latency is kept per preference class. `--strategy` picks the winner:
+Each candidate is probed **3 times**; one timeout or dropped connection is retried once, any other failure drops the candidate. The median latency is kept per preference class. Latency is the full attempt time: connect, TLS / REALITY handshake (and WebSocket upgrade) and the test requests through the tunnel; Trojan's separate ALPN check is excluded. `--strategy` picks the winner:
 
 | Strategy | Behavior |
 |----------|----------|
