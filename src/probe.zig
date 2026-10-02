@@ -280,6 +280,15 @@ pub fn selectBestClass(
     };
 }
 
+/// Absolute latency gap (ms) a `hydec` demotion requires on top of its ratio:
+/// 21 ms vs 7 ms is 3× but only noise.
+pub const min_demote_gap_ms: u64 = 30;
+
+/// `slow` loses to `fast` by more than `min_demote_gap_ms`.
+fn clearlySlower(slow: u64, fast: u64) bool {
+    return slow -| fast > min_demote_gap_ms;
+}
+
 /// Default `hydec` policy:
 /// 1. Prefer fastest VLESS² (gRPC).
 /// 2. Prefer VLESS³ over VLESS² when VLESS² is strictly more than 2× slower.
@@ -288,6 +297,8 @@ pub fn selectBestClass(
 ///    (even if VLESS² was not demoted to VLESS³).
 /// 4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is strictly more than 2× slower than SS.
 /// 5. Trojan only when no VLESS² / VLESS³ / SS succeeded.
+/// Every demotion in 2–4 also needs the slower class to lose by more than
+/// `min_demote_gap_ms`, so jitter between near-local nodes cannot flip the pick.
 fn selectHydecClass(
     vless2_ms: ?u64,
     vless3_ms: ?u64,
@@ -297,15 +308,15 @@ fn selectHydecClass(
     if (vless2_ms) |v2| {
         var class: PrefClass = .vless2;
         if (vless3_ms) |v3| {
-            if (v2 > v3 *| 2) {
+            if (v2 > v3 *| 2 and clearlySlower(v2, v3)) {
                 class = .vless3;
             }
         }
         if (ss_ms) |ss_lat| {
-            if (v2 >= ss_lat *| 3) {
+            if (v2 >= ss_lat *| 3 and clearlySlower(v2, ss_lat)) {
                 // SS eligible vs VLESS²: prefer VLESS³ unless it is >3× slower than SS.
                 if (vless3_ms) |v3| {
-                    if (v3 > ss_lat *| 3) return .shadowsocks;
+                    if (v3 > ss_lat *| 3 and clearlySlower(v3, ss_lat)) return .shadowsocks;
                     return .vless3;
                 }
                 return .shadowsocks;
@@ -316,7 +327,7 @@ fn selectHydecClass(
 
     if (vless3_ms) |v3| {
         if (ss_ms) |ss_lat| {
-            if (v3 > ss_lat *| 2) return .shadowsocks;
+            if (v3 > ss_lat *| 2 and clearlySlower(v3, ss_lat)) return .shadowsocks;
         }
         return .vless3;
     }
@@ -850,6 +861,20 @@ test "selectBestClass hydec prefers VLESS2 then demotes on 2x / SS on 3x" {
     // Trojan only as last resort.
     try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, null, null, 10));
     try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.hydec, null, null, null, null));
+}
+
+test "selectBestClass hydec ignores ratio wins below the absolute gap" {
+    // 3× but only 14 ms apart: no VLESS²→SS demotion.
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 21, null, 7, null));
+    // >2× but 30 ms apart (not more): no VLESS²→VLESS³ demotion.
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 50, 20, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 51, 20, null, null));
+    // No VLESS²: VLESS³ 25 ms vs SS 5 ms stays VLESS³.
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 25, 5, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, 36, 5, null));
+    // SS eligible vs VLESS², VLESS³ >3× SS yet within the gap: keep VLESS³.
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 100, 32, 10, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 100, 41, 10, null));
 }
 
 test "selectBestClass fastest picks minimum latency" {
