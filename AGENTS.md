@@ -27,14 +27,14 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 1. Fetch subscription URL (**HTTPS only**; plaintext schemes → `InsecureSubscriptionUrl`). Redirects are followed only while the resolved target stays HTTPS; `http://` hops are rejected. Scheme is normalized to lowercase for `std.http.Client`.
 2. Base64-decode body; iterate URI lines.
 3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**.
-4. Each candidate: **3 probes**, fail-fast on first error; keep **average** latency per preference class.
+4. Each candidate: **3 probes**; one transient failure (timeout / reset / EOF, `isTransient`) is retried once, any other error fails it immediately; keep **median** latency per preference class.
 5. Rank with `selectBestClass` according to `--strategy` (`hydec` default, `fastest`, `strict`). `hydec`: prefer VLESS² (gRPC) → VLESS³ (TCP) → SS → Trojan. Demote VLESS²→VLESS³ when VLESS² is **>2×** slower; VLESS²→SS when **≥3×** (then keep VLESS³ unless it is **>3×** slower than SS); with no VLESS², demote VLESS³→SS when **>2×** slower. Trojan only if no VLESS² / VLESS³ / SS succeeded. `fastest`: lowest latency (tie → higher class). `strict`: never demote.
 6. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
 
 **Behavior (`ping`)**
 
 1. Parse one proxy URI from the CLI.
-2. Probe it **3 times** (stop on first failure); log `OK: …` or `FAIL: …` to **stderr**.
+2. Probe it **3 times** (same retry rule as `best`); log `OK: …` or `FAIL: …` to **stderr**.
 3. Exit `0` on success, `1` on probe failure.
 
 **`--interface` / `-I`**
@@ -57,7 +57,7 @@ Optional bind spec for **probe** sockets only (subscription fetch unchanged):
 | `src/fetch.zig` | Download subscription (HTTPS-only gate) |
 | `src/subscription.zig` | Base64 decode, line iteration |
 | `src/proxy_uri.zig` | URI parse (kind, host/port, query, `#name`) |
-| `src/probe.zig` | Group-by-host parallel `findBest`, preference ranking, `probeOne` / `probeAverage` |
+| `src/probe.zig` | Group-by-host parallel `findBest`, preference ranking, `probeOne` / `probeLatency` |
 | `src/ss.zig` / `trojan.zig` / `reality.zig` | Protocol probes |
 | `src/alpn.zig` | `alpn=` parsing, ALPN negotiation check (TLS 1.2 ClientHello) |
 | `src/vless.zig` / `grpc_gun.zig` / `ws.zig` | Framing helpers |

@@ -98,7 +98,7 @@ const Shared = struct {
     }
 };
 
-/// How many successful probes are required for `ping` / `best` (fail-fast on first error).
+/// How many successful probes are required for `ping` / `best` (see `transient_retries`).
 pub const probe_attempts: usize = 3;
 
 pub fn probeOne(
@@ -196,28 +196,73 @@ pub fn probeOne(
     };
 }
 
-/// Rounded mean of `samples` (at least one). Used by `probeAverage` and tests.
-pub fn averageMs(samples: []const u64) u64 {
+/// How many failed attempts per candidate may be retried, and only when `isTransient`.
+pub const transient_retries: usize = 1;
+
+/// Median of `samples` (at least one); upper median for an even count. Sorts in place.
+/// A single latency spike among three samples does not move the result.
+pub fn medianMs(samples: []u64) u64 {
     std.debug.assert(samples.len > 0);
-    var sum: u64 = 0;
-    for (samples) |s| sum += s;
-    return (sum + samples.len / 2) / samples.len;
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    return samples[samples.len / 2];
 }
 
-/// Run `probe_attempts` full probes; stop on the first failure.
-/// On success returns the rounded average latency in ms.
-pub fn probeAverage(
+/// Failures a repeat attempt may plausibly not hit again (packet loss, a dropped
+/// connection). Handshake, auth, response-mismatch and DNS errors are deterministic
+/// for a given URI, so they still fail the candidate on the first occurrence.
+pub fn isTransient(err: anyerror) bool {
+    return switch (err) {
+        error.Timeout,
+        error.ConnectionTimedOut,
+        error.ConnectionResetByPeer,
+        error.EndOfStream,
+        error.UnexpectedEndOfStream,
+        error.BrokenPipe,
+        error.TlsConnectionTruncated,
+        => true,
+        else => false,
+    };
+}
+
+/// Fill `samples` from `prober.probe()`; fail on the first non-transient error or once
+/// `transient_retries` is used up.
+fn collectSamples(prober: anytype, samples: []u64) !void {
+    var retries_left = transient_retries;
+    for (samples) |*slot| {
+        slot.* = while (true) {
+            break prober.probe() catch |err| {
+                if (retries_left == 0 or !isTransient(err)) return err;
+                retries_left -= 1;
+                std.log.debug("retrying after transient error: {t}", .{err});
+                continue;
+            };
+        };
+    }
+}
+
+/// Run `probe_attempts` full probes (one retry on a transient error).
+/// On success returns the median latency in ms.
+pub fn probeLatency(
     gpa: std.mem.Allocator,
     io: Io,
     proxy: proxy_uri.Proxy,
     timeout_secs: u32,
     bind: ?[]const u8,
 ) !u64 {
+    const Prober = struct {
+        gpa: std.mem.Allocator,
+        io: Io,
+        proxy: proxy_uri.Proxy,
+        timeout_secs: u32,
+        bind: ?[]const u8,
+
+        fn probe(self: @This()) !u64 {
+            return probeOne(self.gpa, self.io, self.proxy, self.timeout_secs, self.bind);
+        }
+    };
     var samples: [probe_attempts]u64 = undefined;
-    for (&samples) |*slot| {
-        slot.* = try probeOne(gpa, io, proxy, timeout_secs, bind);
-    }
-    return averageMs(&samples);
+    try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind }, &samples);
+    return medianMs(&samples);
 }
 
 /// Pick the winning preference class from per-class fastest latencies.
@@ -465,8 +510,8 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
             }
         }
 
-        // Three probes, fail-fast; ranking uses the average of all three.
-        const latency = probeAverage(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind) catch |err| {
+        // Three probes (one transient retry); ranking uses their median.
+        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind) catch |err| {
             if (shared.verbose) {
                 std.log.warn("FAIL: {f}: {s} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, failHint(err), err });
             }
@@ -646,13 +691,66 @@ test "OK/FAIL log formatters render both named and unnamed proxies" {
     );
 }
 
-test "averageMs rounds half up via integer bias" {
-    try std.testing.expectEqual(@as(u64, 10), averageMs(&.{ 10, 10, 10 }));
-    try std.testing.expectEqual(@as(u64, 30), averageMs(&.{ 20, 30, 40 }));
-    // (10+10+11 + 1) / 3 = 32/3 = 10
-    try std.testing.expectEqual(@as(u64, 10), averageMs(&.{ 10, 10, 11 }));
-    // (10+11+11 + 1) / 3 = 33/3 = 11
-    try std.testing.expectEqual(@as(u64, 11), averageMs(&.{ 10, 11, 11 }));
+test "medianMs ignores a single spike" {
+    var spike = [_]u64{ 40, 300, 42 };
+    try std.testing.expectEqual(@as(u64, 42), medianMs(&spike));
+    var even = [_]u64{ 30, 10, 20, 40 };
+    try std.testing.expectEqual(@as(u64, 30), medianMs(&even));
+    var one = [_]u64{7};
+    try std.testing.expectEqual(@as(u64, 7), medianMs(&one));
+}
+
+const FakeProber = struct {
+    script: []const anyerror!u64,
+    calls: *usize,
+
+    fn probe(self: FakeProber) !u64 {
+        const r = self.script[self.calls.*];
+        self.calls.* += 1;
+        return r;
+    }
+};
+
+test "collectSamples retries one transient error" {
+    // Arrange
+    var calls: usize = 0;
+    const script = [_]anyerror!u64{ 10, error.Timeout, 20, 30 };
+    var samples: [probe_attempts]u64 = undefined;
+
+    // Act
+    try collectSamples(FakeProber{ .script = &script, .calls = &calls }, &samples);
+
+    // Assert
+    try std.testing.expectEqual(@as(usize, 4), calls);
+    try std.testing.expectEqualSlices(u64, &.{ 10, 20, 30 }, &samples);
+}
+
+test "collectSamples fails on a second transient error" {
+    var calls: usize = 0;
+    const script = [_]anyerror!u64{ error.ConnectionResetByPeer, 10, error.Timeout };
+    var samples: [probe_attempts]u64 = undefined;
+
+    try std.testing.expectError(error.Timeout, collectSamples(FakeProber{ .script = &script, .calls = &calls }, &samples));
+    try std.testing.expectEqual(@as(usize, 3), calls);
+}
+
+test "collectSamples does not retry deterministic errors" {
+    var calls: usize = 0;
+    const script = [_]anyerror!u64{ error.TlsAlert, 10, 10, 10 };
+    var samples: [probe_attempts]u64 = undefined;
+
+    try std.testing.expectError(error.TlsAlert, collectSamples(FakeProber{ .script = &script, .calls = &calls }, &samples));
+    try std.testing.expectEqual(@as(usize, 1), calls);
+}
+
+test "isTransient splits network blips from deterministic failures" {
+    try std.testing.expect(isTransient(error.Timeout));
+    try std.testing.expect(isTransient(error.ConnectionResetByPeer));
+    try std.testing.expect(isTransient(error.EndOfStream));
+    try std.testing.expect(!isTransient(error.TlsAlert));
+    try std.testing.expect(!isTransient(error.ProbeResponseMismatch));
+    try std.testing.expect(!isTransient(error.UnknownHostName));
+    try std.testing.expect(!isTransient(error.ConnectionRefused));
 }
 
 test "collectGroups buckets by host" {
