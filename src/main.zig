@@ -154,7 +154,7 @@ fn runPing(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
         std.process.exit(1);
     };
 
-    std.log.info("OK: {d}ms {s}{f}", .{ latency, proxy.host, probe.NameSuffix{ .name = proxy.name } });
+    std.log.info("OK: {d}ms {s}{f}", .{ latency.median_ms, proxy.host, probe.NameSuffix{ .name = proxy.name } });
 }
 
 test {

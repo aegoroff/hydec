@@ -199,13 +199,24 @@ pub fn probeOne(
 /// How many failed attempts per candidate may be retried, and only when `isTransient`.
 pub const TRANSIENT_RETRIES: usize = 1;
 
-/// Median of `samples` (at least one); upper median for an even count. Sorts in place.
-/// A single latency spike among three samples does not move the result.
-pub fn medianMs(samples: []u64) u64 {
-    std.debug.assert(samples.len > 0);
-    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
-    return samples[samples.len / 2];
-}
+/// Summary of one candidate's samples. `median_ms` ranks; min/max are for `-v` output.
+pub const Latency = struct {
+    median_ms: u64,
+    min_ms: u64,
+    max_ms: u64,
+
+    /// `samples` must be non-empty; sorts it in place. Upper median for an even count,
+    /// so a single latency spike among three samples does not move the result.
+    pub fn fromSamples(samples: []u64) Latency {
+        std.debug.assert(samples.len > 0);
+        std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        return .{
+            .median_ms = samples[samples.len / 2],
+            .min_ms = samples[0],
+            .max_ms = samples[samples.len - 1],
+        };
+    }
+};
 
 /// Failures a repeat attempt may plausibly not hit again (packet loss, a dropped
 /// connection). Handshake, auth, response-mismatch and DNS errors are deterministic
@@ -241,14 +252,14 @@ fn collectSamples(prober: anytype, samples: []u64) !void {
 }
 
 /// Run `PROBE_ATTEMPTS` full probes (one retry on a transient error).
-/// On success returns the median latency in ms.
+/// On success returns the median latency and the sample spread.
 pub fn probeLatency(
     gpa: std.mem.Allocator,
     io: Io,
     proxy: proxy_uri.Proxy,
     timeout_secs: u32,
     bind: ?[]const u8,
-) !u64 {
+) !Latency {
     const Prober = struct {
         gpa: std.mem.Allocator,
         io: Io,
@@ -262,7 +273,7 @@ pub fn probeLatency(
     };
     var samples: [PROBE_ATTEMPTS]u64 = undefined;
     try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind }, &samples);
-    return medianMs(&samples);
+    return Latency.fromSamples(&samples);
 }
 
 /// Pick the winning preference class from per-class fastest latencies.
@@ -536,11 +547,11 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
         }
 
         if (shared.verbose) {
-            std.log.info("OK: {d}ms {s}{f}", .{ latency, proxy.host, NameSuffix{ .name = proxy.name } });
+            std.log.info("OK: {d}ms (min {d}, max {d}) {s}{f}", .{ latency.median_ms, latency.min_ms, latency.max_ms, proxy.host, NameSuffix{ .name = proxy.name } });
         }
 
         const class = PrefClass.fromProxy(proxy) orelse continue;
-        considerBest(shared, class, latency, item.raw, proxy.host);
+        considerBest(shared, class, latency.median_ms, item.raw, proxy.host);
     }
 }
 
@@ -681,7 +692,11 @@ pub fn findBest(
 test "OK/FAIL log formatters render both named and unnamed proxies" {
     var buf: [128]u8 = undefined;
 
-    // OK: shared by `best -v` (probe.zig) and `ping` (main.zig).
+    // OK: `best -v` (probe.zig) adds the sample spread; `ping` (main.zig) does not.
+    try std.testing.expectEqualStrings(
+        "OK: 42ms (min 40, max 300) 1.2.3.4 \u{2014} NL",
+        try std.fmt.bufPrint(&buf, "OK: {d}ms (min {d}, max {d}) {s}{f}", .{ 42, 40, 300, "1.2.3.4", NameSuffix{ .name = "NL" } }),
+    );
     try std.testing.expectEqualStrings(
         "OK: 42ms 1.2.3.4 \u{2014} \u{1f1f3}\u{1f1f1} NL",
         try std.fmt.bufPrint(&buf, "OK: {d}ms {s}{f}", .{ 42, "1.2.3.4", NameSuffix{ .name = "\u{1f1f3}\u{1f1f1} NL" } }),
@@ -702,13 +717,13 @@ test "OK/FAIL log formatters render both named and unnamed proxies" {
     );
 }
 
-test "medianMs ignores a single spike" {
+test "Latency.fromSamples: median ignores a single spike, min/max keep it" {
     var spike = [_]u64{ 40, 300, 42 };
-    try std.testing.expectEqual(@as(u64, 42), medianMs(&spike));
+    try std.testing.expectEqual(Latency{ .median_ms = 42, .min_ms = 40, .max_ms = 300 }, Latency.fromSamples(&spike));
     var even = [_]u64{ 30, 10, 20, 40 };
-    try std.testing.expectEqual(@as(u64, 30), medianMs(&even));
+    try std.testing.expectEqual(Latency{ .median_ms = 30, .min_ms = 10, .max_ms = 40 }, Latency.fromSamples(&even));
     var one = [_]u64{7};
-    try std.testing.expectEqual(@as(u64, 7), medianMs(&one));
+    try std.testing.expectEqual(Latency{ .median_ms = 7, .min_ms = 7, .max_ms = 7 }, Latency.fromSamples(&one));
 }
 
 const FakeProber = struct {
