@@ -517,14 +517,36 @@ pub fn failHint(err: anyerror) []const u8 {
     };
 }
 
-/// The candidate's final error means its host never accepted a TCP connection.
-/// A timeout after connecting can be specific to one port or protocol (a REALITY
-/// dest fallback that hangs while SS on the same IP works), so it does not count.
-pub fn hostUnreachable(err: anyerror) bool {
-    return err == error.ConnectTimeout;
-}
+/// Decides when a host's remaining entries are not worth probing.
+///
+/// Only a timed-out TCP connect counts: a timeout after connecting can be specific to
+/// one port or protocol (a REALITY dest fallback that hangs while SS on the same IP
+/// works). Even a connect timeout can be one throttled port on a live host, so the
+/// host is dead only after it on two different ports, with no entry having connected.
+const DeadHost = struct {
+    timed_out_port: ?u16 = null,
+    /// Some entry got past the TCP connect (passed, or failed later).
+    alive: bool = false,
+
+    /// Record one candidate's outcome (`null` = passed); true once the host is dead.
+    fn record(self: *DeadHost, port: u16, err: ?anyerror) bool {
+        const e = err orelse {
+            self.alive = true;
+            return false;
+        };
+        if (e != error.ConnectTimeout) {
+            self.alive = true;
+            return false;
+        }
+        if (self.alive) return false;
+        if (self.timed_out_port) |p| return p != port;
+        self.timed_out_port = port;
+        return false;
+    }
+};
 
 fn probeGroup(shared: *Shared, items: []WorkItem) void {
+    var dead_host: DeadHost = .{};
     for (items, 0..) |*item, i| {
         const proxy = item.proxy;
 
@@ -547,12 +569,13 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
             if (shared.verbose) {
                 std.log.warn("FAIL: {f}: {s} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, failHint(err), err });
             }
-            if (hostUnreachable(err)) {
+            if (dead_host.record(proxy.port, err)) {
                 skipDeadHost(shared, items[i + 1 ..]);
                 return;
             }
             continue;
         };
+        _ = dead_host.record(proxy.port, null);
 
         {
             shared.lock();
@@ -797,11 +820,28 @@ test "collectSamples does not retry deterministic errors" {
     try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
-test "hostUnreachable only for a timed-out TCP connect" {
-    try std.testing.expect(hostUnreachable(error.ConnectTimeout));
-    // Connected, then stalled: may be one port/protocol only — keep probing the host.
-    try std.testing.expect(!hostUnreachable(error.Timeout));
-    try std.testing.expect(!hostUnreachable(error.ConnectionRefused));
+test "DeadHost needs connect timeouts on two different ports" {
+    // Arrange
+    var host: DeadHost = .{};
+
+    // Act / Assert: one throttled port (live 84.32.177.169:2058) is not enough.
+    try std.testing.expect(!host.record(2058, error.ConnectTimeout));
+    try std.testing.expect(!host.record(2058, error.ConnectTimeout));
+    try std.testing.expect(host.record(8443, error.ConnectTimeout));
+}
+
+test "DeadHost never skips a host that connected once" {
+    var passed: DeadHost = .{};
+    _ = passed.record(443, null);
+    try std.testing.expect(!passed.record(2058, error.ConnectTimeout));
+    try std.testing.expect(!passed.record(8443, error.ConnectTimeout));
+
+    // Connected, then stalled: may be one port/protocol only — the host is alive.
+    var stalled: DeadHost = .{};
+    try std.testing.expect(!stalled.record(443, error.Timeout));
+    try std.testing.expect(!stalled.record(2058, error.ConnectTimeout));
+    try std.testing.expect(!stalled.record(8443, error.ConnectTimeout));
+
     try std.testing.expectEqualStrings("slow/timeout", failHint(error.ConnectTimeout));
 }
 

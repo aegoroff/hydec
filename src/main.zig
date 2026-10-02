@@ -172,4 +172,5 @@ test {
     _ = @import("probe.zig");
     _ = @import("netutil.zig");
     _ = @import("fetch.zig");
+    _ = @import("alpn.zig");
 }

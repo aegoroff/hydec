@@ -4,6 +4,8 @@ const Io = std.Io;
 
 /// What Xray-family clients advertise when a share link carries no `alpn=`.
 /// hydec mirrors it so a probe fails wherever the real client would.
+/// Kept for ws too: Xray's own ws dialer would fall back to `http/1.1`, but link-based
+/// clients (Happ, sing-box) offer h2 there, and h2-picking ws servers fail in them.
 const DEFAULT_ALPN: []const []const u8 = &.{ "h2", "http/1.1" };
 
 /// Share links carry one or two protocols; the cap only keeps the list on the stack.
