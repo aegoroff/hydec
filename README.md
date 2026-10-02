@@ -10,7 +10,7 @@ Requires **Zig 0.16.0** ([mise](https://mise.jdx.dev/) pin in `mise.toml`, or in
 - Probes **Shadowsocks** (AEAD), **Trojan** (TLS / WebSocket), **VLESS REALITY** (TCP vision and gRPC gun)
 - Skips VMess (counted in stats)
 - Groups by host/IP: different IPs in parallel, same IP sequentially
-- Ranks by **protocol preference** (VLESS gRPC → VLESS TCP → SS → Trojan), demoting a preferred tier only when a lower tier is much faster (2× / 3× rules); override with `--strategy fastest` or `strict`
+- Ranks by **protocol preference** (VLESS gRPC → VLESS TCP → SS / Trojan), demoting a preferred tier only when a lower tier is much faster (2× / 3× rules); override with `--strategy fastest` or `strict`
 - Optional `--interface` / `-I` binds probe sockets to a source IP or Linux device name
 - Logs progress to **stderr**; prints the winning URI to **stdout**
 
@@ -75,9 +75,9 @@ Each candidate is probed **3 times**; one timeout or dropped connection is retri
 
 1. Prefer **VLESS²** (REALITY gRPC)
 2. Prefer **VLESS³** (REALITY TCP vision) over VLESS² when VLESS² is **>2×** slower
-3. Prefer **Shadowsocks** over VLESS² when VLESS² is **≥3×** slower. If SS is eligible and VLESS³ exists, keep VLESS³ unless it is **>3×** slower than SS (even if VLESS² was not demoted to VLESS³)
-4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is **>2×** slower than SS
-5. **Trojan** only if no VLESS² / VLESS³ / SS succeeded
+3. **Shadowsocks** and **Trojan** share one tier: the faster of the two stands for it (SS on a tie). Prefer that tier over VLESS² when VLESS² is **≥3×** slower. If it is eligible and VLESS³ exists, keep VLESS³ unless it is **>3×** slower than the tier (even if VLESS² was not demoted to VLESS³)
+4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is **>2×** slower than the SS / Trojan tier
+5. With no VLESS at all: the faster of SS / Trojan
 
 Every demotion in 2–4 also requires the slower class to be more than **15 ms** behind, so jitter between nearby nodes (e.g. 21 ms vs 7 ms) does not change the winner.
 
