@@ -28,15 +28,15 @@ fn buildRequest(password: []const u8, out: []u8) !usize {
     i += 1;
     out[i] = 0x01; // CONNECT
     i += 1;
-    const n = try util.writeSocksAddrDomain(out[i..], util.probe_domain, util.probe_http_port);
+    const n = try util.writeSocksAddrDomain(out[i..], util.PROBE_DOMAIN, util.PROBE_HTTP_PORT);
     i += n;
     out[i] = '\r';
     i += 1;
     out[i] = '\n';
     i += 1;
-    if (out.len < i + util.probe_http.len) return error.BufferTooSmall;
-    @memcpy(out[i..][0..util.probe_http.len], util.probe_http);
-    i += util.probe_http.len;
+    if (out.len < i + util.PROBE_HTTP.len) return error.BufferTooSmall;
+    @memcpy(out[i..][0..util.PROBE_HTTP.len], util.PROBE_HTTP);
+    i += util.PROBE_HTTP.len;
     return i;
 }
 
@@ -287,17 +287,17 @@ pub fn probe(
     const frame_buf = try gpa.alloc(u8, 16384);
     defer gpa.free(frame_buf);
     try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
-    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_warmup))
+    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.PROBE_UA_WARMUP))
         return error.ProbeResponseMismatch;
 
     // Steady-state: require a real keep-alive reply (same fail-closed policy as gRPC/Vision).
     const steady_start = netutil.monoNow(io);
     if (opts.transport_ws) {
-        ws.writeBinaryFrame(conn, io, util.probe_http_steady) catch |err| {
+        ws.writeBinaryFrame(conn, io, util.PROBE_HTTP_STEADY) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     } else {
-        tls_writer.writeAll(util.probe_http_steady) catch |err| {
+        tls_writer.writeAll(util.PROBE_HTTP_STEADY) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
         netutil.flushTls(tls_writer, &stream_writer.interface) catch |err| {
@@ -306,7 +306,7 @@ pub fn probe(
     }
     http_len = 0;
     try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
-    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.probe_ua_steady))
+    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.PROBE_UA_STEADY))
         return error.ProbeResponseMismatch;
 
     return netutil.elapsedMs(steady_start, io);
@@ -349,7 +349,7 @@ test "trojanHash empty password" {
 test "buildRequest wire layout" {
     var buf: [256]u8 = undefined;
     const n = try buildRequest("password", &buf);
-    try std.testing.expectEqual(@as(usize, 82 + util.probe_http.len), n);
+    try std.testing.expectEqual(@as(usize, 82 + util.PROBE_HTTP.len), n);
 
     var want_hex: [56]u8 = undefined;
     trojanHash("password", &want_hex);
@@ -365,5 +365,5 @@ test "buildRequest wire layout" {
     try std.testing.expectEqual(@as(u8, 0x50), buf[79]); // port 80 low
     try std.testing.expectEqual(@as(u8, '\r'), buf[80]);
     try std.testing.expectEqual(@as(u8, '\n'), buf[81]);
-    try std.testing.expectEqualStrings(util.probe_http, buf[82..n]);
+    try std.testing.expectEqualStrings(util.PROBE_HTTP, buf[82..n]);
 }

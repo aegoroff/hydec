@@ -29,16 +29,16 @@ pub fn urlDecodeStrict(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     return try out.toOwnedSlice(gpa);
 }
 
-const b64_ignore_ws = " \t\n\r";
+const B64_IGNORE_WS = " \t\n\r";
 
 /// Decode into `dest` (standard or URL-safe, padded or not). Returns bytes written.
 pub fn decodeBase64UrlInto(dest: []u8, input: []const u8, skip_whitespace: bool) std.base64.Error!usize {
     if (skip_whitespace) {
         const codecs = .{
-            std.base64.standard.decoderWithIgnore(b64_ignore_ws),
-            std.base64.standard_no_pad.decoderWithIgnore(b64_ignore_ws),
-            std.base64.url_safe.decoderWithIgnore(b64_ignore_ws),
-            std.base64.url_safe_no_pad.decoderWithIgnore(b64_ignore_ws),
+            std.base64.standard.decoderWithIgnore(B64_IGNORE_WS),
+            std.base64.standard_no_pad.decoderWithIgnore(B64_IGNORE_WS),
+            std.base64.url_safe.decoderWithIgnore(B64_IGNORE_WS),
+            std.base64.url_safe_no_pad.decoderWithIgnore(B64_IGNORE_WS),
         };
         inline for (codecs) |dec| {
             if (dec.calcSizeUpperBound(input.len) > dest.len) return error.NoSpaceLeft;
@@ -134,22 +134,22 @@ pub fn splitHostPortOrDefault(address: []const u8, default_port: u16) error{Inva
 }
 
 /// SOCKS5 ATYP domain for a fixed well-known host (reachable from most VPS).
-pub const probe_domain = "cp.cloudflare.com";
-pub const probe_http_port: u16 = 80;
-pub const probe_tls_port: u16 = 443;
+pub const PROBE_DOMAIN = "cp.cloudflare.com";
+pub const PROBE_HTTP_PORT: u16 = 80;
+pub const PROBE_TLS_PORT: u16 = 443;
 
 /// Distinct UAs so Cloudflare `/cdn-cgi/trace` echoes them in `uag=` — proves the
 /// steady-state reply is not a duplicate of the warmup response (all probe paths).
-pub const probe_ua_warmup = "hydec-warmup";
-pub const probe_ua_steady = "hydec-steady";
+pub const PROBE_UA_WARMUP = "hydec-warmup";
+pub const PROBE_UA_STEADY = "hydec-steady";
 
 /// Keep-alive so the tunnel stays open for a second (steady-state) request.
-pub const probe_http =
-    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nUser-Agent: " ++ probe_ua_warmup ++ "\r\nConnection: keep-alive\r\n\r\n";
+pub const PROBE_HTTP =
+    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ PROBE_DOMAIN ++ "\r\nUser-Agent: " ++ PROBE_UA_WARMUP ++ "\r\nConnection: keep-alive\r\n\r\n";
 
-/// Second (steady-state) request — distinct UA from `probe_http`.
-pub const probe_http_steady =
-    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ probe_domain ++ "\r\nUser-Agent: " ++ probe_ua_steady ++ "\r\nConnection: keep-alive\r\n\r\n";
+/// Second (steady-state) request — distinct UA from `PROBE_HTTP`.
+pub const PROBE_HTTP_STEADY =
+    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ PROBE_DOMAIN ++ "\r\nUser-Agent: " ++ PROBE_UA_STEADY ++ "\r\nConnection: keep-alive\r\n\r\n";
 
 /// True when headers are complete and the body is HTTP/1.0 close-delimited
 /// (no `Content-Length` / `Transfer-Encoding: chunked`). Peer close then ends the response.
@@ -286,12 +286,12 @@ test "writeSocksAddrDomain rejects domain longer than 255" {
 
 test "looksLikeCloudflareTraceUag matches echoed UA" {
     const body = "fl=1\nvisit_scheme=http\nuag=hydec-steady\n";
-    try std.testing.expect(looksLikeCloudflareTraceUag(body, probe_ua_steady));
-    try std.testing.expect(!looksLikeCloudflareTraceUag(body, probe_ua_warmup));
-    try std.testing.expect(!looksLikeCloudflareTraceUag("fl=1\nvisit_scheme=http\nuag=curl\n", probe_ua_steady));
+    try std.testing.expect(looksLikeCloudflareTraceUag(body, PROBE_UA_STEADY));
+    try std.testing.expect(!looksLikeCloudflareTraceUag(body, PROBE_UA_WARMUP));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("fl=1\nvisit_scheme=http\nuag=curl\n", PROBE_UA_STEADY));
     // Not a Cloudflare trace body (no visit_scheme=).
-    try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 400 Bad Request\r\n\r\n", probe_ua_steady));
-    try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", probe_ua_steady));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 400 Bad Request\r\n\r\n", PROBE_UA_STEADY));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", PROBE_UA_STEADY));
 }
 
 test "urlDecodeStrict keeps plus" {

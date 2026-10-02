@@ -14,11 +14,11 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const HkdfSha256 = std.crypto.kdf.hkdf.Hkdf(HmacSha256);
 
 const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
-const named_group_x25519: u16 = 0x001d;
+const NAMED_GROUP_X25519: u16 = 0x001d;
 
 /// TLS 1.3 max ciphertext length (2^14 + 256). Same bound as `RecordConn` /
 /// `RealityConn.readApp` scratch — Vision downlink must accept one full record.
-const max_tls_record_len = 16640;
+const MAX_TLS_RECORD_LEN = 16640;
 
 /// Post-handshake TLS 1.3 messages (typ 22). NewSessionTicket is ignorable;
 /// KeyUpdate would require traffic-secret rotation we do not keep — fail closed.
@@ -91,13 +91,13 @@ fn sealSessionId(
 /// xray-core ≥26.7.11 defaults inbound `minClientVer` to 26.3.27 when unset; reporting
 /// the old sing-box 1.8.1 triple fails auth and the peer falls through to the dest
 /// (often visible here as `TlsAlert` after we write VLESS).
-const reality_client_ver: [3]u8 = .{ 26, 7, 11 };
+const REALITY_CLIENT_VER: [3]u8 = .{ 26, 7, 11 };
 
 fn fillSessionIdPlain(session_id: *[32]u8, short_id: *const [8]u8, unix_secs: u32) void {
     @memset(session_id, 0);
-    session_id[0] = reality_client_ver[0];
-    session_id[1] = reality_client_ver[1];
-    session_id[2] = reality_client_ver[2];
+    session_id[0] = REALITY_CLIENT_VER[0];
+    session_id[1] = REALITY_CLIENT_VER[1];
+    session_id[2] = REALITY_CLIENT_VER[2];
     session_id[3] = 0; // reserved
     std.mem.writeInt(u32, session_id[4..8], unix_secs, .big);
     @memcpy(session_id[8..16], short_id);
@@ -276,7 +276,7 @@ fn parseServerHelloX25519(sh_body: []const u8) ![32]u8 {
         if (et == 51 and el >= 4 + 32) { // key_share
             const group = std.mem.readInt(u16, sh_body[pos..][0..2], .big);
             const klen = std.mem.readInt(u16, sh_body[pos + 2 ..][0..2], .big);
-            if (group == named_group_x25519 and klen == 32) {
+            if (group == NAMED_GROUP_X25519 and klen == 32) {
                 var pubk: [32]u8 = undefined;
                 @memcpy(&pubk, sh_body[pos + 4 ..][0..32]);
                 server_x25519 = pubk;
@@ -348,7 +348,7 @@ fn buildClientHello(
     i += 2;
     std.mem.writeInt(u16, body[i..][0..2], 2, .big);
     i += 2;
-    std.mem.writeInt(u16, body[i..][0..2], named_group_x25519, .big);
+    std.mem.writeInt(u16, body[i..][0..2], NAMED_GROUP_X25519, .big);
     i += 2;
 
     // key_share: x25519
@@ -358,7 +358,7 @@ fn buildClientHello(
     i += 2;
     std.mem.writeInt(u16, body[i..][0..2], 36, .big);
     i += 2;
-    std.mem.writeInt(u16, body[i..][0..2], named_group_x25519, .big);
+    std.mem.writeInt(u16, body[i..][0..2], NAMED_GROUP_X25519, .big);
     i += 2;
     std.mem.writeInt(u16, body[i..][0..2], 32, .big);
     i += 2;
@@ -899,7 +899,7 @@ pub fn probeVless(
     var http_buf: [16384]u8 = undefined;
     var http_len: usize = 0;
     // gRPC messages may span multiple HTTP/2 DATA frames — assemble before unwrap.
-    var grpc_stream: [grpc_gun.max_grpc_message_len + 5]u8 = undefined;
+    var grpc_stream: [grpc_gun.MAX_GRPC_MESSAGE_LEN + 5]u8 = undefined;
     var grpc_stream_len: usize = 0;
     while (true) {
         const n = rc.readApp(app_buf[0..]) catch |err| {
@@ -960,7 +960,7 @@ pub fn probeVless(
                     saw_grpc_data = true;
                     var finished_warmup = false;
                     if (!warmup_done) {
-                        if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_warmup)) {
+                        if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.PROBE_UA_WARMUP)) {
                             warmup_done = true;
                             finished_warmup = true;
                             // Fresh buffer for the keep-alive request; VLESS header already stripped.
@@ -968,7 +968,7 @@ pub fn probeVless(
                             saw_headers_ok = false;
                             saw_grpc_data = false;
                             var hunk: [256]u8 = undefined;
-                            const hunk_len = try grpc_gun.wrapHunk(&hunk, util.probe_http_steady);
+                            const hunk_len = try grpc_gun.wrapHunk(&hunk, util.PROBE_HTTP_STEADY);
                             var grpc_msg: [320]u8 = undefined;
                             const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
                             var data_frame: [384]u8 = undefined;
@@ -978,7 +978,7 @@ pub fn probeVless(
                             // Bytes already in `gather` cannot be a reply to the steady write.
                             discard_data_before = gather_len;
                         }
-                    } else if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.probe_ua_steady)) {
+                    } else if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, util.PROBE_UA_STEADY)) {
                         return netutil.elapsedMs(steady_start.?, io);
                     }
                     // Drop any pipelined leftover after warmup (same as ignoring trailing
@@ -1032,9 +1032,9 @@ const VisionPipe = struct {
     uplink_padding: bool = true,
     err: ?anyerror = null,
 
-    wire: [max_tls_record_len]u8 = undefined,
+    wire: [MAX_TLS_RECORD_LEN]u8 = undefined,
     wire_len: usize = 0,
-    plain: [max_tls_record_len]u8 = undefined,
+    plain: [MAX_TLS_RECORD_LEN]u8 = undefined,
     plain_len: usize = 0,
     plain_off: usize = 0,
     stripped: bool = false,
@@ -1097,12 +1097,12 @@ const VisionPipe = struct {
         // Continue through handshake (and incomplete App Data). Direct on a complete
         // TLS Application Data flight — matches xray IsCompleteRecord / EnableXtls.
         if (!self.handshake_done or !isCompleteTlsAppData(data)) {
-            n += try vless.appendVisionFrame(pkt[n..], vless.vision_cmd_continue, uuid_ptr, data, 64);
+            n += try vless.appendVisionFrame(pkt[n..], vless.VISION_CMD_CONTINUE, uuid_ptr, data, 64);
             try self.rc.writeApp(pkt[0..n]);
             return;
         }
 
-        n += try vless.appendVisionFrame(pkt[n..], vless.vision_cmd_direct, uuid_ptr, data, 64);
+        n += try vless.appendVisionFrame(pkt[n..], vless.VISION_CMD_DIRECT, uuid_ptr, data, 64);
         self.uplink_padding = false;
         try self.rc.writeApp(pkt[0..n]);
         self.rc.xtls_raw_write = true;
@@ -1145,7 +1145,7 @@ const VisionPipe = struct {
             self.plain_off = 0;
             self.plain_len = 0;
             // Must fit a full Reality/TLS app record; 8KiB rejected large Certificate flights.
-            var resp: [max_tls_record_len]u8 = undefined;
+            var resp: [MAX_TLS_RECORD_LEN]u8 = undefined;
             const n = self.rc.readApp(&resp) catch |err| {
                 self.err = err;
                 return if (util.isPeerClosed(err)) error.EndOfStream else error.ReadFailed;
@@ -1196,7 +1196,7 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
     try vless.parseUuid(uuid_text, &uuid);
 
     var hdr_buf: [256]u8 = undefined;
-    const hdr_len = try vless.encodeRequestDomain(&hdr_buf, &uuid, util.probe_domain, util.probe_tls_port, flow);
+    const hdr_len = try vless.encodeRequestDomain(&hdr_buf, &uuid, util.PROBE_DOMAIN, util.PROBE_TLS_PORT, flow);
     var pipe: VisionPipe = .{
         .rc = rc,
         .uuid = uuid,
@@ -1215,7 +1215,7 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
         &pipe.reader,
         &pipe.writer,
         .{
-            .host = .{ .explicit = util.probe_domain },
+            .host = .{ .explicit = util.PROBE_DOMAIN },
             .ca = .no_verification,
             .read_buffer = &tls_read_buf,
             .write_buffer = &tls_write_buf,
@@ -1233,8 +1233,8 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
     // Nested handshake dominates wall time; a separate warmup RTT is not needed.
     var http_buf: [8192]u8 = undefined;
     const steady_start = netutil.monoNow(io);
-    try flushTlsApp(&tls_client, &pipe, util.probe_http_steady);
-    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf, util.probe_ua_steady);
+    try flushTlsApp(&tls_client, &pipe, util.PROBE_HTTP_STEADY);
+    _ = try readCloudflareTrace(&tls_client, &pipe, &http_buf, util.PROBE_UA_STEADY);
     if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
     return netutil.elapsedMs(steady_start, io);
 }
@@ -1373,7 +1373,7 @@ fn appendServerHelloMinimal(buf: []u8, key_share: *const [32]u8, ext_len_overrid
     i += 2;
     std.mem.writeInt(u16, buf[i..][0..2], 4 + 32, .big);
     i += 2;
-    std.mem.writeInt(u16, buf[i..][0..2], named_group_x25519, .big);
+    std.mem.writeInt(u16, buf[i..][0..2], NAMED_GROUP_X25519, .big);
     i += 2;
     std.mem.writeInt(u16, buf[i..][0..2], 32, .big);
     i += 2;
@@ -1427,8 +1427,8 @@ fn testDecryptConn(reader: *Io.Reader, key: *const [16]u8, iv: *const [12]u8) Re
     return rc;
 }
 
-const test_record_key: [16]u8 = [_]u8{0x5a} ** 16;
-const test_record_iv: [12]u8 = [_]u8{0x31} ** 12;
+const TEST_RECORD_KEY: [16]u8 = [_]u8{0x5a} ** 16;
+const TEST_RECORD_IV: [12]u8 = [_]u8{0x31} ** 12;
 
 /// CCS and a zero-length NewSessionTicket: the two inner types the drain loop skips.
 fn ignorableRecord(index: usize) struct { typ: u8, content: []const u8 } {
@@ -1449,15 +1449,15 @@ test "tryDecryptBufferedRealityApp drains an ignorable chain the size of sock_rb
         const rec = ignorableRecord(seq);
         // Leave room for the payload record that ends the chain.
         if (wire_len + 5 + rec.content.len + 1 + 16 > wire.len - 64) break;
-        wire_len += appendSealedRecord(wire[wire_len..], &test_record_key, &test_record_iv, seq, rec.typ, rec.content);
+        wire_len += appendSealedRecord(wire[wire_len..], &TEST_RECORD_KEY, &TEST_RECORD_IV, seq, rec.typ, rec.content);
         seq += 1;
     }
     // Keep the premise honest: the chain has to be long to be worth the name.
     try std.testing.expect(seq > 600);
-    wire_len += appendSealedRecord(wire[wire_len..], &test_record_key, &test_record_iv, seq, 23, "hello");
+    wire_len += appendSealedRecord(wire[wire_len..], &TEST_RECORD_KEY, &TEST_RECORD_IV, seq, 23, "hello");
 
     var reader: Io.Reader = .fixed(wire[0..wire_len]);
-    var rc = testDecryptConn(&reader, &test_record_key, &test_record_iv);
+    var rc = testDecryptConn(&reader, &TEST_RECORD_KEY, &TEST_RECORD_IV);
 
     var out: [64]u8 = undefined;
     const n = (try rc.tryDecryptBufferedRealityApp(&out)).?;
@@ -1475,12 +1475,12 @@ test "tryDecryptBufferedRealityApp fails closed on a KeyUpdate mid-chain" {
     var wire: [512]u8 = undefined;
     var wire_len: usize = 0;
     const first = ignorableRecord(0);
-    wire_len += appendSealedRecord(wire[wire_len..], &test_record_key, &test_record_iv, 0, first.typ, first.content);
+    wire_len += appendSealedRecord(wire[wire_len..], &TEST_RECORD_KEY, &TEST_RECORD_IV, 0, first.typ, first.content);
     // Handshake record carrying KeyUpdate (handshake type 24, length 0).
-    wire_len += appendSealedRecord(wire[wire_len..], &test_record_key, &test_record_iv, 1, 22, &[_]u8{ 24, 0, 0, 0 });
+    wire_len += appendSealedRecord(wire[wire_len..], &TEST_RECORD_KEY, &TEST_RECORD_IV, 1, 22, &[_]u8{ 24, 0, 0, 0 });
 
     var reader: Io.Reader = .fixed(wire[0..wire_len]);
-    var rc = testDecryptConn(&reader, &test_record_key, &test_record_iv);
+    var rc = testDecryptConn(&reader, &TEST_RECORD_KEY, &TEST_RECORD_IV);
 
     var out: [64]u8 = undefined;
     try std.testing.expectError(error.TlsKeyUpdateUnsupported, rc.tryDecryptBufferedRealityApp(&out));
@@ -1489,10 +1489,10 @@ test "tryDecryptBufferedRealityApp fails closed on a KeyUpdate mid-chain" {
 test "tryDecryptBufferedRealityApp reports null on a partial record" {
     // A partial trailing record must leave the buffer alone for the next fill.
     var wire: [512]u8 = undefined;
-    const full = appendSealedRecord(&wire, &test_record_key, &test_record_iv, 0, 23, "hello");
+    const full = appendSealedRecord(&wire, &TEST_RECORD_KEY, &TEST_RECORD_IV, 0, 23, "hello");
 
     var reader: Io.Reader = .fixed(wire[0 .. full - 1]);
-    var rc = testDecryptConn(&reader, &test_record_key, &test_record_iv);
+    var rc = testDecryptConn(&reader, &TEST_RECORD_KEY, &TEST_RECORD_IV);
 
     var out: [64]u8 = undefined;
     try std.testing.expectEqual(@as(?usize, null), try rc.tryDecryptBufferedRealityApp(&out));
@@ -1519,7 +1519,7 @@ test "grpcProbeHttpReady rejects non-Cloudflare HTTP" {
     var len: usize = 0;
     var stripped = false;
     const bad = "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-    try std.testing.expectError(error.ProbeResponseMismatch, grpcProbeHttpReady(&buf, &len, bad, &stripped, util.probe_ua_warmup));
+    try std.testing.expectError(error.ProbeResponseMismatch, grpcProbeHttpReady(&buf, &len, bad, &stripped, util.PROBE_UA_WARMUP));
 }
 
 test "grpcProbeHttpReady accepts Cloudflare trace" {
@@ -1530,7 +1530,7 @@ test "grpcProbeHttpReady accepts Cloudflare trace" {
     var chunk: [128]u8 = undefined;
     const prefix = try std.fmt.bufPrint(chunk[0..], "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body.len});
     @memcpy(chunk[prefix.len..][0..body.len], body);
-    try std.testing.expect(try grpcProbeHttpReady(&buf, &len, chunk[0 .. prefix.len + body.len], &stripped, util.probe_ua_warmup));
+    try std.testing.expect(try grpcProbeHttpReady(&buf, &len, chunk[0 .. prefix.len + body.len], &stripped, util.PROBE_UA_WARMUP));
 }
 
 test "grpcProbeHttpReady rejects wrong uag on steady" {
@@ -1544,7 +1544,7 @@ test "grpcProbeHttpReady rejects wrong uag on steady" {
     @memcpy(chunk[prefix.len..][0..body.len], body);
     try std.testing.expectError(
         error.ProbeResponseMismatch,
-        grpcProbeHttpReady(&buf, &len, chunk[0 .. prefix.len + body.len], &stripped, util.probe_ua_steady),
+        grpcProbeHttpReady(&buf, &len, chunk[0 .. prefix.len + body.len], &stripped, util.PROBE_UA_STEADY),
     );
 }
 
@@ -1552,7 +1552,7 @@ test "grpcProbeHttpReady needs more until complete" {
     var buf: [256]u8 = undefined;
     var len: usize = 0;
     var stripped = false;
-    try std.testing.expect(!(try grpcProbeHttpReady(&buf, &len, "\x00\x00HTTP/1.1 200 OK\r\n", &stripped, util.probe_ua_warmup)));
+    try std.testing.expect(!(try grpcProbeHttpReady(&buf, &len, "\x00\x00HTTP/1.1 200 OK\r\n", &stripped, util.PROBE_UA_WARMUP)));
     try std.testing.expect(stripped);
 }
 
@@ -1583,7 +1583,7 @@ test "drainVlessVisionStream strips header before Vision unwrap" {
     var uuid: [16]u8 = [_]u8{0xcd} ** 16;
     const http = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     var vision: [256]u8 = undefined;
-    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_end, &uuid, http, 64);
+    const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_END, &uuid, http, 64);
 
     var stream: [512]u8 = undefined;
     stream[0] = 0;
@@ -1611,7 +1611,7 @@ test "drainVlessVisionStream splits header then Vision across pushes" {
     var uuid: [16]u8 = [_]u8{0xef} ** 16;
     const http = "HTTP/1.1 200 OK\r\n\r\n";
     var vision: [256]u8 = undefined;
-    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_end, &uuid, http, 64);
+    const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_END, &uuid, http, 64);
 
     var stream: [512]u8 = undefined;
     var stream_len: usize = 0;
@@ -1643,11 +1643,11 @@ test "drainVlessVisionStream continues without UUID then End" {
     const part2 = "Content-Length: 0\r\n\r\n";
 
     var first: [256]u8 = undefined;
-    const n1 = try vless.appendVisionFrame(&first, vless.vision_cmd_continue, &uuid, part1, 8);
+    const n1 = try vless.appendVisionFrame(&first, vless.VISION_CMD_CONTINUE, &uuid, part1, 8);
     var cont: [256]u8 = undefined;
-    const n2 = try vless.appendVisionFrame(&cont, vless.vision_cmd_continue, null, part2, 16);
+    const n2 = try vless.appendVisionFrame(&cont, vless.VISION_CMD_CONTINUE, null, part2, 16);
     var endf: [64]u8 = undefined;
-    const n3 = try vless.appendVisionFrame(&endf, vless.vision_cmd_end, null, "", 8);
+    const n3 = try vless.appendVisionFrame(&endf, vless.VISION_CMD_END, null, "", 8);
 
     var stream: [1024]u8 = undefined;
     stream[0] = 0;
@@ -1677,7 +1677,7 @@ test "drainVlessVisionStream steady raw after End grows http" {
     var uuid: [16]u8 = [_]u8{0x22} ** 16;
     const http = "HTTP/1.1 200 OK\r\n\r\n";
     var vision: [256]u8 = undefined;
-    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_end, &uuid, http, 64);
+    const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_END, &uuid, http, 64);
 
     var stream: [512]u8 = undefined;
     stream[0] = 0;
@@ -1707,7 +1707,7 @@ test "drainVlessVisionStream steady raw after End grows http" {
 test "drainVlessVisionStream incomplete Vision does not grow http" {
     var uuid: [16]u8 = [_]u8{0x33} ** 16;
     var vision: [256]u8 = undefined;
-    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_end, &uuid, "HTTP/1.1 200 OK\r\n\r\n", 64);
+    const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_END, &uuid, "HTTP/1.1 200 OK\r\n\r\n", 64);
 
     var stream: [512]u8 = undefined;
     stream[0] = 0;
@@ -1784,7 +1784,7 @@ test "drainVlessVisionStream Direct sets xtls_raw_read" {
     var uuid: [16]u8 = [_]u8{0x66} ** 16;
     const payload = "\x17\x03\x03\x00\x01\x00";
     var vision: [256]u8 = undefined;
-    const vn = try vless.appendVisionFrame(&vision, vless.vision_cmd_direct, &uuid, payload, 8);
+    const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_DIRECT, &uuid, payload, 8);
 
     var stream: [512]u8 = undefined;
     stream[0] = 0;

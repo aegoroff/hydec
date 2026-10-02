@@ -30,7 +30,7 @@ pub fn connectHostPort(
 /// How long the resolver poll loop naps between non-blocking queue reads.
 /// Small enough that DNS latency dominates it, large enough that dozens of host
 /// workers waiting at once cost nothing measurable.
-const dns_poll_interval_ns: u64 = 5 * std.time.ns_per_ms;
+const DNS_POLL_INTERVAL_NS: u64 = 5 * std.time.ns_per_ms;
 
 fn connectHostnameTimed(
     io: Io,
@@ -69,7 +69,7 @@ fn connectHostnameTimed(
     // `concurrent` is also the only interruptible option: its `cancel` signals the
     // worker (SIGIO) out of a blocking resolver syscall, which a plain `std.Thread`
     // cannot do — a joined lookup thread would stall for the resolver's own timeout.
-    // Cost: the Io pool it grows lives until exit, bounded by `max_parallel_hosts`
+    // Cost: the Io pool it grows lives until exit, bounded by `MAX_PARALLEL_HOSTS`
     // since each host worker resolves one name at a time; IP-literal lines never
     // reach here. Worst case measured (all 64 hung at once): 129 threads, 44 MB RSS.
     const lookup_args = .{ hostname, io, &lookup_queue, lookup_options };
@@ -104,7 +104,7 @@ fn connectHostnameTimed(
         };
 
         if (n == 0) {
-            var nap = dns_poll_interval_ns;
+            var nap = DNS_POLL_INTERVAL_NS;
             if (deadline) |d| {
                 const now = monoNow(io);
                 if (now >= d) return error.Timeout;

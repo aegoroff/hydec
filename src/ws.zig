@@ -15,13 +15,13 @@ pub const Conn = struct {
     }
 };
 
-const ws_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 fn expectAccept(key_b64: []const u8, out: *[28]u8) []const u8 {
     var digest: [20]u8 = undefined;
     var hasher = std.crypto.hash.Sha1.init(.{});
     hasher.update(key_b64);
-    hasher.update(ws_guid);
+    hasher.update(WS_GUID);
     hasher.final(&digest);
     return std.base64.standard.Encoder.encode(out, &digest);
 }
@@ -73,7 +73,7 @@ fn validateUpgradeResponse(hdr: []const u8, key_b64: []const u8) !void {
     if (!std.mem.eql(u8, accept, expected)) return error.WebSocketAcceptMismatch;
 }
 
-const max_upgrade_headers: usize = 2048;
+const MAX_UPGRADE_HEADERS: usize = 2048;
 
 /// Consume the HTTP 101 upgrade response from `reader`, leaving any bytes past
 /// `\r\n\r\n` buffered for subsequent WebSocket frame reads.
@@ -86,7 +86,7 @@ fn consumeUpgradeResponse(reader: *Io.Reader, key_b64: []const u8) !void {
             reader.toss(hdr_end);
             return;
         }
-        if (buffered.len >= max_upgrade_headers) return error.WebSocketHeadersTooLarge;
+        if (buffered.len >= MAX_UPGRADE_HEADERS) return error.WebSocketHeadersTooLarge;
         reader.fillMore() catch |err| switch (err) {
             error.EndOfStream => return error.UnexpectedEndOfStream,
             else => |e| return e,

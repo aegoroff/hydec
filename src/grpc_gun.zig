@@ -10,13 +10,13 @@ pub fn wrapGrpc(out: []u8, message: []const u8) error{BufferTooSmall}!usize {
 }
 
 /// Cap for one gun-lite message (probe CF traces are tiny; rejects hostile length prefixes).
-pub const max_grpc_message_len: u32 = 16384;
+pub const MAX_GRPC_MESSAGE_LEN: u32 = 16384;
 
 /// Length of the first complete gRPC frame in `buf`, or null if more DATA bytes are needed.
 pub fn completeGrpcFrameLen(buf: []const u8) error{InvalidGrpcFrame}!?usize {
     if (buf.len < 5) return null;
     const body_len = std.mem.readInt(u32, buf[1..5], .big);
-    if (body_len > max_grpc_message_len) return error.InvalidGrpcFrame;
+    if (body_len > MAX_GRPC_MESSAGE_LEN) return error.InvalidGrpcFrame;
     const total: usize = 5 + body_len;
     if (buf.len < total) return null;
     return total;

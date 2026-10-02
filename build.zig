@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
     archive_step.dependOn(&zig_step.step);
 }
 
-const pinned_glibc: std.Target.Query.SemanticVersion = .{
+const PINNED_GLIBC: std.Target.Query.SemanticVersion = .{
     .major = 2,
     .minor = 38,
     .patch = 0,
@@ -85,7 +85,7 @@ const pinned_glibc: std.Target.Query.SemanticVersion = .{
 fn resolveTarget(b: *std.Build) std.Build.ResolvedTarget {
     const default_target: std.Target.Query = .{
         .abi = .gnu,
-        .glibc_version = pinned_glibc,
+        .glibc_version = PINNED_GLIBC,
     };
 
     var query = b.standardTargetOptionsQueryOnly(.{
@@ -108,7 +108,7 @@ fn resolveTarget(b: *std.Build) std.Build.ResolvedTarget {
         if (os == .linux) {
             const abi = query.abi orelse builtin.target.abi;
             if (abi.isGnu()) {
-                query.glibc_version = pinned_glibc;
+                query.glibc_version = PINNED_GLIBC;
             }
         }
     }

@@ -76,8 +76,8 @@ pub fn responseHeaderLen(buf: []const u8) error{ NeedMore, InvalidVlessResponse 
 pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8) !usize {
     var uuid: [16]u8 = undefined;
     try parseUuid(uuid_text, &uuid);
-    var n = try encodeRequestDomain(out, &uuid, util.probe_domain, util.probe_http_port, "");
-    const http = util.probe_http;
+    var n = try encodeRequestDomain(out, &uuid, util.PROBE_DOMAIN, util.PROBE_HTTP_PORT, "");
+    const http = util.PROBE_HTTP;
     if (out.len < n + http.len) return error.BufferTooSmall;
     @memcpy(out[n..][0..http.len], http);
     n += http.len;
@@ -85,9 +85,9 @@ pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8) !usize {
 }
 
 /// Vision padding commands (xray / sing-box).
-pub const vision_cmd_continue: u8 = 0x00;
-pub const vision_cmd_end: u8 = 0x01;
-pub const vision_cmd_direct: u8 = 0x02;
+pub const VISION_CMD_CONTINUE: u8 = 0x00;
+pub const VISION_CMD_END: u8 = 0x01;
+pub const VISION_CMD_DIRECT: u8 = 0x02;
 
 /// Decoder state for xray `XtlsUnpadding`: UUID only on the first padded block;
 /// subsequent `CommandPaddingContinue` blocks use a 5-byte header.
@@ -168,8 +168,8 @@ pub fn consumeVisionFrame(
     return .{
         .consumed = total,
         .content = buf[content_off .. content_off + content_len],
-        .switch_to_raw = cmd == vision_cmd_end or cmd == vision_cmd_direct,
-        .switch_to_xtls = cmd == vision_cmd_direct,
+        .switch_to_raw = cmd == VISION_CMD_END or cmd == VISION_CMD_DIRECT,
+        .switch_to_xtls = cmd == VISION_CMD_DIRECT,
     };
 }
 
@@ -212,14 +212,14 @@ test "appendVisionFrame rejects content longer than u16" {
     const content = try gpa.alloc(u8, @as(usize, std.math.maxInt(u16)) + 1);
     defer gpa.free(content);
     var buf: [8]u8 = undefined;
-    try std.testing.expectError(error.ContentTooLong, appendVisionFrame(&buf, vision_cmd_end, null, content, 0));
+    try std.testing.expectError(error.ContentTooLong, appendVisionFrame(&buf, VISION_CMD_END, null, content, 0));
 }
 
 test "encodeProbeRequest is cleartext HTTP without Vision" {
     var buf: [512]u8 = undefined;
     const n = try encodeProbeRequest(&buf, "00000000-1111-2222-3333-444444444444");
     // No Vision UUID frame after the VLESS header — raw HTTP follows.
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], util.probe_http) != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], util.PROBE_HTTP) != null);
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "xtls-rprx-vision") == null);
 }
 
@@ -231,7 +231,7 @@ test "responseHeaderLen consumes only the header in front of a Vision UUID" {
     var wire: [64]u8 = undefined;
     wire[0] = 0;
     wire[1] = 0;
-    const n = try appendVisionFrame(wire[2..], vision_cmd_continue, &uuid, "x", 0);
+    const n = try appendVisionFrame(wire[2..], VISION_CMD_CONTINUE, &uuid, "x", 0);
     try std.testing.expectEqual(@as(usize, 2), try responseHeaderLen(wire[0 .. 2 + n]));
 }
 
@@ -239,7 +239,7 @@ test "consumeVisionFrame NeedMore and content before padding" {
     var uuid: [16]u8 = [_]u8{0xab} ** 16;
     var frame_buf: [128]u8 = undefined;
     const http = "HTTP/1.1 200 OK\r\n\r\n";
-    const n = try appendVisionFrame(&frame_buf, vision_cmd_end, &uuid, http, 64);
+    const n = try appendVisionFrame(&frame_buf, VISION_CMD_END, &uuid, http, 64);
 
     // Wire layout: header then content immediately (xray order).
     try std.testing.expectEqualStrings(http, frame_buf[21 .. 21 + http.len]);
@@ -259,7 +259,7 @@ test "consumeVisionFrame Direct sets switch_to_xtls" {
     var uuid: [16]u8 = [_]u8{0x55} ** 16;
     const payload = "\x17\x03\x03\x00\x01\x00";
     var frame_buf: [128]u8 = undefined;
-    const n = try appendVisionFrame(&frame_buf, vision_cmd_direct, &uuid, payload, 8);
+    const n = try appendVisionFrame(&frame_buf, VISION_CMD_DIRECT, &uuid, payload, 8);
     var state: VisionUnpadState = .{};
     const frame = try consumeVisionFrame(frame_buf[0..n], &uuid, &state);
     try std.testing.expect(frame.switch_to_raw);
@@ -282,10 +282,10 @@ test "consumeVisionFrame continue block omits UUID" {
 
     var first: [128]u8 = undefined;
     // First block: UUID + Continue (not End).
-    const n1 = try appendVisionFrame(&first, vision_cmd_continue, &uuid, part1, 8);
+    const n1 = try appendVisionFrame(&first, VISION_CMD_CONTINUE, &uuid, part1, 8);
 
     var cont: [128]u8 = undefined;
-    const n2 = try appendVisionFrame(&cont, vision_cmd_continue, null, part2, 16);
+    const n2 = try appendVisionFrame(&cont, VISION_CMD_CONTINUE, null, part2, 16);
 
     var state: VisionUnpadState = .{};
     const f1 = try consumeVisionFrame(first[0..n1], &uuid, &state);

@@ -28,7 +28,7 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 2. Base64-decode body; iterate URI lines.
 3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**.
 4. Each candidate: **3 probes**; one transient failure (timeout / reset / EOF, `isTransient`) is retried once, any other error fails it immediately; keep **median** latency per preference class.
-5. Rank with `selectBestClass` according to `--strategy` (`hydec` default, `fastest`, `strict`). `hydec`: prefer VLESS² (gRPC) → VLESS³ (TCP) → SS → Trojan. Demote VLESS²→VLESS³ when VLESS² is **>2×** slower; VLESS²→SS when **≥3×** (then keep VLESS³ unless it is **>3×** slower than SS); with no VLESS², demote VLESS³→SS when **>2×** slower. Each demotion also needs an absolute gap of **>30 ms** (`min_demote_gap_ms`). Trojan only if no VLESS² / VLESS³ / SS succeeded. `fastest`: lowest latency (tie → higher class). `strict`: never demote.
+5. Rank with `selectBestClass` according to `--strategy` (`hydec` default, `fastest`, `strict`). `hydec`: prefer VLESS² (gRPC) → VLESS³ (TCP) → SS → Trojan. Demote VLESS²→VLESS³ when VLESS² is **>2×** slower; VLESS²→SS when **≥3×** (then keep VLESS³ unless it is **>3×** slower than SS); with no VLESS², demote VLESS³→SS when **>2×** slower. Each demotion also needs an absolute gap of **>15 ms** (`MIN_DEMOTE_GAP_MS`). Trojan only if no VLESS² / VLESS³ / SS succeeded. `fastest`: lowest latency (tie → higher class). `strict`: never demote.
 6. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
 
 **Behavior (`ping`)**

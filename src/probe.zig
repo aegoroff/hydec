@@ -66,7 +66,7 @@ const WorkItem = struct {
 };
 
 /// Cap concurrent host workers so a large subscription cannot exhaust OS threads.
-const max_parallel_hosts: usize = 64;
+const MAX_PARALLEL_HOSTS: usize = 64;
 
 const Shared = struct {
     gpa: std.mem.Allocator,
@@ -98,8 +98,8 @@ const Shared = struct {
     }
 };
 
-/// How many successful probes are required for `ping` / `best` (see `transient_retries`).
-pub const probe_attempts: usize = 3;
+/// How many successful probes are required for `ping` / `best` (see `TRANSIENT_RETRIES`).
+pub const PROBE_ATTEMPTS: usize = 3;
 
 pub fn probeOne(
     gpa: std.mem.Allocator,
@@ -126,7 +126,7 @@ pub fn probeOne(
             const host_hdr = host_owned orelse sni;
             const alpn_owned = try proxy.getParamDecoded(gpa, "alpn");
             defer if (alpn_owned) |a| gpa.free(a);
-            var alpn_storage: [alpn.max_protocols][]const u8 = undefined;
+            var alpn_storage: [alpn.MAX_PROTOCOLS][]const u8 = undefined;
             const alpn_list = try alpn.parseList(alpn_owned, &alpn_storage);
             const allow_insecure = util.queryParamTruthy(proxy.query, "allowInsecure") or
                 util.queryParamTruthy(proxy.query, "allow_insecure") or
@@ -197,7 +197,7 @@ pub fn probeOne(
 }
 
 /// How many failed attempts per candidate may be retried, and only when `isTransient`.
-pub const transient_retries: usize = 1;
+pub const TRANSIENT_RETRIES: usize = 1;
 
 /// Median of `samples` (at least one); upper median for an even count. Sorts in place.
 /// A single latency spike among three samples does not move the result.
@@ -225,9 +225,9 @@ pub fn isTransient(err: anyerror) bool {
 }
 
 /// Fill `samples` from `prober.probe()`; fail on the first non-transient error or once
-/// `transient_retries` is used up.
+/// `TRANSIENT_RETRIES` is used up.
 fn collectSamples(prober: anytype, samples: []u64) !void {
-    var retries_left = transient_retries;
+    var retries_left = TRANSIENT_RETRIES;
     for (samples) |*slot| {
         slot.* = while (true) {
             break prober.probe() catch |err| {
@@ -240,7 +240,7 @@ fn collectSamples(prober: anytype, samples: []u64) !void {
     }
 }
 
-/// Run `probe_attempts` full probes (one retry on a transient error).
+/// Run `PROBE_ATTEMPTS` full probes (one retry on a transient error).
 /// On success returns the median latency in ms.
 pub fn probeLatency(
     gpa: std.mem.Allocator,
@@ -260,7 +260,7 @@ pub fn probeLatency(
             return probeOne(self.gpa, self.io, self.proxy, self.timeout_secs, self.bind);
         }
     };
-    var samples: [probe_attempts]u64 = undefined;
+    var samples: [PROBE_ATTEMPTS]u64 = undefined;
     try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind }, &samples);
     return medianMs(&samples);
 }
@@ -282,11 +282,11 @@ pub fn selectBestClass(
 
 /// Absolute latency gap (ms) a `hydec` demotion requires on top of its ratio:
 /// 21 ms vs 7 ms is 3× but only noise.
-pub const min_demote_gap_ms: u64 = 30;
+pub const MIN_DEMOTE_GAP_MS: u64 = 15;
 
-/// `slow` loses to `fast` by more than `min_demote_gap_ms`.
+/// `slow` loses to `fast` by more than `MIN_DEMOTE_GAP_MS`.
 fn clearlySlower(slow: u64, fast: u64) bool {
-    return slow -| fast > min_demote_gap_ms;
+    return slow -| fast > MIN_DEMOTE_GAP_MS;
 }
 
 /// Default `hydec` policy:
@@ -298,7 +298,7 @@ fn clearlySlower(slow: u64, fast: u64) bool {
 /// 4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is strictly more than 2× slower than SS.
 /// 5. Trojan only when no VLESS² / VLESS³ / SS succeeded.
 /// Every demotion in 2–4 also needs the slower class to lose by more than
-/// `min_demote_gap_ms`, so jitter between near-local nodes cannot flip the pick.
+/// `MIN_DEMOTE_GAP_MS`, so jitter between near-local nodes cannot flip the pick.
 fn selectHydecClass(
     vless2_ms: ?u64,
     vless3_ms: ?u64,
@@ -461,7 +461,7 @@ pub fn failHint(err: anyerror) []const u8 {
         // Socket creation / bind failures: netutil.openSocket for our own probe
         // sockets, std's Io.net.IpAddress.BindError for the resolver's. Split from
         // sys/resources because the operator fix differs — raise the fd limit, or cut
-        // max_parallel_hosts, rather than free memory.
+        // MAX_PARALLEL_HOSTS, rather than free memory.
         error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => "sys/fd-limit",
         // Ephemeral source ports exhausted (bind with port 0 finding none free).
         error.AddressInUse => "addr/in-use",
@@ -636,12 +636,12 @@ pub fn findBest(
 
     const lists = groups.values();
     const n = lists.len;
-    const threads = try gpa.alloc(std.Thread, @min(n, max_parallel_hosts));
+    const threads = try gpa.alloc(std.Thread, @min(n, MAX_PARALLEL_HOSTS));
     defer gpa.free(threads);
 
     var next: usize = 0;
     while (next < n) {
-        const batch = @min(max_parallel_hosts, n - next);
+        const batch = @min(MAX_PARALLEL_HOSTS, n - next);
         var spawned: usize = 0;
         errdefer for (threads[0..spawned]) |t| t.join();
 
@@ -726,7 +726,7 @@ test "collectSamples retries one transient error" {
     // Arrange
     var calls: usize = 0;
     const script = [_]anyerror!u64{ 10, error.Timeout, 20, 30 };
-    var samples: [probe_attempts]u64 = undefined;
+    var samples: [PROBE_ATTEMPTS]u64 = undefined;
 
     // Act
     try collectSamples(FakeProber{ .script = &script, .calls = &calls }, &samples);
@@ -739,7 +739,7 @@ test "collectSamples retries one transient error" {
 test "collectSamples fails on a second transient error" {
     var calls: usize = 0;
     const script = [_]anyerror!u64{ error.ConnectionResetByPeer, 10, error.Timeout };
-    var samples: [probe_attempts]u64 = undefined;
+    var samples: [PROBE_ATTEMPTS]u64 = undefined;
 
     try std.testing.expectError(error.Timeout, collectSamples(FakeProber{ .script = &script, .calls = &calls }, &samples));
     try std.testing.expectEqual(@as(usize, 3), calls);
@@ -748,7 +748,7 @@ test "collectSamples fails on a second transient error" {
 test "collectSamples does not retry deterministic errors" {
     var calls: usize = 0;
     const script = [_]anyerror!u64{ error.TlsAlert, 10, 10, 10 };
-    var samples: [probe_attempts]u64 = undefined;
+    var samples: [PROBE_ATTEMPTS]u64 = undefined;
 
     try std.testing.expectError(error.TlsAlert, collectSamples(FakeProber{ .script = &script, .calls = &calls }, &samples));
     try std.testing.expectEqual(@as(usize, 1), calls);
@@ -866,15 +866,16 @@ test "selectBestClass hydec prefers VLESS2 then demotes on 2x / SS on 3x" {
 test "selectBestClass hydec ignores ratio wins below the absolute gap" {
     // 3× but only 14 ms apart: no VLESS²→SS demotion.
     try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 21, null, 7, null));
-    // >2× but 30 ms apart (not more): no VLESS²→VLESS³ demotion.
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 50, 20, null, null));
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 51, 20, null, null));
-    // No VLESS²: VLESS³ 25 ms vs SS 5 ms stays VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 25, 5, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, 36, 5, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 23, null, 7, null));
+    // >2× but 15 ms apart (not more): no VLESS²→VLESS³ demotion.
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 29, 14, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 30, 14, null, null));
+    // No VLESS²: VLESS³ 20 ms vs SS 5 ms stays VLESS³.
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 20, 5, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, 21, 5, null));
     // SS eligible vs VLESS², VLESS³ >3× SS yet within the gap: keep VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 100, 32, 10, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 100, 41, 10, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 100, 20, 5, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 100, 21, 5, null));
 }
 
 test "selectBestClass fastest picks minimum latency" {

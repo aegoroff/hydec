@@ -4,17 +4,17 @@ const Io = std.Io;
 
 /// What Xray-family clients advertise when a share link carries no `alpn=`.
 /// hydec mirrors it so a probe fails wherever the real client would.
-const default: []const []const u8 = &.{ "h2", "http/1.1" };
+const DEFAULT_ALPN: []const []const u8 = &.{ "h2", "http/1.1" };
 
 /// Share links carry one or two protocols; the cap only keeps the list on the stack.
-pub const max_protocols: usize = 8;
+pub const MAX_PROTOCOLS: usize = 8;
 
 /// Split a decoded `alpn=` value on commas into `storage`. An absent or empty value
 /// falls back to the Xray default, matching how those clients treat a blank setting.
 /// More than `storage.len` protocols is rejected rather than silently truncated —
 /// a probe must not negotiate a different list than the URI asked for.
 pub fn parseList(decoded: ?[]const u8, storage: [][]const u8) ![]const []const u8 {
-    const raw = decoded orelse return default;
+    const raw = decoded orelse return DEFAULT_ALPN;
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, raw, ',');
     while (it.next()) |part| {
@@ -24,7 +24,7 @@ pub fn parseList(decoded: ?[]const u8, storage: [][]const u8) ![]const []const u
         storage[n] = p;
         n += 1;
     }
-    return if (n == 0) default else storage[0..n];
+    return if (n == 0) DEFAULT_ALPN else storage[0..n];
 }
 
 /// h2 is the only protocol that can break a WebSocket transport, so an offer without
@@ -35,9 +35,9 @@ pub fn offersH2(protos: []const []const u8) bool {
 }
 
 /// Enough for a TLS 1.2 ClientHello carrying an SNI and a short protocol list.
-const hello_buf_len = 512;
+const HELLO_BUF_LEN = 512;
 /// ServerHello plus whatever the peer pipelines into the same flight.
-const reply_buf_len = 4096;
+const REPLY_BUF_LEN = 4096;
 
 /// Build a TLS 1.2 ClientHello advertising `protos`.
 ///
@@ -251,11 +251,11 @@ pub fn negotiated(
 
     var random: [32]u8 = undefined;
     io.random(&random);
-    var hello_buf: [hello_buf_len]u8 = undefined;
+    var hello_buf: [HELLO_BUF_LEN]u8 = undefined;
     const hello = try buildClientHello(&hello_buf, sni, protos, &random);
 
-    var wbuf: [hello_buf_len]u8 = undefined;
-    var rbuf: [reply_buf_len]u8 = undefined;
+    var wbuf: [HELLO_BUF_LEN]u8 = undefined;
+    var rbuf: [REPLY_BUF_LEN]u8 = undefined;
     var w = stream.writer(io, &wbuf);
     var r = stream.reader(io, &rbuf);
 
@@ -264,13 +264,13 @@ pub fn negotiated(
     w.interface.flush() catch |err|
         return netutil.classifyIoErr(err, w.err, null, fired.load(.acquire));
 
-    var hs_buf: [reply_buf_len]u8 = undefined;
+    var hs_buf: [REPLY_BUF_LEN]u8 = undefined;
     const body = try readServerHello(&r, &fired, &hs_buf);
     return parseFromServerHello(body, out);
 }
 
 test "buildClientHello wire layout" {
-    var buf: [hello_buf_len]u8 = undefined;
+    var buf: [HELLO_BUF_LEN]u8 = undefined;
     var random: [32]u8 = undefined;
     @memset(&random, 0xab);
 
@@ -292,7 +292,7 @@ test "buildClientHello wire layout" {
 }
 
 test "buildClientHello rejects unusable protocol lists" {
-    var buf: [hello_buf_len]u8 = undefined;
+    var buf: [HELLO_BUF_LEN]u8 = undefined;
     var random: [32]u8 = undefined;
     @memset(&random, 0);
 

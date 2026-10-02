@@ -79,7 +79,7 @@ Each candidate is probed **3 times**; one timeout or dropped connection is retri
 4. With VLESS³ but no VLESS²: prefer VLESS³ unless it is **>2×** slower than SS
 5. **Trojan** only if no VLESS² / VLESS³ / SS succeeded
 
-Every demotion in 2–4 also requires the slower class to be more than **30 ms** behind, so jitter between nearby nodes (e.g. 21 ms vs 7 ms) does not change the winner.
+Every demotion in 2–4 also requires the slower class to be more than **15 ms** behind, so jitter between nearby nodes (e.g. 21 ms vs 7 ms) does not change the winner.
 
 ### Output (`best`)
 
