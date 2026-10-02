@@ -63,7 +63,7 @@ hydec ping -t 10 -I wlan0 'vless://...'
 
 ### Ranking (`best`)
 
-Each candidate is probed **3 times**; one timeout or dropped connection is retried once, any other failure drops the candidate. The median latency is kept per preference class. If entries on two different ports of an IP cannot even open a TCP connection within `-t` (after the retry), and no entry on that IP has connected, its remaining entries are skipped (`SKIP:` with `-v`, counted as `skipped dead host`); a timeout after connecting skips nothing. Latency is the full attempt time: connect, TLS / REALITY handshake (and WebSocket upgrade) and the test requests through the tunnel; Trojan's separate ALPN check is excluded. `--strategy` picks the winner:
+Each candidate is probed **3 times**; one timeout or dropped connection is retried once, any other failure drops the candidate. The median latency is kept per preference class. If entries on two different ports of an IP cannot even open a TCP connection within `-t` (after the retry), and no entry on that IP has connected, its remaining entries are skipped (`SKIP:` with `-v`, counted as `skipped dead host`); a timeout after connecting skips nothing. Latency is the full attempt time: connect, TLS / REALITY handshake (and WebSocket upgrade) and the test requests through the tunnel; Trojan's separate ALPN check is excluded. That check (WebSocket only) fails a node whose server picks h2, which breaks the HTTP/1.1 upgrade; a link without `alpn=` offers `http/1.1` only, as Xray and sing-box (podkop) do for ws, so it is checked only when the link asks for h2. `--strategy` picks the winner:
 
 | Strategy | Behavior |
 |----------|----------|

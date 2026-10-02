@@ -129,7 +129,7 @@ pub fn probeOne(
             const alpn_owned = try proxy.getParamDecoded(gpa, "alpn");
             defer if (alpn_owned) |a| gpa.free(a);
             var alpn_storage: [alpn.MAX_PROTOCOLS][]const u8 = undefined;
-            const alpn_list = try alpn.parseList(alpn_owned, &alpn_storage);
+            const alpn_list = try alpn.parseList(alpn_owned, &alpn_storage, proxy.transport == .ws);
             const allow_insecure = util.queryParamTruthy(proxy.query, "allowInsecure") or
                 util.queryParamTruthy(proxy.query, "allow_insecure") or
                 util.queryParamTruthy(proxy.query, "insecure");

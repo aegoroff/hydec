@@ -18,7 +18,7 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 | Protocol | Notes |
 |----------|--------|
 | Shadowsocks | AEAD methods |
-| Trojan | TLS; WebSocket transport |
+| Trojan | TLS; WebSocket transport. ws side check fails `WsAlpnHttp2` when the server picks h2; without `alpn=` ws offers `http/1.1` only, like Xray (`WithNextProto`) and sing-box / podkop (`SetNextProtos`), so the check runs only for an explicit h2 |
 | VLESS | REALITY only; TCP vision (`xtls-rprx-vision`, inner HTTPS) and gRPC gun |
 | VMess | Skipped (counted in stats) |
 
