@@ -63,7 +63,7 @@ hydec ping -t 10 -I wlan0 'vless://...'
 
 ### Ranking (`best`)
 
-Each candidate is probed **3 times**; one timeout or dropped connection is retried once, any other failure drops the candidate. The median latency is kept per preference class. Latency is the full attempt time: connect, TLS / REALITY handshake (and WebSocket upgrade) and the test requests through the tunnel; Trojan's separate ALPN check is excluded. `--strategy` picks the winner:
+Each candidate is probed **3 times**; one timeout or dropped connection is retried once, any other failure drops the candidate. The median latency is kept per preference class. If an entry cannot even open a TCP connection within `-t` (after the retry), the remaining entries on that IP are skipped (`SKIP:` with `-v`, counted as `skipped dead host`); a timeout after connecting skips nothing. Latency is the full attempt time: connect, TLS / REALITY handshake (and WebSocket upgrade) and the test requests through the tunnel; Trojan's separate ALPN check is excluded. `--strategy` picks the winner:
 
 | Strategy | Behavior |
 |----------|----------|

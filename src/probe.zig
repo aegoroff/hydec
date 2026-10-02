@@ -58,6 +58,8 @@ pub const Stats = struct {
     skipped_vmess: usize = 0,
     skipped_other: usize = 0,
     parse_failed: usize = 0,
+    /// Entries not probed because an earlier entry on the same host could not even connect.
+    skipped_dead_host: usize = 0,
 };
 
 const WorkItem = struct {
@@ -224,6 +226,7 @@ pub const Latency = struct {
 pub fn isTransient(err: anyerror) bool {
     return switch (err) {
         error.Timeout,
+        error.ConnectTimeout,
         error.ConnectionTimedOut,
         error.ConnectionResetByPeer,
         error.EndOfStream,
@@ -442,7 +445,7 @@ pub const HostIdent = struct {
 /// Short hint for FAIL logs (why the probe likely failed).
 pub fn failHint(err: anyerror) []const u8 {
     return switch (err) {
-        error.Timeout, error.ConnectionTimedOut => "slow/timeout",
+        error.Timeout, error.ConnectTimeout, error.ConnectionTimedOut => "slow/timeout",
         error.ConnectionResetByPeer,
         error.EndOfStream,
         error.UnexpectedEndOfStream,
@@ -514,8 +517,15 @@ pub fn failHint(err: anyerror) []const u8 {
     };
 }
 
+/// The candidate's final error means its host never accepted a TCP connection.
+/// A timeout after connecting can be specific to one port or protocol (a REALITY
+/// dest fallback that hangs while SS on the same IP works), so it does not count.
+pub fn hostUnreachable(err: anyerror) bool {
+    return err == error.ConnectTimeout;
+}
+
 fn probeGroup(shared: *Shared, items: []WorkItem) void {
-    for (items) |*item| {
+    for (items, 0..) |*item, i| {
         const proxy = item.proxy;
 
         {
@@ -537,6 +547,10 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
             if (shared.verbose) {
                 std.log.warn("FAIL: {f}: {s} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, failHint(err), err });
             }
+            if (hostUnreachable(err)) {
+                skipDeadHost(shared, items[i + 1 ..]);
+                return;
+            }
             continue;
         };
 
@@ -552,6 +566,20 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
 
         const class = PrefClass.fromProxy(proxy) orelse continue;
         considerBest(shared, class, latency.median_ms, item.raw, proxy.host);
+    }
+}
+
+fn skipDeadHost(shared: *Shared, rest: []const WorkItem) void {
+    if (rest.len == 0) return;
+    {
+        shared.lock();
+        shared.stats.skipped_dead_host += rest.len;
+        shared.unlock();
+    }
+    if (shared.verbose) {
+        for (rest) |item| {
+            std.log.warn("SKIP: {f}: host did not accept a connection", .{HostIdent{ .name = item.proxy.name, .host = item.proxy.host }});
+        }
     }
 }
 
@@ -769,8 +797,17 @@ test "collectSamples does not retry deterministic errors" {
     try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
+test "hostUnreachable only for a timed-out TCP connect" {
+    try std.testing.expect(hostUnreachable(error.ConnectTimeout));
+    // Connected, then stalled: may be one port/protocol only — keep probing the host.
+    try std.testing.expect(!hostUnreachable(error.Timeout));
+    try std.testing.expect(!hostUnreachable(error.ConnectionRefused));
+    try std.testing.expectEqualStrings("slow/timeout", failHint(error.ConnectTimeout));
+}
+
 test "isTransient splits network blips from deterministic failures" {
     try std.testing.expect(isTransient(error.Timeout));
+    try std.testing.expect(isTransient(error.ConnectTimeout));
     try std.testing.expect(isTransient(error.ConnectionResetByPeer));
     try std.testing.expect(isTransient(error.EndOfStream));
     try std.testing.expect(!isTransient(error.TlsAlert));

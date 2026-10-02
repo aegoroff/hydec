@@ -126,7 +126,7 @@ fn connectHostnameTimed(
                     return stream;
                 } else |err| {
                     last_err = err;
-                    if (err == error.Timeout) return error.Timeout;
+                    if (err == error.ConnectTimeout) return error.ConnectTimeout;
                 }
             },
         };
@@ -341,18 +341,20 @@ fn startConnect(sock: posix.socket_t, address: Io.net.IpAddress) !void {
         .CONNREFUSED => return error.ConnectionRefused,
         .NETUNREACH => return error.NetworkUnreachable,
         .HOSTUNREACH => return error.HostUnreachable,
-        .TIMEDOUT => return error.Timeout,
+        .TIMEDOUT => return error.ConnectTimeout,
         .ADDRNOTAVAIL => return error.AddressNotAvailable,
         .ACCES, .PERM => return error.AccessDenied,
         else => return error.Unexpected,
     }
 }
 
+/// A dial that runs out of time fails with `ConnectTimeout`, not `Timeout`: the host
+/// never answered at all, which `probe.zig` uses to skip its remaining entries.
 fn waitConnectedUntil(io: Io, sock: posix.socket_t, deadline: ?i128) !void {
     while (true) {
         const now = monoNow(io);
         if (deadline) |d| {
-            if (now >= d) return error.Timeout;
+            if (now >= d) return error.ConnectTimeout;
         }
         const timeout_ms: i32 = if (deadline) |d|
             @intCast(@min(@divTrunc(d - now, std.time.ns_per_ms), std.math.maxInt(i32)))
@@ -365,7 +367,7 @@ fn waitConnectedUntil(io: Io, sock: posix.socket_t, deadline: ?i128) !void {
             .revents = 0,
         }};
         const n = try posix.poll(&fds, timeout_ms);
-        if (n == 0) return error.Timeout;
+        if (n == 0) return error.ConnectTimeout;
 
         switch (classifyPoll(fds[0].revents, posix.POLL.OUT)) {
             .pending => continue,
@@ -433,7 +435,7 @@ fn checkSocketError(sock: posix.socket_t) !void {
         .CONNREFUSED => return error.ConnectionRefused,
         .NETUNREACH => return error.NetworkUnreachable,
         .HOSTUNREACH => return error.HostUnreachable,
-        .TIMEDOUT => return error.Timeout,
+        .TIMEDOUT => return error.ConnectTimeout,
         .ADDRNOTAVAIL => return error.AddressNotAvailable,
         .ACCES, .PERM => return error.AccessDenied,
         else => return error.Unexpected,

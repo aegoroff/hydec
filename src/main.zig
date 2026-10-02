@@ -111,11 +111,12 @@ fn runBest(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     var best = try probe.findBest(gpa, io, lines.items, opts.verbose, opts.timeout_secs, opts.interface, opts.strategy, &stats);
     defer if (best) |*b| b.deinit(gpa);
 
-    std.log.info("Tested: {d}, passed: {d}, skipped vmess: {d}, skipped other: {d}, parse failed: {d}", .{
+    std.log.info("Tested: {d}, passed: {d}, skipped vmess: {d}, skipped other: {d}, skipped dead host: {d}, parse failed: {d}", .{
         stats.tested,
         stats.passed,
         stats.skipped_vmess,
         stats.skipped_other,
+        stats.skipped_dead_host,
         stats.parse_failed,
     });
 
