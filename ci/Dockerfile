@@ -1,10 +1,10 @@
 # CI image: mise (zig + just) + apk-tools 3.x for OpenWrt packages.
 # Keep zig/just versions in sync with ../mise.toml.
 # Build from repo root (need --load with buildx docker-container driver):
-#   docker build --load -f ci/Dockerfile --tag registry.egoroff.spb.ru/zigcross:0.16 .
-#   docker push registry.egoroff.spb.ru/zigcross:0.16
+#   docker build --load -f ci/Dockerfile --tag registry.egoroff.spb.ru/zigcross:0.17 .
+#   docker push registry.egoroff.spb.ru/zigcross:0.17
 # Or build and push in one step:
-#   docker build --push -f ci/Dockerfile --tag registry.egoroff.spb.ru/zigcross:0.16 .
+#   docker build --push -f ci/Dockerfile --tag registry.egoroff.spb.ru/zigcross:0.17 .
 
 ARG APK_TOOLS_VERSION=3.0.6
 
@@ -71,7 +71,7 @@ RUN printf '%s\n' \
       'export PATH="/mise/shims:/usr/local/bin:$PATH"' \
       > /etc/profile.d/mise.sh
 
-RUN mise use -g zig@0.16.0 just@1.46.0 \
+RUN mise use -g zig@0.17.0 just@1.46.0 \
     && zig version \
     && just --version \
     && node --version \
