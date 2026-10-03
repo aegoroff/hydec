@@ -29,15 +29,15 @@ fn expectAccept(key_b64: []const u8, out: *[28]u8) []const u8 {
 fn headerValue(response: []const u8, name: []const u8) ?[]const u8 {
     var rest = response;
     // Skip status line
-    if (std.mem.indexOf(u8, rest, "\r\n")) |nl| {
+    if (std.mem.find(u8, rest, "\r\n")) |nl| {
         rest = rest[nl + 2 ..];
     } else return null;
 
-    while (std.mem.indexOf(u8, rest, "\r\n")) |nl| {
+    while (std.mem.find(u8, rest, "\r\n")) |nl| {
         const line = rest[0..nl];
         rest = rest[nl + 2 ..];
         if (line.len == 0) break;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = std.mem.trim(u8, line[0..colon], " \t");
         if (std.ascii.eqlIgnoreCase(key, name)) {
             return std.mem.trim(u8, line[colon + 1 ..], " \t");
@@ -80,7 +80,7 @@ const MAX_UPGRADE_HEADERS: usize = 2048;
 fn consumeUpgradeResponse(reader: *Io.Reader, key_b64: []const u8) !void {
     while (true) {
         const buffered = reader.buffered();
-        if (std.mem.indexOf(u8, buffered, "\r\n\r\n")) |end| {
+        if (std.mem.find(u8, buffered, "\r\n\r\n")) |end| {
             const hdr_end = end + 4;
             try validateUpgradeResponse(buffered[0..hdr_end], key_b64);
             reader.toss(hdr_end);
@@ -100,8 +100,8 @@ pub fn performUpgrade(
     path: []const u8,
     host_header: []const u8,
 ) !void {
-    if (std.mem.indexOfAny(u8, path, "\r\n") != null) return error.InvalidWsPath;
-    if (std.mem.indexOfAny(u8, host_header, "\r\n") != null) return error.InvalidWsHost;
+    if (std.mem.findAny(u8, path, "\r\n") != null) return error.InvalidWsPath;
+    if (std.mem.findAny(u8, host_header, "\r\n") != null) return error.InvalidWsHost;
 
     var key_raw: [16]u8 = undefined;
     io.random(&key_raw);
@@ -110,7 +110,7 @@ pub fn performUpgrade(
     const key_b64 = std.base64.standard.Encoder.encode(&key_b64_buf, &key_raw);
 
     var req_buf: [512]u8 = undefined;
-    const req = try std.fmt.bufPrint(
+    const req = try std.mem.print(
         &req_buf,
         "GET {s} HTTP/1.1\r\nHost: {s}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n\r\n",
         .{ path, host_header, key_b64 },

@@ -2,7 +2,7 @@
 
 Non-interactive CLI that downloads a base64-encoded proxy subscription, probes working nodes, and prints the preferred working one (protocol preference, then latency).
 
-Requires **Zig 0.16.0** ([mise](https://mise.jdx.dev/) pin in `mise.toml`, or install manually).
+Requires **Zig 0.17.0** ([mise](https://mise.jdx.dev/) pin in `mise.toml`, or install manually).
 
 ## Features
 

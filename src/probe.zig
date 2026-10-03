@@ -611,7 +611,7 @@ fn skipDeadHost(shared: *Shared, rest: []const WorkItem) void {
     }
 }
 
-fn freeGroups(gpa: std.mem.Allocator, groups: *std.StringArrayHashMapUnmanaged(std.ArrayList(WorkItem))) void {
+fn freeGroups(gpa: std.mem.Allocator, groups: *std.array_hash_map.String(std.ArrayList(WorkItem))) void {
     for (groups.keys()) |key| {
         gpa.free(key);
     }
@@ -630,8 +630,8 @@ fn collectGroups(
     lines: []const []const u8,
     stats: *Stats,
     verbose: bool,
-) !std.StringArrayHashMapUnmanaged(std.ArrayList(WorkItem)) {
-    var groups: std.StringArrayHashMapUnmanaged(std.ArrayList(WorkItem)) = .empty;
+) !std.array_hash_map.String(std.ArrayList(WorkItem)) {
+    var groups: std.array_hash_map.String(std.ArrayList(WorkItem)) = .empty;
     errdefer freeGroups(gpa, &groups);
 
     for (lines) |line| {
@@ -751,25 +751,25 @@ test "OK/FAIL log formatters render both named and unnamed proxies" {
     // OK: `best -v` (probe.zig) adds the sample spread; `ping` (main.zig) does not.
     try std.testing.expectEqualStrings(
         "OK: 42ms (min 40, max 300) 1.2.3.4 \u{2014} NL",
-        try std.fmt.bufPrint(&buf, "OK: {d}ms (min {d}, max {d}) {s}{f}", .{ 42, 40, 300, "1.2.3.4", NameSuffix{ .name = "NL" } }),
+        try std.mem.print(&buf, "OK: {d}ms (min {d}, max {d}) {s}{f}", .{ 42, 40, 300, "1.2.3.4", NameSuffix{ .name = "NL" } }),
     );
     try std.testing.expectEqualStrings(
         "OK: 42ms 1.2.3.4 \u{2014} \u{1f1f3}\u{1f1f1} NL",
-        try std.fmt.bufPrint(&buf, "OK: {d}ms {s}{f}", .{ 42, "1.2.3.4", NameSuffix{ .name = "\u{1f1f3}\u{1f1f1} NL" } }),
+        try std.mem.print(&buf, "OK: {d}ms {s}{f}", .{ 42, "1.2.3.4", NameSuffix{ .name = "\u{1f1f3}\u{1f1f1} NL" } }),
     );
     try std.testing.expectEqualStrings(
         "OK: 42ms 1.2.3.4",
-        try std.fmt.bufPrint(&buf, "OK: {d}ms {s}{f}", .{ 42, "1.2.3.4", NameSuffix{ .name = null } }),
+        try std.mem.print(&buf, "OK: {d}ms {s}{f}", .{ 42, "1.2.3.4", NameSuffix{ .name = null } }),
     );
 
     // FAIL: same two call sites.
     try std.testing.expectEqualStrings(
         "FAIL: \u{1f1f3}\u{1f1f1} NL (1.2.3.4): slow/timeout",
-        try std.fmt.bufPrint(&buf, "FAIL: {f}: {s}", .{ HostIdent{ .name = "\u{1f1f3}\u{1f1f1} NL", .host = "1.2.3.4" }, failHint(error.Timeout) }),
+        try std.mem.print(&buf, "FAIL: {f}: {s}", .{ HostIdent{ .name = "\u{1f1f3}\u{1f1f1} NL", .host = "1.2.3.4" }, failHint(error.Timeout) }),
     );
     try std.testing.expectEqualStrings(
         "FAIL: 1.2.3.4: slow/timeout",
-        try std.fmt.bufPrint(&buf, "FAIL: {f}: {s}", .{ HostIdent{ .name = null, .host = "1.2.3.4" }, failHint(error.Timeout) }),
+        try std.mem.print(&buf, "FAIL: {f}: {s}", .{ HostIdent{ .name = null, .host = "1.2.3.4" }, failHint(error.Timeout) }),
     );
 }
 
@@ -1036,13 +1036,13 @@ test "failHint covers every Io.net.IpAddress.BindError member" {
     // Two stay deliberately generic: `Unexpected` is an errno netutil could not map,
     // and `Canceled` cannot reach a probe (connectHostnameTimed turns cancellation
     // into Timeout) — for both, "error" is the honest answer.
-    const members = @typeInfo(Io.net.IpAddress.BindError).error_set.?;
-    inline for (members) |m| {
-        if (comptime std.mem.eql(u8, m.name, "Unexpected")) continue;
-        if (comptime std.mem.eql(u8, m.name, "Canceled")) continue;
-        const hint = failHint(@field(anyerror, m.name));
+    const names = @typeInfo(Io.net.IpAddress.BindError).error_set.error_names.?;
+    inline for (names) |name| {
+        if (comptime std.mem.eql(u8, name, "Unexpected")) continue;
+        if (comptime std.mem.eql(u8, name, "Canceled")) continue;
+        const hint = failHint(@field(anyerror, name));
         std.testing.expect(!std.mem.eql(u8, hint, "error")) catch |err| {
-            std.debug.print("BindError.{s} has no failHint\n", .{m.name});
+            std.debug.print("BindError.{s} has no failHint\n", .{name});
             return err;
         };
     }

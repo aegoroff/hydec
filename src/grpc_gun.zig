@@ -135,7 +135,7 @@ pub fn buildGunHeaders(out: []u8, service_name: []const u8, authority: []const u
     const path = if (service_name.len == 0)
         "/GunService/Tun"
     else
-        try std.fmt.bufPrint(&path_buf, "/{s}/Tun", .{service_name});
+        try std.mem.print(&path_buf, "/{s}/Tun", .{service_name});
 
     const auth = if (authority.len > 0) authority else "localhost";
 
@@ -405,7 +405,7 @@ pub fn formatAuthority(buf: []u8, sni: []const u8, port: u16, explicit: []const 
     if (explicit.len > 0) return explicit;
     // Match sing-box v2raygrpclite: Host = SNI:port
     if (port == 443) return sni;
-    return std.fmt.bufPrint(buf, "{s}:{d}", .{ sni, port });
+    return std.mem.print(buf, "{s}:{d}", .{ sni, port });
 }
 
 pub fn vlessFromGrpcData(payload: []const u8) ![]const u8 {
@@ -415,7 +415,7 @@ pub fn vlessFromGrpcData(payload: []const u8) ![]const u8 {
 
 test "writeLiteralHeader rejects fields longer than 255" {
     var buf: [512]u8 = undefined;
-    const long = [_]u8{'a'} ** 256;
+    const long: [256]u8 = @splat('a');
     try std.testing.expectError(error.HeaderFieldTooLong, writeLiteralHeader(&buf, &long, "x"));
     try std.testing.expectError(error.HeaderFieldTooLong, writeLiteralHeader(&buf, "x", &long));
 }
@@ -524,7 +524,7 @@ test "hpackReadInt extended form (RFC 7541 C.1.2: 1337, 5-bit prefix)" {
 }
 
 test "hpackReadInt rejects overflow and truncation" {
-    const overlong = [_]u8{0x1f} ++ ([_]u8{0xff} ** 10);
+    const overlong = [_]u8{0x1f} ++ @as([10]u8, @splat(0xff));
     var p: []const u8 = &overlong;
     try std.testing.expectError(error.InvalidHpack, hpackReadInt(&p, 5));
     var trunc: []const u8 = &.{ 0x1f, 0xff }; // continuation never terminates
@@ -574,17 +574,17 @@ test "unwrapHunk rejects a length that would wrap past the message" {
 }
 
 test "readVarint rejects overlong continuation" {
-    const crafted = [_]u8{0xff} ** 10;
+    const crafted: [10]u8 = @splat(0xff);
     try std.testing.expectError(error.InvalidVarint, readVarint(&crafted));
 }
 
 test "readVarint rejects overflow past usize" {
     // 9 continuation bytes + terminating 0x02 would set bit 64 (u64) / overflow.
-    const crafted = [_]u8{0xff} ** 9 ++ [_]u8{0x02};
+    const crafted = @as([9]u8, @splat(0xff)) ++ [_]u8{0x02};
     try std.testing.expectError(error.InvalidVarint, readVarint(&crafted));
     // Max usize: 9×0xff then 0x01 (bit 63 only) is valid on 64-bit.
     if (@bitSizeOf(usize) == 64) {
-        const max_u64 = [_]u8{0xff} ** 9 ++ [_]u8{0x01};
+        const max_u64 = @as([9]u8, @splat(0xff)) ++ [_]u8{0x01};
         const v, const n = try readVarint(&max_u64);
         try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), v);
         try std.testing.expectEqual(@as(usize, 10), n);

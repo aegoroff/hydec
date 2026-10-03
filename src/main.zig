@@ -9,7 +9,7 @@ const proxy_uri = @import("proxy_uri.zig");
 const probe = @import("probe.zig");
 const trojan = @import("trojan.zig");
 
-const utf8_console = if (builtin.os.tag == .windows)
+const utf8_console = if (builtin.target.os.tag == .windows)
     @import("utf8_console.zig")
 else
     struct {
@@ -64,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
         .run => |opts| {
             defer gpa.free(opts.uri);
             defer if (opts.interface) |i| gpa.free(i);
-            if (builtin.os.tag == .windows and opts.interface != null) {
+            if (builtin.target.os.tag == .windows and opts.interface != null) {
                 std.log.warn("--interface/-I is not supported on Windows; ignored", .{});
             }
             switch (opts.command) {

@@ -294,9 +294,9 @@ test "buildClientHello wire layout" {
 
     const h2 = [_]u8{ 2, 'h', '2' };
     const h11 = [_]u8{ 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
-    try std.testing.expect(std.mem.indexOf(u8, hello, &h2) != null);
-    try std.testing.expect(std.mem.indexOf(u8, hello, &h11) != null);
-    try std.testing.expect(std.mem.indexOf(u8, hello, "example.com") != null);
+    try std.testing.expect(std.mem.find(u8, hello, &h2) != null);
+    try std.testing.expect(std.mem.find(u8, hello, &h11) != null);
+    try std.testing.expect(std.mem.find(u8, hello, "example.com") != null);
 }
 
 test "buildClientHello rejects unusable protocol lists" {

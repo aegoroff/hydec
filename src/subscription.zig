@@ -11,7 +11,7 @@ pub fn iterLines(decoded: []const u8, comptime callback: anytype, ctx: anytype) 
     var iter = std.mem.splitScalar(u8, decoded, '\n');
     while (iter.next()) |raw| {
         var line = raw;
-        if (std.mem.indexOfScalar(u8, line, '\r')) |r| line = line[0..r];
+        if (std.mem.findScalar(u8, line, '\r')) |r| line = line[0..r];
         line = std.mem.trim(u8, line, " \t");
         if (line.len == 0) continue;
         try callback(ctx, line);

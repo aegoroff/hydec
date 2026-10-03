@@ -72,7 +72,7 @@ fn startsWithScheme(line: []const u8, scheme: []const u8) bool {
 }
 
 fn afterScheme(line: []const u8) []const u8 {
-    const sep = std.mem.indexOf(u8, line, "://") orelse return line;
+    const sep = std.mem.find(u8, line, "://") orelse return line;
     return line[sep + 3 ..];
 }
 
@@ -101,19 +101,19 @@ fn parseSecurity(sec: ?[]const u8) Security {
 }
 
 fn stripFragment(s: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, s, '#')) |i| return s[0..i];
+    if (std.mem.findScalar(u8, s, '#')) |i| return s[0..i];
     return s;
 }
 
 /// Drop the path component of an authority (`host:port/...` → `host:port`).
 fn stripPath(s: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, s, '/')) |i| return s[0..i];
+    if (std.mem.findScalar(u8, s, '/')) |i| return s[0..i];
     return s;
 }
 
 /// URL-decoded `#remark` from a subscription line, or null if absent/empty.
 pub fn parseName(gpa: std.mem.Allocator, line: []const u8) !?[]const u8 {
-    const hash = std.mem.indexOfScalar(u8, line, '#') orelse return null;
+    const hash = std.mem.findScalar(u8, line, '#') orelse return null;
     const frag = line[hash + 1 ..];
     if (frag.len == 0) return null;
     const name = try util.urlDecodeStrict(gpa, frag);
@@ -134,13 +134,13 @@ fn parseUserAtHost(gpa: std.mem.Allocator, rest: []const u8, default_port: u16) 
     const no_frag = stripFragment(rest);
     var query: []const u8 = "";
     var address_part = no_frag;
-    if (std.mem.indexOfScalar(u8, no_frag, '?')) |q| {
+    if (std.mem.findScalar(u8, no_frag, '?')) |q| {
         address_part = no_frag[0..q];
         query = no_frag[q + 1 ..];
     }
 
     // Last '@', as Go's net/url does: an unencoded '@' in a password stays userinfo.
-    const at = std.mem.lastIndexOfScalar(u8, address_part, '@') orelse return error.InvalidProxyUri;
+    const at = std.mem.findScalarLast(u8, address_part, '@') orelse return error.InvalidProxyUri;
     const raw_user = address_part[0..at];
     // Drop any path after the authority (`trojan://pw@host:443/?type=ws`); only
     // the userinfo may legally contain '/', so cut after the '@'.
@@ -215,18 +215,18 @@ fn parseTrojan(gpa: std.mem.Allocator, line: []const u8) !Proxy {
 fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     const rest0 = stripFragment(afterScheme(line));
     // SIP002: base64(method:password)@host:port
-    if (std.mem.indexOfScalar(u8, rest0, '@')) |at| {
+    if (std.mem.findScalar(u8, rest0, '@')) |at| {
         const encoded_user = rest0[0..at];
         // SIP002 allows a bare path between the port and the query:
         // `ss://<b64>@host:port/?plugin=...`.
         var hostport = rest0[at + 1 ..];
-        if (std.mem.indexOfScalar(u8, hostport, '?')) |q| hostport = hostport[0..q];
+        if (std.mem.findScalar(u8, hostport, '?')) |q| hostport = hostport[0..q];
         hostport = stripPath(hostport);
         const hp = try util.splitHostPortOrDefault(hostport, 8388);
 
         const decoded = try decodeUserinfo(gpa, encoded_user);
         defer gpa.free(decoded);
-        const colon = std.mem.indexOfScalar(u8, decoded, ':') orelse return error.InvalidProxyUri;
+        const colon = std.mem.findScalar(u8, decoded, ':') orelse return error.InvalidProxyUri;
         const method = try gpa.dupe(u8, decoded[0..colon]);
         errdefer gpa.free(method);
         const password = try gpa.dupe(u8, decoded[colon + 1 ..]);
@@ -250,15 +250,15 @@ fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
 
     // Legacy: entire rest is base64(method:password@host:port)
     var encoded = rest0;
-    if (std.mem.indexOfScalar(u8, encoded, '?')) |q| encoded = encoded[0..q];
+    if (std.mem.findScalar(u8, encoded, '?')) |q| encoded = encoded[0..q];
     const decoded = try decodeLegacyBlob(gpa, encoded);
     defer gpa.free(decoded);
     // Last '@' separates userinfo from host — passwords may contain '@'.
-    const at = std.mem.lastIndexOfScalar(u8, decoded, '@') orelse return error.InvalidProxyUri;
+    const at = std.mem.findScalarLast(u8, decoded, '@') orelse return error.InvalidProxyUri;
     const userinfo = decoded[0..at];
     const hostport = decoded[at + 1 ..];
     const hp = try util.splitHostPortOrDefault(hostport, 8388);
-    const colon = std.mem.indexOfScalar(u8, userinfo, ':') orelse return error.InvalidProxyUri;
+    const colon = std.mem.findScalar(u8, userinfo, ':') orelse return error.InvalidProxyUri;
     const method = try gpa.dupe(u8, userinfo[0..colon]);
     errdefer gpa.free(method);
     const password = try gpa.dupe(u8, userinfo[colon + 1 ..]);
@@ -307,8 +307,8 @@ fn decodeLegacyBlobExact(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
     const decoded = try decodeUserinfo(gpa, encoded);
     errdefer gpa.free(decoded);
     // Last '@' separates userinfo from host — passwords may contain '@'.
-    const at = std.mem.lastIndexOfScalar(u8, decoded, '@') orelse return error.InvalidProxyUri;
-    if (std.mem.indexOfScalar(u8, decoded[0..at], ':') == null) return error.InvalidProxyUri;
+    const at = std.mem.findScalarLast(u8, decoded, '@') orelse return error.InvalidProxyUri;
+    if (std.mem.findScalar(u8, decoded[0..at], ':') == null) return error.InvalidProxyUri;
     _ = try util.splitHostPortOrDefault(decoded[at + 1 ..], 8388);
     return decoded;
 }

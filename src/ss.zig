@@ -58,7 +58,7 @@ fn hkdfSha1(master_key: []const u8, salt: []const u8, out_key: []u8) void {
 const AeadCtx = struct {
     method: Method,
     key: [32]u8,
-    nonce: [12]u8 = [_]u8{0} ** 12,
+    nonce: [12]u8 = @splat(0),
 
     /// SIP004 / shadowsocks.org AEAD: increment as unsigned little-endian (byte 0 first).
     /// Matches libsodium `sodium_increment` used by shadowsocks-libev, rust, go, sing-box.
@@ -340,7 +340,7 @@ test "evpBytesToKey chacha length" {
 test "aead seal/open chunk roundtrip" {
     var seal_ctx: AeadCtx = .{
         .method = .chacha20_ietf_poly1305,
-        .key = [_]u8{0x11} ** 32,
+        .key = @splat(0x11),
     };
     const plain = "HTTP/1.1 200";
     var sealed: [128]u8 = undefined;
@@ -348,7 +348,7 @@ test "aead seal/open chunk roundtrip" {
 
     var open_ctx: AeadCtx = .{
         .method = .chacha20_ietf_poly1305,
-        .key = [_]u8{0x11} ** 32,
+        .key = @splat(0x11),
     };
     var out: [64]u8 = undefined;
     const got = try openChunk(&open_ctx, sealed[0..n], &out);
@@ -358,7 +358,7 @@ test "aead seal/open chunk roundtrip" {
 test "aead sealChunk accepts payload larger than 512" {
     var seal_ctx: AeadCtx = .{
         .method = .chacha20_ietf_poly1305,
-        .key = [_]u8{0x33} ** 32,
+        .key = @splat(0x33),
     };
     var plain: [600]u8 = undefined;
     @memset(&plain, 0xab);
@@ -367,7 +367,7 @@ test "aead sealChunk accepts payload larger than 512" {
 
     var open_ctx: AeadCtx = .{
         .method = .chacha20_ietf_poly1305,
-        .key = [_]u8{0x33} ** 32,
+        .key = @splat(0x33),
     };
     var out: [600]u8 = undefined;
     const got = try openChunk(&open_ctx, sealed[0..n], &out);
@@ -378,7 +378,7 @@ test "aead sealChunk accepts payload larger than 512" {
 test "bumpNonce is little-endian per SIP004" {
     var ctx: AeadCtx = .{
         .method = .aes_128_gcm,
-        .key = [_]u8{0} ** 32,
+        .key = @splat(0),
     };
     ctx.bumpNonce();
     try std.testing.expectEqual(@as(u8, 1), ctx.nonce[0]);
@@ -392,7 +392,7 @@ test "bumpNonce is little-endian per SIP004" {
 test "aead open rejects bad tag" {
     var seal_ctx: AeadCtx = .{
         .method = .aes_128_gcm,
-        .key = [_]u8{0x22} ** 32,
+        .key = @splat(0x22),
     };
     const plain = "ok";
     var sealed: [64]u8 = undefined;
@@ -401,7 +401,7 @@ test "aead open rejects bad tag" {
 
     var open_ctx: AeadCtx = .{
         .method = .aes_128_gcm,
-        .key = [_]u8{0x22} ** 32,
+        .key = @splat(0x22),
     };
     var out: [16]u8 = undefined;
     try std.testing.expectError(error.AuthenticationFailed, openChunk(&open_ctx, sealed[0..n], &out));
@@ -448,7 +448,7 @@ test "takeResponse validates the UA of the response, not of trailing bytes" {
 }
 
 test "one AEAD chunk straddling both responses yields both" {
-    const key = [_]u8{0x44} ** 32;
+    const key: [32]u8 = @splat(0x44);
     var seal_ctx: AeadCtx = .{ .method = .chacha20_ietf_poly1305, .key = key };
 
     // Chunk boundary deliberately falls inside the steady response's *body*, so the

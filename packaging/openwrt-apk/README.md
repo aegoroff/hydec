@@ -4,7 +4,7 @@ SDK-free packaging: cross-compile static musl `hydec`, wrap with `apk mkpkg`.
 
 ## Prerequisites
 
-- Zig 0.16 ([mise](https://mise.jdx.dev/) pin in repo `mise.toml`) + `just`
+- Zig 0.17 ([mise](https://mise.jdx.dev/) pin in repo `mise.toml`) + `just`
 - **apk-tools 3.x** with `apk mkpkg` (OpenWrt 25.12 uses APKv3 — apk 2.x will not work)
 - `fakeroot` — for `root:root` ownership inside the package
 

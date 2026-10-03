@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 pub fn build(b: *std.Build) void {
     const target = resolveTarget(b);
     const optimize = b.standardOptimizeOption(.{});
-    const strip = optimize != .Debug;
+    const strip = optimize != .debug;
     const options = b.addOptions();
 
     const version_opt = b.option([]const u8, "version", "The version of the app") orelse "0.1.0-dev";
@@ -32,9 +32,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
@@ -54,22 +52,18 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
 
     const tr = target.result;
-    const tar_file = b.fmt("{s}/hydec-{s}-{s}-{s}-{s}.tar.gz", .{
-        b.install_prefix,
+    const tar_name = b.fmt("hydec-{s}-{s}-{s}-{s}.tar.gz", .{
         version_opt,
         @tagName(tr.cpu.arch),
         @tagName(tr.os.tag),
         @tagName(tr.abi),
     });
 
-    const zig_step = b.addSystemCommand(&.{
-        "tar",
-        "-czf",
-        tar_file,
-        "-C",
-        b.exe_dir,
-        ".",
-    });
+    const zig_step = b.addSystemCommand(&.{ "tar", "-czf" });
+    zig_step.addDirectoryArg2(b.graph.path(.install_prefix, ""), .{ .suffix = b.fmt("/{s}", .{tar_name}) });
+    zig_step.addArg("-C");
+    zig_step.addDirectoryArg2(b.graph.path(.install_bin, ""), .{});
+    zig_step.addArg(".");
     zig_step.step.dependOn(b.getInstallStep());
 
     const archive_step = b.step("archive", "Create a tar.gz archive of the build");
@@ -96,7 +90,7 @@ fn resolveTarget(b: *std.Build) std.Build.ResolvedTarget {
     // OS-version detection: spell out the host triple so it matches -Dtarget.
     if (query.cpu_arch == null and query.os_tag == null) switch (query.cpu_model) {
         .native, .explicit => {
-            query.cpu_arch = builtin.cpu.arch;
+            query.cpu_arch = builtin.target.cpu.arch;
             query.os_tag = builtin.target.os.tag;
             query.abi = query.abi orelse builtin.target.abi;
         },

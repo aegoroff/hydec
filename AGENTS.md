@@ -8,7 +8,7 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 
 | Item | Value |
 |------|-------|
-| Language | Zig **0.16.0** (see `mise.toml`) |
+| Language | Zig **0.17.0** (see `mise.toml`) |
 | CLI parsing | [zig-cli](https://github.com/zig-utils/zig-cli) |
 | License | MIT |
 | Default version | `0.1.0-dev` (`-Dversion=...` / `build_options.version`) |
@@ -66,7 +66,7 @@ Optional bind spec for **probe** sockets only (subscription fetch unchanged):
 
 ## Build and run
 
-Use **mise** for Zig 0.16.0, or install it manually.
+Use **mise** for Zig 0.17.0, or install it manually.
 
 ```bash
 zig build
@@ -77,13 +77,13 @@ zig build run -- best "https://example.com/sub"
 zig build run -- ping 'ss://...'
 
 # Cross-compile example
-zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast
+zig build -Dtarget=x86_64-linux-musl -Doptimize=fast
 ```
 
 Via **just** (mise-wrapped Zig):
 
 ```bash
-just build                                                      # ReleaseSmall, x86_64-linux-musl, core2
+just build                                                      # -Doptimize=small, x86_64-linux-musl, core2
 just test
 just arch=x86_64 os=linux abi=musl ver=0.1.0 cpu=core2 release
 just ver=0.1.0 build-all                                        # all release targets + archives
@@ -98,7 +98,7 @@ Binary: `zig-out/bin/hydec` (or `--prefix-exe-dir`).
 - **Minimize scope.** Small, focused diffs. No drive-by refactors.
 - **Match existing style.** Follow patterns in `src/*.zig` for naming, errors, and allocators.
 - **Use std library first.** Avoid new dependencies without discussion.
-- **I/O.** Zig 0.16 `std.Io` (`init.io`, `std.Io.File`, `std.Io.Clock`, `std.Io.Writer`, `Io.Mutex`). Do not revert to pre-0.16 APIs.
+- **I/O.** Zig 0.17 `std.Io` (`init.io`, `std.Io.File`, `std.Io.Clock`, `std.Io.Writer`, `Io.Mutex`). Do not revert to pre-0.16 APIs; on 0.17 avoid std decls marked `Deprecated`.
 - **Networking.** Prefer `netutil` helpers for connect/timeouts/bind. IP connects use non-blocking + `poll` (Zig `IpAddress.connect` timeout is still TODO on Linux). Thread optional `-I` bind through `connectHostPort` → `connectIpUntil` / `applyBind`. Blocking `std.crypto.tls` needs `DeadlineShutdown`, not only poll.
 - **Concurrency.** Parallelism is **by host** in `probe.zig` (`std.Thread` + `Io.Mutex`). Do not probe the same IP concurrently.
 - **Comments.** Only for non-obvious logic.
@@ -158,7 +158,7 @@ Prefer focused unit tests (URI parse, framing, grouping). Live subscription prob
 feat: probe distinct IPs in parallel
 fix: respect Trojan TLS timeout via socket shutdown
 chore: correct project overview in AGENTS.md
-build: zig 0.16
+build: zig 0.17
 ```
 
 - Do **not** commit unless explicitly asked.
@@ -187,4 +187,4 @@ build: zig 0.16
 1. `zig build` succeeds.
 2. `zig build test` passes.
 3. Changed Zig sources are `zig fmt`'d.
-4. No new compiler warnings in ReleaseSmall (just/CI default).
+4. No new compiler warnings in `-Doptimize=small` (just/CI default).

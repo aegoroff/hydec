@@ -557,7 +557,7 @@ const RealityConn = struct {
             r.seek += n;
             return n;
         }
-        if (builtin.os.tag == .windows) {
+        if (builtin.target.os.tag == .windows) {
             const n = self.conn.reader.readSliceShort(out[0..@min(out.len, 1)]) catch |err| {
                 return self.mapReaderErr(err);
             };
@@ -653,7 +653,7 @@ fn connect(
 
     var seed: [32]u8 = undefined;
     io.random(&seed);
-    const kp = try X25519.KeyPair.generateDeterministic(seed);
+    const kp = X25519.KeyPair.generateDeterministic(seed);
 
     var client_random: [32]u8 = undefined;
     io.random(&client_random);
@@ -732,7 +732,7 @@ fn connect(
     var master: [32]u8 = undefined;
 
     {
-        const zeroes = [_]u8{0} ** 32;
+        const zeroes: [32]u8 = @splat(0);
         const early = HkdfSha256.extract(&[_]u8{0}, &zeroes);
         const empty_hash = tls.emptyHash(Sha256);
         const derived = hkdfExpandLabel(32, &early, "derived", &empty_hash);
@@ -1191,7 +1191,7 @@ const VisionPipe = struct {
 };
 
 fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []const u8, start: i128) !u64 {
-    const use_vision = std.mem.indexOf(u8, flow, "vision") != null;
+    const use_vision = std.mem.find(u8, flow, "vision") != null;
     var uuid: [16]u8 = undefined;
     try vless.parseUuid(uuid_text, &uuid);
 
@@ -1426,8 +1426,8 @@ fn testDecryptConn(reader: *Io.Reader, key: *const [16]u8, iv: *const [12]u8) Re
     return rc;
 }
 
-const TEST_RECORD_KEY: [16]u8 = [_]u8{0x5a} ** 16;
-const TEST_RECORD_IV: [12]u8 = [_]u8{0x31} ** 12;
+const TEST_RECORD_KEY: [16]u8 = @splat(0x5a);
+const TEST_RECORD_IV: [12]u8 = @splat(0x31);
 
 /// CCS and a zero-length NewSessionTicket: the two inner types the drain loop skips.
 fn ignorableRecord(index: usize) struct { typ: u8, content: []const u8 } {
@@ -1527,7 +1527,7 @@ test "grpcProbeHttpReady accepts Cloudflare trace" {
     var stripped = false;
     const body = "fl=1\nh=cp.cloudflare.com\nvisit_scheme=http\nuag=hydec-warmup\n";
     var chunk: [128]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(chunk[0..], "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body.len});
+    const prefix = try std.mem.print(chunk[0..], "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body.len});
     @memcpy(chunk[prefix.len..][0..body.len], body);
     try std.testing.expect(try grpcProbeHttpReady(&buf, &len, chunk[0 .. prefix.len + body.len], &stripped, util.PROBE_UA_WARMUP));
 }
@@ -1539,7 +1539,7 @@ test "grpcProbeHttpReady rejects wrong uag on steady" {
     // Duplicate warmup body must not satisfy the steady-state UA check.
     const body = "fl=1\nvisit_scheme=http\nuag=hydec-warmup\n";
     var chunk: [128]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(chunk[0..], "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body.len});
+    const prefix = try std.mem.print(chunk[0..], "\x00\x00HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{body.len});
     @memcpy(chunk[prefix.len..][0..body.len], body);
     try std.testing.expectError(
         error.ProbeResponseMismatch,
@@ -1579,7 +1579,7 @@ test "isCompleteTlsAppData one and several records" {
 }
 
 test "drainVlessVisionStream strips header before Vision unwrap" {
-    var uuid: [16]u8 = [_]u8{0xcd} ** 16;
+    var uuid: [16]u8 = @splat(0xcd);
     const http = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
     var vision: [256]u8 = undefined;
     const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_END, &uuid, http, 64);
@@ -1607,7 +1607,7 @@ test "drainVlessVisionStream strips header before Vision unwrap" {
 }
 
 test "drainVlessVisionStream splits header then Vision across pushes" {
-    var uuid: [16]u8 = [_]u8{0xef} ** 16;
+    var uuid: [16]u8 = @splat(0xef);
     const http = "HTTP/1.1 200 OK\r\n\r\n";
     var vision: [256]u8 = undefined;
     const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_END, &uuid, http, 64);
@@ -1637,7 +1637,7 @@ test "drainVlessVisionStream splits header then Vision across pushes" {
 }
 
 test "drainVlessVisionStream continues without UUID then End" {
-    var uuid: [16]u8 = [_]u8{0x11} ** 16;
+    var uuid: [16]u8 = @splat(0x11);
     const part1 = "HTTP/1.1 200 OK\r\n";
     const part2 = "Content-Length: 0\r\n\r\n";
 
@@ -1673,7 +1673,7 @@ test "drainVlessVisionStream continues without UUID then End" {
 }
 
 test "drainVlessVisionStream steady raw after End grows http" {
-    var uuid: [16]u8 = [_]u8{0x22} ** 16;
+    var uuid: [16]u8 = @splat(0x22);
     const http = "HTTP/1.1 200 OK\r\n\r\n";
     var vision: [256]u8 = undefined;
     const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_END, &uuid, http, 64);
@@ -1704,7 +1704,7 @@ test "drainVlessVisionStream steady raw after End grows http" {
 }
 
 test "drainVlessVisionStream incomplete Vision does not grow http" {
-    var uuid: [16]u8 = [_]u8{0x33} ** 16;
+    var uuid: [16]u8 = @splat(0x33);
     var vision: [256]u8 = undefined;
     const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_END, &uuid, "HTTP/1.1 200 OK\r\n\r\n", 64);
 
@@ -1738,7 +1738,7 @@ test "drainVlessVisionStream incomplete Vision does not grow http" {
 }
 
 test "drainVlessVisionStream rejects raw HTTP when Vision required" {
-    var uuid: [16]u8 = [_]u8{0x44} ** 16;
+    var uuid: [16]u8 = @splat(0x44);
     const raw = "\x00\x00HTTP/1.1 200 OK\r\n\r\n";
     var stream: [64]u8 = undefined;
     @memcpy(stream[0..raw.len], raw);
@@ -1760,8 +1760,8 @@ test "drainVlessVisionStream rejects raw HTTP when Vision required" {
 test "drainVlessVisionStream rejects an HTTP/2 peer when Vision required" {
     // A REALITY dest fallback that picked h2 opens with SETTINGS, whose first two bytes
     // read as an empty VLESS header; the Vision frame check turns the rest away.
-    var uuid: [16]u8 = [_]u8{0x77} ** 16;
-    const settings = [_]u8{ 0x00, 0x00, 0x12, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 } ++ [_]u8{0} ** 0x12;
+    var uuid: [16]u8 = @splat(0x77);
+    const settings = [_]u8{ 0x00, 0x00, 0x12, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00 } ++ @as([0x12]u8, @splat(0));
     var stream: [64]u8 = undefined;
     @memcpy(stream[0..settings.len], &settings);
     var stream_len: usize = settings.len;
@@ -1780,7 +1780,7 @@ test "drainVlessVisionStream rejects an HTTP/2 peer when Vision required" {
 }
 
 test "drainVlessVisionStream Direct sets xtls_raw_read" {
-    var uuid: [16]u8 = [_]u8{0x66} ** 16;
+    var uuid: [16]u8 = @splat(0x66);
     const payload = "\x17\x03\x03\x00\x01\x00";
     var vision: [256]u8 = undefined;
     const vn = try vless.appendVisionFrame(&vision, vless.VISION_CMD_DIRECT, &uuid, payload, 8);
@@ -1807,7 +1807,7 @@ test "drainVlessVisionStream Direct sets xtls_raw_read" {
 
 test "parseServerHelloX25519 accepts key_share" {
     var body: [128]u8 = undefined;
-    const key = [_]u8{0x42} ** 32;
+    const key: [32]u8 = @splat(0x42);
     const n = try appendServerHelloMinimal(&body, &key, null);
     const got = try parseServerHelloX25519(body[0..n]);
     try std.testing.expectEqualSlices(u8, &key, &got);
@@ -1815,7 +1815,7 @@ test "parseServerHelloX25519 accepts key_share" {
 
 test "parseServerHelloX25519 rejects truncated extensions" {
     var body: [128]u8 = undefined;
-    const key = [_]u8{0x42} ** 32;
+    const key: [32]u8 = @splat(0x42);
     const n = try appendServerHelloMinimal(&body, &key, null);
     // Claim a huge extensions length past the real buffer.
     try std.testing.expectError(error.TlsDecodeError, parseServerHelloX25519(body[0 .. n - 1]));
@@ -1824,16 +1824,16 @@ test "parseServerHelloX25519 rejects truncated extensions" {
 
 test "parseServerHelloX25519 rejects ext_len past body" {
     var body: [128]u8 = undefined;
-    const key = [_]u8{0x42} ** 32;
+    const key: [32]u8 = @splat(0x42);
     const n = try appendServerHelloMinimal(&body, &key, 0xffff);
     try std.testing.expectError(error.TlsDecodeError, parseServerHelloX25519(body[0..n]));
 }
 
 test "clientHello session id at offset 39" {
     var out: [512]u8 = undefined;
-    const random = [_]u8{0x11} ** 32;
-    const sid = [_]u8{0x22} ** 32;
-    const pubk = [_]u8{0x33} ** 32;
+    const random: [32]u8 = @splat(0x11);
+    const sid: [32]u8 = @splat(0x22);
+    const pubk: [32]u8 = @splat(0x33);
     const n = try buildClientHello(&out, "example.com", &random, &sid, &pubk);
     try std.testing.expect(n > 39 + 32);
     try std.testing.expectEqual(@as(u8, 1), out[0]); // client_hello
@@ -1843,13 +1843,13 @@ test "clientHello session id at offset 39" {
 
 test "buildClientHello rejects oversized SNI" {
     var out: [2048]u8 = undefined;
-    const random = [_]u8{0x11} ** 32;
-    const sid = [_]u8{0x22} ** 32;
-    const pubk = [_]u8{0x33} ** 32;
-    const long_sni = "a" ** 256;
+    const random: [32]u8 = @splat(0x11);
+    const sid: [32]u8 = @splat(0x22);
+    const pubk: [32]u8 = @splat(0x33);
+    const long_sni: [256]u8 = @splat('a');
     try std.testing.expectError(
         error.SniTooLong,
-        buildClientHello(&out, long_sni, &random, &sid, &pubk),
+        buildClientHello(&out, &long_sni, &random, &sid, &pubk),
     );
 }
 
@@ -1858,5 +1858,5 @@ test "decodePublicKey length" {
     const pbk = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     var out: [32]u8 = undefined;
     try decodePublicKey(pbk, &out);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &out);
+    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &out);
 }

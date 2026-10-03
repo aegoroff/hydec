@@ -40,7 +40,7 @@ fn connectHostnameTimed(
     bind: ?[]const u8,
 ) !Io.net.Stream {
     const hostname = try Io.net.HostName.init(host);
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         // Best-effort: timed IP connect is Linux/posix-only below.
         const stream = try hostname.connect(io, port, .{ .mode = .stream });
         setTcpNoDelay(stream);
@@ -198,7 +198,7 @@ fn connectIpUntil(
     deadline: ?i128,
     bind: ?[]const u8,
 ) !Io.net.Stream {
-    if (builtin.os.tag == .windows) {
+    if (builtin.target.os.tag == .windows) {
         // Best-effort: Zig Windows connect timeout is also TODO.
         return address.connect(io, .{ .mode = .stream });
     }
@@ -250,7 +250,7 @@ fn applyBind(sock: posix.socket_t, bind: ?[]const u8) !void {
         return bindSrcIp(sock, src);
     } else |_| {}
 
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         return bindToDevice(sock, spec);
     }
     return error.InterfaceBindingUnsupported;
@@ -430,7 +430,7 @@ fn checkSocketError(sock: posix.socket_t) !void {
         else => return error.Unexpected,
     }
     if (err_code == 0) return;
-    switch (@as(posix.E, @enumFromInt(err_code))) {
+    switch (@as(posix.E, @fromBackingInt(@intCast(err_code)))) {
         .SUCCESS => {},
         .CONNREFUSED => return error.ConnectionRefused,
         .NETUNREACH => return error.NetworkUnreachable,
@@ -459,7 +459,7 @@ fn clearNonblock(sock: posix.socket_t) !void {
 
 /// Disable Nagle — required for timely HTTP/2 preface/SETTINGS exchange.
 fn setTcpNoDelay(stream: Io.net.Stream) void {
-    if (builtin.os.tag == .windows) return;
+    if (builtin.target.os.tag == .windows) return;
     const one: c_int = 1;
     std.posix.setsockopt(
         stream.socket.handle,
@@ -486,10 +486,10 @@ pub fn deadlineNs(io: Io, timeout_secs: u32) ?i128 {
 }
 
 /// Wait until the socket is readable or the absolute deadline passes.
-/// Uses poll(2) — safe with Zig 0.16 Threaded Io (unlike SO_RCVTIMEO).
+/// Uses poll(2) — safe with Zig Threaded Io (unlike SO_RCVTIMEO).
 pub fn waitReadableUntil(stream: Io.net.Stream, io: Io, deadline_ns: ?i128) !void {
     const deadline = deadline_ns orelse return;
-    if (builtin.os.tag == .windows) return;
+    if (builtin.target.os.tag == .windows) return;
 
     while (true) {
         const now = monoNow(io);
@@ -535,7 +535,7 @@ pub const DeadlineShutdown = struct {
     ) !DeadlineShutdown {
         done.* = std.atomic.Value(bool).init(false);
         fired.* = std.atomic.Value(bool).init(false);
-        if (builtin.os.tag == .windows or timeout_ns == 0) {
+        if (builtin.target.os.tag == .windows or timeout_ns == 0) {
             return .{ .done = done, .fired = fired, .thread = null };
         }
         const thread = try std.Thread.spawn(.{}, watchdog, .{ fd, timeout_ns, done, fired });

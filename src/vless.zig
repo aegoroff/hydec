@@ -182,14 +182,14 @@ test "parseUuid" {
 
 test "encodeRequestDomain size" {
     var buf: [64]u8 = undefined;
-    var uuid: [16]u8 = [_]u8{0} ** 16;
+    var uuid: [16]u8 = @splat(0);
     const n = try encodeRequestDomain(&buf, &uuid, "x.com", 443, "");
     try std.testing.expectEqual(@as(usize, 1 + 16 + 1 + 1 + 2 + 1 + 1 + 5), n);
 }
 
 test "encodeRequestDomain with flow addon" {
     var buf: [128]u8 = undefined;
-    var uuid: [16]u8 = [_]u8{0} ** 16;
+    var uuid: [16]u8 = @splat(0);
     const flow = "xtls-rprx-vision";
     const n = try encodeRequestDomain(&buf, &uuid, "x.com", 443, flow);
     try std.testing.expectEqual(@as(usize, 1 + 16 + 1 + (1 + 1 + flow.len) + 1 + 2 + 1 + 1 + 5), n);
@@ -199,11 +199,11 @@ test "encodeRequestDomain with flow addon" {
 
 test "encodeRequestDomain rejects oversized domain and flow" {
     var buf: [1024]u8 = undefined;
-    var uuid: [16]u8 = [_]u8{0} ** 16;
-    const long_domain = [_]u8{'a'} ** 256;
+    var uuid: [16]u8 = @splat(0);
+    const long_domain: [256]u8 = @splat('a');
     try std.testing.expectError(error.DomainTooLong, encodeRequestDomain(&buf, &uuid, &long_domain, 443, ""));
     // addon_len = 2 + flow.len must fit in u8 → flow.len > 253 overflows.
-    const long_flow = [_]u8{'f'} ** 254;
+    const long_flow: [254]u8 = @splat('f');
     try std.testing.expectError(error.FlowTooLong, encodeRequestDomain(&buf, &uuid, "x.com", 443, &long_flow));
 }
 
@@ -219,8 +219,8 @@ test "encodeProbeRequest is cleartext HTTP without Vision" {
     var buf: [512]u8 = undefined;
     const n = try encodeProbeRequest(&buf, "00000000-1111-2222-3333-444444444444");
     // No Vision UUID frame after the VLESS header — raw HTTP follows.
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], util.PROBE_HTTP) != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "xtls-rprx-vision") == null);
+    try std.testing.expect(std.mem.find(u8, buf[0..n], util.PROBE_HTTP) != null);
+    try std.testing.expect(std.mem.find(u8, buf[0..n], "xtls-rprx-vision") == null);
 }
 
 test "responseHeaderLen consumes only the header in front of a Vision UUID" {
@@ -236,7 +236,7 @@ test "responseHeaderLen consumes only the header in front of a Vision UUID" {
 }
 
 test "consumeVisionFrame NeedMore and content before padding" {
-    var uuid: [16]u8 = [_]u8{0xab} ** 16;
+    var uuid: [16]u8 = @splat(0xab);
     var frame_buf: [128]u8 = undefined;
     const http = "HTTP/1.1 200 OK\r\n\r\n";
     const n = try appendVisionFrame(&frame_buf, VISION_CMD_END, &uuid, http, 64);
@@ -256,7 +256,7 @@ test "consumeVisionFrame NeedMore and content before padding" {
 }
 
 test "consumeVisionFrame Direct sets switch_to_xtls" {
-    var uuid: [16]u8 = [_]u8{0x55} ** 16;
+    var uuid: [16]u8 = @splat(0x55);
     const payload = "\x17\x03\x03\x00\x01\x00";
     var frame_buf: [128]u8 = undefined;
     const n = try appendVisionFrame(&frame_buf, VISION_CMD_DIRECT, &uuid, payload, 8);
@@ -268,7 +268,7 @@ test "consumeVisionFrame Direct sets switch_to_xtls" {
 }
 
 test "consumeVisionFrame rejects non-uuid prefix" {
-    var uuid: [16]u8 = [_]u8{0xab} ** 16;
+    var uuid: [16]u8 = @splat(0xab);
     // VLESS empty response header + HTTP must not be mistaken for Vision.
     const raw = "\x00\x00HTTP/1.1 200 OK\r\n\r\n";
     var state: VisionUnpadState = .{};
@@ -276,7 +276,7 @@ test "consumeVisionFrame rejects non-uuid prefix" {
 }
 
 test "consumeVisionFrame continue block omits UUID" {
-    var uuid: [16]u8 = [_]u8{0xcd} ** 16;
+    var uuid: [16]u8 = @splat(0xcd);
     const part1 = "HTTP/1.1 200 OK\r\n";
     const part2 = "Content-Length: 0\r\n\r\n";
 
@@ -299,7 +299,7 @@ test "consumeVisionFrame continue block omits UUID" {
 }
 
 test "consumeVisionFrame recognizes raw TLS after UUID phase" {
-    var uuid: [16]u8 = [_]u8{0xcd} ** 16;
+    var uuid: [16]u8 = @splat(0xcd);
     var state: VisionUnpadState = .{ .expect_uuid = false };
     const tls_record = [_]u8{ 0x16, 0x03, 0x03, 0x00, 0x2a };
     try std.testing.expectError(error.NotVision, consumeVisionFrame(&tls_record, &uuid, &state));

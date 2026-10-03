@@ -135,7 +135,7 @@ fn normalizeArgs(
             continue;
         }
         if (arg.len >= 4 and std.mem.startsWith(u8, arg, "--")) {
-            if (std.mem.indexOfScalar(u8, arg, '=')) |eq| {
+            if (std.mem.findScalar(u8, arg, '=')) |eq| {
                 if (eq > 2) {
                     try list.append(gpa, arg[0..eq]);
                     try list.append(gpa, arg[eq + 1 ..]);
@@ -386,8 +386,7 @@ fn normalizeOptionsFor(root: *zig_cli.BaseCommand, args: []const []const u8) []c
 }
 
 pub fn parse(gpa: std.mem.Allocator, io: Io, args: std.process.Args) !ParseResult {
-    const description = try std.fmt.allocPrint(
-        gpa,
+    const description = try gpa.print(
         \\Probe proxies from a subscription or a single URI ({s})
         \\Copyright (C) 2026. MIT License.
     ,
@@ -409,7 +408,7 @@ pub fn parse(gpa: std.mem.Allocator, io: Io, args: std.process.Args) !ParseResul
     if (arg_slice.len == 0 or wantsHelp(arg_slice)) {
         if (arg_slice.len >= 1) {
             if (root.findSubcommand(arg_slice[0])) |sub| {
-                const usage = try std.fmt.allocPrint(gpa, "hydec {s}", .{sub.name});
+                const usage = try gpa.print("hydec {s}", .{sub.name});
                 defer gpa.free(usage);
                 try printHelp(io, sub, usage);
                 return .help;

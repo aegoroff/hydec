@@ -83,7 +83,7 @@ pub fn getQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
     var iter = std.mem.splitScalar(u8, query, '&');
     while (iter.next()) |pair| {
         if (pair.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+        if (std.mem.findScalar(u8, pair, '=')) |eq| {
             if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
         } else if (std.mem.eql(u8, pair, key)) {
             return "";
@@ -113,7 +113,7 @@ pub fn splitHostPortOrDefault(address: []const u8, default_port: u16) error{Inva
     if (address.len == 0) return error.InvalidAddress;
 
     if (address[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, address, ']') orelse return error.InvalidAddress;
+        const close = std.mem.findScalar(u8, address, ']') orelse return error.InvalidAddress;
         if (close < 2) return error.InvalidAddress;
         const host = address[1..close];
         if (close + 1 == address.len) return .{ .host = host, .port = default_port };
@@ -125,7 +125,7 @@ pub fn splitHostPortOrDefault(address: []const u8, default_port: u16) error{Inva
     // Bare IPv6 has multiple colons — require brackets.
     if (std.mem.count(u8, address, ":") > 1) return error.InvalidAddress;
 
-    const colon = std.mem.lastIndexOfScalar(u8, address, ':') orelse {
+    const colon = std.mem.findScalarLast(u8, address, ':') orelse {
         return .{ .host = address, .port = default_port };
     };
     if (colon == 0 or colon + 1 >= address.len) return error.InvalidAddress;
@@ -155,7 +155,7 @@ pub const PROBE_HTTP_STEADY =
 /// (no `Content-Length` / `Transfer-Encoding: chunked`). Peer close then ends the response.
 /// Truncated CL/chunked bodies must not be treated as ready on peer close alone.
 pub fn httpCloseDelimitedReady(buf: []const u8) bool {
-    const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return false;
+    const sep = std.mem.find(u8, buf, "\r\n\r\n") orelse return false;
     const headers = buf[0..sep];
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
     const status = lines.next() orelse return false;
@@ -163,7 +163,7 @@ pub fn httpCloseDelimitedReady(buf: []const u8) bool {
     while (lines.next()) |line| {
         if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
             const v = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
-            if (std.ascii.indexOfIgnoreCase(v, "chunked") != null) return false;
+            if (std.ascii.findIgnoreCase(v, "chunked") != null) return false;
         } else if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
             return false;
         }
@@ -176,7 +176,7 @@ pub fn httpCloseDelimitedReady(buf: []const u8) bool {
 /// when neither is present (RFC 7230 §3.3.3). HTTP/1.0 without framing stays
 /// incomplete until the peer closes (see warmup loops + `httpCloseDelimitedReady`).
 pub fn httpResponseTotalLen(buf: []const u8) ?usize {
-    const sep = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
+    const sep = std.mem.find(u8, buf, "\r\n\r\n") orelse return null;
     const headers = buf[0..sep];
     const body_start = sep + 4;
 
@@ -187,7 +187,7 @@ pub fn httpResponseTotalLen(buf: []const u8) ?usize {
     while (lines.next()) |line| {
         if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
             const v = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
-            if (std.ascii.indexOfIgnoreCase(v, "chunked") != null) chunked = true;
+            if (std.ascii.findIgnoreCase(v, "chunked") != null) chunked = true;
         } else if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
             const v = std.mem.trim(u8, line["content-length:".len..], " \t");
             content_len = std.fmt.parseInt(usize, v, 10) catch return null;
@@ -213,9 +213,9 @@ pub fn httpResponseTotalLen(buf: []const u8) ?usize {
 fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?usize {
     var pos = body_start;
     while (true) {
-        const line_end = std.mem.indexOfPos(u8, buf, pos, "\r\n") orelse return null;
+        const line_end = std.mem.findPos(u8, buf, pos, "\r\n") orelse return null;
         const size_line = buf[pos..line_end];
-        const size_tok = if (std.mem.indexOfScalar(u8, size_line, ';')) |sc|
+        const size_tok = if (std.mem.findScalar(u8, size_line, ';')) |sc|
             size_line[0..sc]
         else
             size_line;
@@ -228,7 +228,7 @@ fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?usize {
             // reported length runs past the end of this response.
             if (pos + 2 <= buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') return pos + 2;
             // Optional trailers, then terminating CRLF.
-            if (std.mem.indexOfPos(u8, buf, pos, "\r\n\r\n")) |end| return end + 4;
+            if (std.mem.findPos(u8, buf, pos, "\r\n\r\n")) |end| return end + 4;
             return null;
         }
         // Same reason as `Content-Length` above: `size` is peer-controlled, so the
@@ -246,10 +246,10 @@ fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?usize {
 /// Rejects generic HTTP 400/empty pages from REALITY dest fallback and stale
 /// warmup copies (wrong UA).
 pub fn looksLikeCloudflareTraceUag(buf: []const u8, uag: []const u8) bool {
-    if (std.mem.indexOf(u8, buf, "visit_scheme=") == null) return false;
+    if (std.mem.find(u8, buf, "visit_scheme=") == null) return false;
     var needle_buf: [64]u8 = undefined;
-    const needle = std.fmt.bufPrint(&needle_buf, "uag={s}", .{uag}) catch return false;
-    return std.mem.indexOf(u8, buf, needle) != null;
+    const needle = std.mem.print(&needle_buf, "uag={s}", .{uag}) catch return false;
+    return std.mem.find(u8, buf, needle) != null;
 }
 
 /// True when the peer closed the tunnel (warmup may complete via close-delimited HTTP/1.0).
@@ -280,7 +280,7 @@ pub fn writeSocksAddrDomain(buf: []u8, domain: []const u8, port: u16) error{ Buf
 
 test "writeSocksAddrDomain rejects domain longer than 255" {
     var buf: [512]u8 = undefined;
-    const long = [_]u8{'a'} ** 256;
+    const long: [256]u8 = @splat('a');
     try std.testing.expectError(error.DomainTooLong, writeSocksAddrDomain(&buf, &long, 80));
 }
 
