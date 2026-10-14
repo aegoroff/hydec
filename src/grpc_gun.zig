@@ -99,19 +99,35 @@ fn writeFrameHeader(out: []u8, length: u24, typ: u8, flags: u8, stream_id: u31) 
     std.mem.writeInt(u32, out[5..9], stream_id, .big);
 }
 
+/// RFC 7541 §5.1 string length: 7-bit prefix, H bit clear (no Huffman). Lengths of 127
+/// and up spill into a continuation byte. Caller guarantees `len` <= 255.
+fn writeStringLen(out: []u8, len: usize) usize {
+    if (len < 127) {
+        out[0] = @intCast(len);
+        return 1;
+    }
+    out[0] = 127;
+    const rest = len - 127;
+    if (rest < 128) {
+        out[1] = @intCast(rest);
+        return 2;
+    }
+    out[1] = @intCast((rest & 0x7f) | 0x80);
+    out[2] = @intCast(rest >> 7);
+    return 3;
+}
+
 fn writeLiteralHeader(out: []u8, name: []const u8, value: []const u8) error{ BufferTooSmall, HeaderFieldTooLong }!usize {
-    // Single-byte HPACK string lengths (no 0x7f extended form).
     if (name.len > 255 or value.len > 255) return error.HeaderFieldTooLong;
-    if (out.len < 1 + 1 + name.len + 1 + value.len) return error.BufferTooSmall;
+    // Worst case: 1 representation byte + 2 length bytes per string.
+    if (out.len < 1 + 2 + name.len + 2 + value.len) return error.BufferTooSmall;
     var i: usize = 0;
     out[i] = 0x00;
     i += 1;
-    out[i] = @intCast(name.len);
-    i += 1;
+    i += writeStringLen(out[i..], name.len);
     @memcpy(out[i..][0..name.len], name);
     i += name.len;
-    out[i] = @intCast(value.len);
-    i += 1;
+    i += writeStringLen(out[i..], value.len);
     @memcpy(out[i..][0..value.len], value);
     i += value.len;
     return i;
@@ -411,6 +427,25 @@ pub fn formatAuthority(buf: []u8, sni: []const u8, port: u16, explicit: []const 
 pub fn vlessFromGrpcData(payload: []const u8) ![]const u8 {
     const grpc_payload = try unwrapGrpc(payload);
     return unwrapHunk(grpc_payload) catch grpc_payload;
+}
+
+test "writeLiteralHeader encodes string lengths as HPACK integers" {
+    var buf: [1024]u8 = undefined;
+    for ([_]usize{ 0, 1, 126, 127, 128, 200, 255 }) |len| {
+        const value_arr: [255]u8 = @splat('v');
+        const value = value_arr[0..len];
+        const n = try writeLiteralHeader(&buf, "x", value);
+
+        // Decode with the reader the status parser uses: it must land exactly on the end.
+        var p: []const u8 = buf[0..n];
+        try std.testing.expectEqual(@as(u8, 0x00), p[0]);
+        p = p[1..];
+        try std.testing.expectEqual(@as(usize, 1), try hpackReadInt(&p, 7));
+        p = p[1..]; // name "x"
+        try std.testing.expect((p[0] & 0x80) == 0); // not Huffman
+        try std.testing.expectEqual(len, try hpackReadInt(&p, 7));
+        try std.testing.expectEqual(len, p.len);
+    }
 }
 
 test "writeLiteralHeader rejects fields longer than 255" {
