@@ -8,7 +8,10 @@ const reality = @import("reality.zig");
 const Io = std.Io;
 
 const Result = struct {
+    /// Median latency, for the `Best:` line.
     latency_ms: u64,
+    /// What `considerBest` / `selectBestClass` compare (see `Rank.of`).
+    rank: Rank,
     raw: []const u8,
     /// Owned copy of the host; free with `deinit`.
     host: []u8,
@@ -74,6 +77,7 @@ const Shared = struct {
     gpa: std.mem.Allocator,
     io: Io,
     verbose: bool,
+    prefer_stable: bool,
     timeout_secs: u32,
     /// Optional interface/source-IP spec forwarded to `connectHostPort` (`null` = default).
     bind: ?[]const u8,
@@ -201,11 +205,14 @@ pub fn probeOne(
 /// How many failed attempts per candidate may be retried, and only when `isTransient`.
 pub const TRANSIENT_RETRIES: usize = 1;
 
-/// Summary of one candidate's samples. `median_ms` ranks; min/max are for `-v` output.
+/// Summary of one candidate's samples. `median_ms` ranks by default; `--prefer-stable`
+/// ranks by `retries`, then `max_ms` (see `Rank.of`).
 pub const Latency = struct {
     median_ms: u64,
     min_ms: u64,
     max_ms: u64,
+    /// Transient failures retried while collecting the samples.
+    retries: usize = 0,
 
     /// `samples` must be non-empty; sorts it in place. Upper median for an even count,
     /// so a single latency spike among three samples does not move the result.
@@ -239,8 +246,8 @@ pub fn isTransient(err: anyerror) bool {
 }
 
 /// Fill `samples` from `prober.probe()`; fail on the first non-transient error or once
-/// `TRANSIENT_RETRIES` is used up.
-fn collectSamples(prober: anytype, samples: []u64) !void {
+/// `TRANSIENT_RETRIES` is used up. Returns how many retries were spent.
+fn collectSamples(prober: anytype, samples: []u64) !usize {
     var retries_left = TRANSIENT_RETRIES;
     for (samples) |*slot| {
         slot.* = while (true) {
@@ -252,6 +259,7 @@ fn collectSamples(prober: anytype, samples: []u64) !void {
             };
         };
     }
+    return TRANSIENT_RETRIES - retries_left;
 }
 
 /// Run `PROBE_ATTEMPTS` full probes (one retry on a transient error).
@@ -275,8 +283,45 @@ pub fn probeLatency(
         }
     };
     var samples: [PROBE_ATTEMPTS]u64 = undefined;
-    try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind }, &samples);
-    return Latency.fromSamples(&samples);
+    const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind }, &samples);
+    var latency = Latency.fromSamples(&samples);
+    latency.retries = retries;
+    return latency;
+}
+
+/// Ranking key for one candidate: lower is better, `retried` first, then `ms`.
+pub const Rank = struct {
+    /// Only set with `--prefer-stable`: a candidate that needed a retry loses to
+    /// every candidate that did not, in any class.
+    retried: bool,
+    ms: u64,
+
+    /// Default: median latency. `--prefer-stable`: the worst sample, so a single
+    /// spike counts against the candidate instead of being hidden by the median.
+    pub fn of(latency: Latency, prefer_stable: bool) Rank {
+        if (!prefer_stable) return .{ .retried = false, .ms = latency.median_ms };
+        return .{ .retried = latency.retries > 0, .ms = latency.max_ms };
+    }
+
+    pub fn lessThan(a: Rank, b: Rank) bool {
+        if (a.retried != b.retried) return !a.retried;
+        return a.ms < b.ms;
+    }
+};
+
+/// `selectBestClass` over per-class bests. Classes whose best needed a retry only
+/// compete when no class has a clean best.
+fn selectBestRanked(strategy: Strategy, best: std.EnumArray(PrefClass, ?Rank)) ?PrefClass {
+    for ([_]bool{ false, true }) |allow_retried| {
+        var ms: std.EnumArray(PrefClass, ?u64) = .initFill(null);
+        for (std.enums.values(PrefClass)) |class| {
+            const r = best.get(class) orelse continue;
+            if (r.retried and !allow_retried) continue;
+            ms.set(class, r.ms);
+        }
+        if (selectBestClass(strategy, ms.get(.vless2), ms.get(.vless3), ms.get(.shadowsocks), ms.get(.trojan))) |class| return class;
+    }
+    return null;
 }
 
 /// Pick the winning preference class from per-class fastest latencies.
@@ -395,7 +440,8 @@ fn selectStrictClass(
     return null;
 }
 
-fn considerBest(shared: *Shared, class: PrefClass, latency: u64, raw: []const u8, host: []const u8) void {
+fn considerBest(shared: *Shared, class: PrefClass, latency: Latency, raw: []const u8, host: []const u8) void {
+    const rank = Rank.of(latency, shared.prefer_stable);
     // Dupe outside the lock so host workers do not serialize on allocation.
     const host_copy = shared.gpa.dupe(u8, host) catch {
         shared.lock();
@@ -407,7 +453,7 @@ fn considerBest(shared: *Shared, class: PrefClass, latency: u64, raw: []const u8
     shared.lock();
     const slot = shared.best.getPtr(class);
     if (slot.*) |cur| {
-        if (latency >= cur.latency_ms) {
+        if (!rank.lessThan(cur.rank)) {
             shared.unlock();
             shared.gpa.free(host_copy);
             return;
@@ -416,13 +462,23 @@ fn considerBest(shared: *Shared, class: PrefClass, latency: u64, raw: []const u8
     // Own a copy: proxy.deinit may free legacy-SS hosts before the caller reads Result.
     const prev_host: ?[]u8 = if (slot.*) |old| old.host else null;
     slot.* = .{
-        .latency_ms = latency,
+        .latency_ms = latency.median_ms,
+        .rank = rank,
         .raw = raw,
         .host = host_copy,
     };
     shared.unlock();
     if (prev_host) |h| shared.gpa.free(h);
 }
+
+/// `", retry N"` when a transient failure was retried, otherwise nothing.
+pub const RetrySuffix = struct {
+    retries: usize,
+
+    pub fn format(self: RetrySuffix, w: *Io.Writer) Io.Writer.Error!void {
+        if (self.retries > 0) try w.print(", retry {d}", .{self.retries});
+    }
+};
 
 /// `" — name"` when the proxy is named, otherwise nothing.
 pub const NameSuffix = struct {
@@ -589,11 +645,11 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
         }
 
         if (shared.verbose) {
-            std.log.info("OK: {d}ms (min {d}, max {d}) {s}{f}", .{ latency.median_ms, latency.min_ms, latency.max_ms, proxy.host, NameSuffix{ .name = proxy.name } });
+            std.log.info("OK: {d}ms (min {d}, max {d}{f}) {s}{f}", .{ latency.median_ms, latency.min_ms, latency.max_ms, RetrySuffix{ .retries = latency.retries }, proxy.host, NameSuffix{ .name = proxy.name } });
         }
 
         const class = PrefClass.fromProxy(proxy) orelse continue;
-        considerBest(shared, class, latency.median_ms, item.raw, proxy.host);
+        considerBest(shared, class, latency, item.raw, proxy.host);
     }
 }
 
@@ -684,6 +740,7 @@ pub fn findBest(
     timeout_secs: u32,
     bind: ?[]const u8,
     strategy: Strategy,
+    prefer_stable: bool,
     stats: *Stats,
 ) !?Result {
     var groups = try collectGroups(gpa, lines, stats, verbose);
@@ -695,6 +752,7 @@ pub fn findBest(
         .gpa = gpa,
         .io = io,
         .verbose = verbose,
+        .prefer_stable = prefer_stable,
         .timeout_secs = timeout_secs,
         .bind = bind,
         .stats = stats,
@@ -721,13 +779,11 @@ pub fn findBest(
         next += batch;
     }
 
-    const chosen = selectBestClass(
-        strategy,
-        if (shared.best.get(.vless2)) |r| r.latency_ms else null,
-        if (shared.best.get(.vless3)) |r| r.latency_ms else null,
-        if (shared.best.get(.shadowsocks)) |r| r.latency_ms else null,
-        if (shared.best.get(.trojan)) |r| r.latency_ms else null,
-    );
+    var ranks: std.EnumArray(PrefClass, ?Rank) = .initFill(null);
+    for (std.enums.values(PrefClass)) |class| {
+        if (shared.best.get(class)) |r| ranks.set(class, r.rank);
+    }
+    const chosen = selectBestRanked(strategy, ranks);
 
     if (chosen == null) {
         shared.deinitBests();
@@ -800,11 +856,60 @@ test "collectSamples retries one transient error" {
     var samples: [PROBE_ATTEMPTS]u64 = undefined;
 
     // Act
-    try collectSamples(FakeProber{ .script = &script, .calls = &calls }, &samples);
+    const retries = try collectSamples(FakeProber{ .script = &script, .calls = &calls }, &samples);
 
     // Assert
+    try std.testing.expectEqual(@as(usize, 1), retries);
     try std.testing.expectEqual(@as(usize, 4), calls);
     try std.testing.expectEqualSlices(u64, &.{ 10, 20, 30 }, &samples);
+}
+
+test "collectSamples reports no retries on a clean run" {
+    var calls: usize = 0;
+    const script = [_]anyerror!u64{ 10, 20, 30 };
+    var samples: [PROBE_ATTEMPTS]u64 = undefined;
+
+    try std.testing.expectEqual(@as(usize, 0), try collectSamples(FakeProber{ .script = &script, .calls = &calls }, &samples));
+}
+
+test "Rank.of: median by default, worst sample with --prefer-stable" {
+    // Arrange
+    const spiky: Latency = .{ .median_ms = 42, .min_ms = 40, .max_ms = 300 };
+    const steady: Latency = .{ .median_ms = 46, .min_ms = 45, .max_ms = 47 };
+
+    // Act / Assert
+    try std.testing.expect(Rank.of(spiky, false).lessThan(Rank.of(steady, false)));
+    try std.testing.expect(Rank.of(steady, true).lessThan(Rank.of(spiky, true)));
+}
+
+test "Rank.of: a retried candidate loses to any clean one only with --prefer-stable" {
+    const retried: Latency = .{ .median_ms = 20, .min_ms = 20, .max_ms = 20, .retries = 1 };
+    const clean: Latency = .{ .median_ms = 200, .min_ms = 200, .max_ms = 200 };
+
+    try std.testing.expect(Rank.of(clean, true).lessThan(Rank.of(retried, true)));
+    try std.testing.expect(Rank.of(retried, false).lessThan(Rank.of(clean, false)));
+    // Among retried candidates the worst sample still decides.
+    const retried_slow: Latency = .{ .median_ms = 30, .min_ms = 30, .max_ms = 30, .retries = 1 };
+    try std.testing.expect(Rank.of(retried, true).lessThan(Rank.of(retried_slow, true)));
+}
+
+test "selectBestRanked: retried classes compete only when nothing is clean" {
+    var ranks: std.EnumArray(PrefClass, ?Rank) = .initFill(null);
+    ranks.set(.vless2, .{ .retried = true, .ms = 50 });
+    ranks.set(.shadowsocks, .{ .retried = false, .ms = 100 });
+    // A clean SS beats a faster, retried VLESS² (hydec would otherwise keep VLESS²).
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestRanked(.hydec, ranks));
+
+    ranks.set(.shadowsocks, .{ .retried = true, .ms = 100 });
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestRanked(.hydec, ranks));
+
+    try std.testing.expectEqual(@as(?PrefClass, null), selectBestRanked(.hydec, .initFill(null)));
+}
+
+test "RetrySuffix renders only when a retry happened" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(", retry 1", try std.mem.print(&buf, "{f}", .{RetrySuffix{ .retries = 1 }}));
+    try std.testing.expectEqualStrings("", try std.mem.print(&buf, "{f}", .{RetrySuffix{ .retries = 0 }}));
 }
 
 test "collectSamples fails on a second transient error" {

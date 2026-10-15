@@ -19,6 +19,8 @@ pub const Options = struct {
     interface: ?[]u8,
     /// Ranking policy for `best`; ignored by `ping`.
     strategy: probe.Strategy,
+    /// `best --prefer-stable`: rank by worst sample, retried candidates last.
+    prefer_stable: bool,
 };
 
 const Capture = struct {
@@ -65,6 +67,7 @@ fn onBest(ctx: *zig_cli.BaseCommand.ParseContext) !void {
         .verbose = ctx.hasOption("verbose"),
         .interface = interface,
         .strategy = strategy,
+        .prefer_stable = ctx.hasOption("prefer-stable"),
     };
 }
 
@@ -86,6 +89,7 @@ fn onPing(ctx: *zig_cli.BaseCommand.ParseContext) !void {
         .verbose = false,
         .interface = interface,
         .strategy = .hydec,
+        .prefer_stable = false,
     };
 }
 
@@ -235,6 +239,14 @@ fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseComm
                 "strategy",
                 "Ranking strategy: hydec (default), fastest, strict",
                 .string,
+            ),
+        );
+        _ = try best.addOption(
+            zig_cli.Option.init(
+                "prefer-stable",
+                "prefer-stable",
+                "Rank by the worst of the probes instead of the median; candidates that needed a retry rank last",
+                .bool,
             ),
         );
         _ = best.setAction(onBest);
