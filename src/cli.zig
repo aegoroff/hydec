@@ -21,6 +21,8 @@ pub const Options = struct {
     strategy: probe.Strategy,
     /// `best --prefer-stable`: rank by worst sample, retried candidates last.
     prefer_stable: bool,
+    /// `--check-volume`: also require a `util.VOLUME_BYTES` download through the tunnel.
+    check_volume: bool,
 };
 
 const Capture = struct {
@@ -68,6 +70,7 @@ fn onBest(ctx: *zig_cli.BaseCommand.ParseContext) !void {
         .interface = interface,
         .strategy = strategy,
         .prefer_stable = ctx.hasOption("prefer-stable"),
+        .check_volume = ctx.hasOption("check-volume"),
     };
 }
 
@@ -90,6 +93,7 @@ fn onPing(ctx: *zig_cli.BaseCommand.ParseContext) !void {
         .interface = interface,
         .strategy = .hydec,
         .prefer_stable = false,
+        .check_volume = ctx.hasOption("check-volume"),
     };
 }
 
@@ -197,6 +201,17 @@ fn addInterfaceOption(cmd: *zig_cli.BaseCommand) !*zig_cli.BaseCommand {
     );
 }
 
+fn addCheckVolumeOption(cmd: *zig_cli.BaseCommand) !*zig_cli.BaseCommand {
+    return cmd.addOption(
+        zig_cli.Option.init(
+            "check-volume",
+            "check-volume",
+            "After the latency probes, download 40 KB through the tunnel once; a stall fails the proxy (DPI freezes past ~16 KB)",
+            .bool,
+        ),
+    );
+}
+
 fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseCommand {
     const root = try zig_cli.BaseCommand.init(gpa, "hydec", description);
     errdefer {
@@ -241,6 +256,7 @@ fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseComm
                 .string,
             ),
         );
+        _ = try addCheckVolumeOption(best);
         _ = try best.addOption(
             zig_cli.Option.init(
                 "prefer-stable",
@@ -266,6 +282,7 @@ fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseComm
         );
         _ = try addTimeoutOption(ping);
         _ = try addInterfaceOption(ping);
+        _ = try addCheckVolumeOption(ping);
         _ = ping.setAction(onPing);
         _ = try root.addCommand(ping);
         owned = false;

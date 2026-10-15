@@ -78,6 +78,7 @@ const Shared = struct {
     io: Io,
     verbose: bool,
     prefer_stable: bool,
+    check_volume: bool,
     timeout_secs: u32,
     /// Optional interface/source-IP spec forwarded to `connectHostPort` (`null` = default).
     bind: ?[]const u8,
@@ -111,6 +112,7 @@ pub fn probeOne(
     gpa: std.mem.Allocator,
     io: Io,
     proxy: proxy_uri.Proxy,
+    target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
 ) !u64 {
@@ -118,7 +120,7 @@ pub fn probeOne(
         .shadowsocks => blk: {
             const method = proxy.method orelse return error.InvalidProxyUri;
             const password = proxy.password orelse return error.InvalidProxyUri;
-            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, timeout_secs, bind);
+            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind);
         },
         .trojan => blk: {
             const sni_owned = try proxy.getParamDecoded(gpa, "sni");
@@ -145,7 +147,7 @@ pub fn probeOne(
                 .ws_host = host_hdr,
                 .alpn = alpn_list,
                 .allow_insecure = allow_insecure,
-            }, timeout_secs, bind);
+            }, target, timeout_secs, bind);
         },
         .vless => blk: {
             if (proxy.security != .reality) return error.UnsupportedSecurity;
@@ -193,6 +195,7 @@ pub fn probeOne(
                 use_grpc,
                 service,
                 authority,
+                target,
                 timeout_secs,
                 bind,
             );
@@ -263,6 +266,7 @@ fn collectSamples(prober: anytype, samples: []u64) !usize {
 }
 
 /// Run `PROBE_ATTEMPTS` full probes (one retry on a transient error).
+/// With `check_volume`, then one untimed `util.VOLUME_TARGET` download (see `checkVolume`).
 /// On success returns the median latency and the sample spread.
 pub fn probeLatency(
     gpa: std.mem.Allocator,
@@ -270,6 +274,7 @@ pub fn probeLatency(
     proxy: proxy_uri.Proxy,
     timeout_secs: u32,
     bind: ?[]const u8,
+    check_volume: bool,
 ) !Latency {
     const Prober = struct {
         gpa: std.mem.Allocator,
@@ -279,14 +284,33 @@ pub fn probeLatency(
         bind: ?[]const u8,
 
         fn probe(self: @This()) !u64 {
-            return probeOne(self.gpa, self.io, self.proxy, self.timeout_secs, self.bind);
+            return probeOne(self.gpa, self.io, self.proxy, util.LATENCY_TARGET, self.timeout_secs, self.bind);
         }
     };
     var samples: [PROBE_ATTEMPTS]u64 = undefined;
     const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind }, &samples);
     var latency = Latency.fromSamples(&samples);
     latency.retries = retries;
+    if (check_volume) {
+        _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind) catch |err| switch (err) {
+            // Cloudflare said no; the node carried the warmup, so do not fail it.
+            error.VolumeRefused => std.log.warn("volume check skipped for {s}:{d}: download refused", .{ proxy.host, proxy.port }),
+            else => return volumeError(err),
+        };
+    }
     return latency;
+}
+
+/// The volume download runs once and is never retried: a DPI freeze past the first
+/// ~16–20 KB repeats on every attempt, and a retry would only double its cost.
+/// A timeout there is that freeze, so it gets its own name; other errors pass through.
+/// A connect timeout counts too: this candidate already connected, so it must not
+/// feed `DeadHost`.
+fn volumeError(err: anyerror) anyerror {
+    return switch (err) {
+        error.Timeout, error.ConnectTimeout => error.VolumeStalled,
+        else => err,
+    };
 }
 
 /// Ranking key for one candidate: lower is better, `retried` first, then `ms`.
@@ -506,6 +530,7 @@ pub const HostIdent = struct {
 /// Short hint for FAIL logs (why the probe likely failed).
 pub fn failHint(err: anyerror) []const u8 {
     return switch (err) {
+        error.VolumeStalled => "volume/stalled",
         error.Timeout, error.ConnectTimeout, error.ConnectionTimedOut => "slow/timeout",
         error.ConnectionResetByPeer,
         error.EndOfStream,
@@ -626,7 +651,7 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
         }
 
         // Three probes (one transient retry); ranking uses their median.
-        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind) catch |err| {
+        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, shared.check_volume) catch |err| {
             if (shared.verbose) {
                 std.log.warn("FAIL: {f}: {s} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, failHint(err), err });
             }
@@ -741,6 +766,7 @@ pub fn findBest(
     bind: ?[]const u8,
     strategy: Strategy,
     prefer_stable: bool,
+    check_volume: bool,
     stats: *Stats,
 ) !?Result {
     var groups = try collectGroups(gpa, lines, stats, verbose);
@@ -753,6 +779,7 @@ pub fn findBest(
         .io = io,
         .verbose = verbose,
         .prefer_stable = prefer_stable,
+        .check_volume = check_volume,
         .timeout_secs = timeout_secs,
         .bind = bind,
         .stats = stats,
@@ -1160,6 +1187,18 @@ test "failHint covers every Io.net.IpAddress.BindError member" {
             return err;
         };
     }
+}
+
+test "volumeError names a stalled download and keeps other errors" {
+    try std.testing.expectEqual(error.VolumeStalled, volumeError(error.Timeout));
+    try std.testing.expectEqual(error.VolumeStalled, volumeError(error.ConnectTimeout));
+    try std.testing.expectEqual(error.ProbeResponseMismatch, volumeError(error.ProbeResponseMismatch));
+    try std.testing.expectEqualStrings("volume/stalled", failHint(error.VolumeStalled));
+    // Connected and then stalled: the host is alive, other entries on it still run.
+    var host: DeadHost = .{};
+    try std.testing.expect(!host.record(443, error.VolumeStalled));
+    try std.testing.expect(!host.record(2058, error.ConnectTimeout));
+    try std.testing.expect(!host.record(8443, error.ConnectTimeout));
 }
 
 test "failHint names the ALPN failures" {

@@ -143,13 +143,78 @@ pub const PROBE_TLS_PORT: u16 = 443;
 pub const PROBE_UA_WARMUP = "hydec-warmup";
 pub const PROBE_UA_STEADY = "hydec-steady";
 
-/// Keep-alive so the tunnel stays open for a second (steady-state) request.
-pub const PROBE_HTTP =
-    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ PROBE_DOMAIN ++ "\r\nUser-Agent: " ++ PROBE_UA_WARMUP ++ "\r\nConnection: keep-alive\r\n\r\n";
+/// Keep-alive so the tunnel stays open for the next request on it.
+fn traceRequest(comptime domain: []const u8, comptime uag: []const u8) []const u8 {
+    return "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ domain ++ "\r\nUser-Agent: " ++ uag ++ "\r\nConnection: keep-alive\r\n\r\n";
+}
+
+pub const PROBE_HTTP = traceRequest(PROBE_DOMAIN, PROBE_UA_WARMUP);
 
 /// Second (steady-state) request — distinct UA from `PROBE_HTTP`.
-pub const PROBE_HTTP_STEADY =
-    "GET /cdn-cgi/trace HTTP/1.1\r\nHost: " ++ PROBE_DOMAIN ++ "\r\nUser-Agent: " ++ PROBE_UA_STEADY ++ "\r\nConnection: keep-alive\r\n\r\n";
+pub const PROBE_HTTP_STEADY = traceRequest(PROBE_DOMAIN, PROBE_UA_STEADY);
+
+/// Domain that serves both `/cdn-cgi/trace` and a sized download (`--check-volume`).
+/// `cp.cloudflare.com` answers `/__down` with 204, and Host-overriding it gets 403.
+pub const VOLUME_DOMAIN = "speed.cloudflare.com";
+/// Past the ~16–20 KB after which TSPU-style DPI freezes a foreign TLS session.
+pub const VOLUME_BYTES: usize = 40000;
+
+/// Room for one probe response, including the `VOLUME_BYTES` download and its headers.
+pub const PROBE_HTTP_BUF_LEN: usize = 48 * 1024;
+
+/// What a reply must look like to count.
+pub const ProbeReply = union(enum) {
+    /// Cloudflare `/cdn-cgi/trace` echoing this UA (see `looksLikeCloudflareTraceUag`).
+    trace: []const u8,
+    /// `200` with exactly this many body bytes.
+    download: usize,
+
+    /// `resp` is one complete response (`httpResponseTotalLen`, or close-delimited).
+    /// `VolumeRefused`: the download got a well-formed non-200 (Cloudflare rate limit
+    /// or block). The warmup trace already crossed the tunnel, so that is not the node.
+    pub fn check(self: ProbeReply, resp: []const u8) error{ ProbeResponseMismatch, VolumeRefused }!void {
+        switch (self) {
+            .trace => |uag| if (!looksLikeCloudflareTraceUag(resp, uag)) return error.ProbeResponseMismatch,
+            .download => |bytes| {
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.")) return error.ProbeResponseMismatch;
+                if (!std.mem.startsWith(u8, resp["HTTP/1.".len..], "1 200 ") and
+                    !std.mem.startsWith(u8, resp["HTTP/1.".len..], "0 200 ")) return error.VolumeRefused;
+                if (!downloadComplete(resp, bytes)) return error.ProbeResponseMismatch;
+            },
+        }
+    }
+};
+
+/// Where the tunnel goes and which two requests it carries (warmup, then steady).
+pub const Target = struct {
+    domain: []const u8,
+    warmup: []const u8,
+    steady: []const u8,
+    steady_reply: ProbeReply,
+};
+
+/// Default probe: two small trace requests, timed.
+pub const LATENCY_TARGET: Target = .{
+    .domain = PROBE_DOMAIN,
+    .warmup = PROBE_HTTP,
+    .steady = PROBE_HTTP_STEADY,
+    .steady_reply = .{ .trace = PROBE_UA_STEADY },
+};
+
+/// `--check-volume`: same warmup, then a `VOLUME_BYTES` download on the same tunnel.
+pub const VOLUME_TARGET: Target = .{
+    .domain = VOLUME_DOMAIN,
+    .warmup = traceRequest(VOLUME_DOMAIN, PROBE_UA_WARMUP),
+    .steady = std.fmt.comptimePrint("GET /__down?bytes={d} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: {s}\r\nConnection: keep-alive\r\n\r\n", .{ VOLUME_BYTES, VOLUME_DOMAIN, PROBE_UA_STEADY }),
+    .steady_reply = .{ .download = VOLUME_BYTES },
+};
+
+/// Response whose body is exactly `bytes` long (status checked by the caller).
+fn downloadComplete(resp: []const u8, bytes: usize) bool {
+    const sep = std.mem.find(u8, resp, "\r\n\r\n") orelse return false;
+    const total = httpResponseTotalLen(resp) orelse return false;
+    return total - (sep + 4) == bytes;
+}
 
 /// True when headers are complete and the body is HTTP/1.0 close-delimited
 /// (no `Content-Length` / `Transfer-Encoding: chunked`). Peer close then ends the response.
@@ -292,6 +357,29 @@ test "looksLikeCloudflareTraceUag matches echoed UA" {
     // Not a Cloudflare trace body (no visit_scheme=).
     try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 400 Bad Request\r\n\r\n", PROBE_UA_STEADY));
     try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", PROBE_UA_STEADY));
+}
+
+test "ProbeReply.download needs a 200 with the exact body length" {
+    const reply: ProbeReply = .{ .download = 3 };
+    try reply.check("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc");
+    try std.testing.expectError(error.ProbeResponseMismatch, ProbeReply.check(.{ .download = 4 }, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc"));
+    // Body still arriving: not a match yet.
+    try std.testing.expectError(error.ProbeResponseMismatch, reply.check("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab"));
+    try std.testing.expectError(error.ProbeResponseMismatch, reply.check("garbage"));
+}
+
+test "ProbeReply.download tells a Cloudflare refusal from a broken node" {
+    const reply: ProbeReply = .{ .download = 3 };
+    try std.testing.expectError(error.VolumeRefused, reply.check("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n"));
+    try std.testing.expectError(error.VolumeRefused, reply.check("HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n\r\nabc"));
+    // The trace check is unchanged: any mismatch is the node's fault.
+    try std.testing.expectError(error.ProbeResponseMismatch, ProbeReply.check(.{ .trace = PROBE_UA_STEADY }, "HTTP/1.1 429 Too Many Requests\r\n\r\n"));
+}
+
+test "VOLUME_TARGET fits the probe buffer and asks for VOLUME_BYTES" {
+    try std.testing.expect(VOLUME_BYTES + 2048 <= PROBE_HTTP_BUF_LEN);
+    try std.testing.expect(std.mem.find(u8, VOLUME_TARGET.steady, "/__down?bytes=40000 ") != null);
+    try std.testing.expect(std.mem.find(u8, VOLUME_TARGET.warmup, "Host: speed.cloudflare.com\r\n") != null);
 }
 
 test "urlDecodeStrict keeps plus" {

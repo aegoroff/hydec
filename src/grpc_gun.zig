@@ -9,8 +9,9 @@ pub fn wrapGrpc(out: []u8, message: []const u8) error{BufferTooSmall}!usize {
     return 5 + message.len;
 }
 
-/// Cap for one gun-lite message (probe CF traces are tiny; rejects hostile length prefixes).
-pub const MAX_GRPC_MESSAGE_LEN: u32 = 16384;
+/// Cap for one gun-lite message: room for a `--check-volume` download sent as one
+/// message, while still rejecting hostile length prefixes.
+pub const MAX_GRPC_MESSAGE_LEN: u32 = 64 * 1024;
 
 /// Length of the first complete gRPC frame in `buf`, or null if more DATA bytes are needed.
 pub fn completeGrpcFrameLen(buf: []const u8) error{InvalidGrpcFrame}!?usize {
@@ -472,8 +473,11 @@ test "completeGrpcFrameLen reassembles across splits" {
 }
 
 test "completeGrpcFrameLen rejects oversized length" {
-    const hdr = [_]u8{ 0, 0, 0, 0x40, 0x01 }; // body_len = 16385
+    const hdr = [_]u8{ 0, 0, 1, 0x00, 0x01 }; // body_len = 65537
     try std.testing.expectError(error.InvalidGrpcFrame, completeGrpcFrameLen(&hdr));
+    // A 40 KB download in one message is fine (`--check-volume`).
+    const big = [_]u8{ 0, 0, 0, 0x9c, 0x40 }; // body_len = 40000
+    try std.testing.expectEqual(@as(?usize, null), try completeGrpcFrameLen(&big));
 }
 
 test "preface starts correctly" {

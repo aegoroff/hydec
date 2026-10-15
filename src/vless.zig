@@ -71,13 +71,13 @@ pub fn responseHeaderLen(buf: []const u8) error{ NeedMore, InvalidVlessResponse 
     return total;
 }
 
-/// Encode a gRPC VLESS probe: CONNECT to probe host:80 + HTTP GET (no Vision framing).
+/// Encode a gRPC VLESS probe: CONNECT to `target`:80 + its warmup GET (no Vision framing).
 /// Vision TCP uses an inner HTTPS client instead (`probeVlessTcpHttps`).
-pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8) !usize {
+pub fn encodeProbeRequest(out: []u8, uuid_text: []const u8, target: util.Target) !usize {
     var uuid: [16]u8 = undefined;
     try parseUuid(uuid_text, &uuid);
-    var n = try encodeRequestDomain(out, &uuid, util.PROBE_DOMAIN, util.PROBE_HTTP_PORT, "");
-    const http = util.PROBE_HTTP;
+    var n = try encodeRequestDomain(out, &uuid, target.domain, util.PROBE_HTTP_PORT, "");
+    const http = target.warmup;
     if (out.len < n + http.len) return error.BufferTooSmall;
     @memcpy(out[n..][0..http.len], http);
     n += http.len;
@@ -217,10 +217,18 @@ test "appendVisionFrame rejects content longer than u16" {
 
 test "encodeProbeRequest is cleartext HTTP without Vision" {
     var buf: [512]u8 = undefined;
-    const n = try encodeProbeRequest(&buf, "00000000-1111-2222-3333-444444444444");
+    const n = try encodeProbeRequest(&buf, "00000000-1111-2222-3333-444444444444", util.LATENCY_TARGET);
     // No Vision UUID frame after the VLESS header — raw HTTP follows.
     try std.testing.expect(std.mem.find(u8, buf[0..n], util.PROBE_HTTP) != null);
     try std.testing.expect(std.mem.find(u8, buf[0..n], "xtls-rprx-vision") == null);
+}
+
+test "encodeProbeRequest tunnels the volume check to its own domain" {
+    var buf: [512]u8 = undefined;
+    const n = try encodeProbeRequest(&buf, "00000000-1111-2222-3333-444444444444", util.VOLUME_TARGET);
+    try std.testing.expect(std.mem.find(u8, buf[0..n], util.VOLUME_DOMAIN) != null);
+    try std.testing.expect(std.mem.find(u8, buf[0..n], util.PROBE_DOMAIN) == null);
+    try std.testing.expect(std.mem.endsWith(u8, buf[0..n], util.VOLUME_TARGET.warmup));
 }
 
 test "responseHeaderLen consumes only the header in front of a Vision UUID" {

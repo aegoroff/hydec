@@ -15,7 +15,7 @@ fn trojanHash(password: []const u8, out: *[56]u8) void {
 
 /// HTTP/1.1 on port 80 — remote replies immediately so the probe read unblocks.
 /// Targeting :443 without payload would hang (TLS server waits for ClientHello).
-fn buildRequest(password: []const u8, out: []u8) !usize {
+fn buildRequest(password: []const u8, target: util.Target, out: []u8) !usize {
     var hex: [56]u8 = undefined;
     trojanHash(password, &hex);
 
@@ -28,15 +28,15 @@ fn buildRequest(password: []const u8, out: []u8) !usize {
     i += 1;
     out[i] = 0x01; // CONNECT
     i += 1;
-    const n = try util.writeSocksAddrDomain(out[i..], util.PROBE_DOMAIN, util.PROBE_HTTP_PORT);
+    const n = try util.writeSocksAddrDomain(out[i..], target.domain, util.PROBE_HTTP_PORT);
     i += n;
     out[i] = '\r';
     i += 1;
     out[i] = '\n';
     i += 1;
-    if (out.len < i + util.PROBE_HTTP.len) return error.BufferTooSmall;
-    @memcpy(out[i..][0..util.PROBE_HTTP.len], util.PROBE_HTTP);
-    i += util.PROBE_HTTP.len;
+    if (out.len < i + target.warmup.len) return error.BufferTooSmall;
+    @memcpy(out[i..][0..target.warmup.len], target.warmup);
+    i += target.warmup.len;
     return i;
 }
 
@@ -186,6 +186,7 @@ pub fn probe(
     host: []const u8,
     port: u16,
     opts: Options,
+    target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
 ) !u64 {
@@ -196,7 +197,8 @@ pub fn probe(
     // answers "h2" then speaks HTTP/2 where the upgrade expects HTTP/1.1, so the
     // transport is dead for them even though a no-ALPN handshake would succeed.
     // Only h2 can break it, so an offer without h2 skips the extra round trip.
-    if (opts.transport_ws and alpn.offersH2(opts.alpn)) {
+    // The `--check-volume` attempt follows latency attempts that already ran it.
+    if (opts.transport_ws and alpn.offersH2(opts.alpn) and target.steady_reply != .download) {
         if (AlpnBudget.forTimeout(timeout_secs).negotiateSecs()) |alpn_secs| {
             var selected_buf: [64]u8 = undefined;
             // Only a confirmed h2 pick is evidence against the node. If the side connection
@@ -269,7 +271,7 @@ pub fn probe(
     }
 
     var req_buf: [256]u8 = undefined;
-    const req_len = try buildRequest(opts.password, &req_buf);
+    const req_len = try buildRequest(opts.password, target, &req_buf);
 
     if (opts.transport_ws) {
         ws.writeBinaryFrame(conn, io, req_buf[0..req_len]) catch |err| {
@@ -285,10 +287,11 @@ pub fn probe(
     }
 
     // Warmup: drain first HTTP response; require echoed warmup UA (same as gRPC/SS/Vision).
-    const http_buf = try gpa.alloc(u8, 16384);
+    const http_buf = try gpa.alloc(u8, util.PROBE_HTTP_BUF_LEN);
     defer gpa.free(http_buf);
     var http_len: usize = 0;
-    const frame_buf = try gpa.alloc(u8, 16384);
+    // A `--check-volume` download may come as one large WS frame.
+    const frame_buf = try gpa.alloc(u8, util.PROBE_HTTP_BUF_LEN);
     defer gpa.free(frame_buf);
     try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
     if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.PROBE_UA_WARMUP))
@@ -296,11 +299,11 @@ pub fn probe(
 
     // Steady-state: require a real keep-alive reply (same fail-closed policy as gRPC/Vision).
     if (opts.transport_ws) {
-        ws.writeBinaryFrame(conn, io, util.PROBE_HTTP_STEADY) catch |err| {
+        ws.writeBinaryFrame(conn, io, target.steady) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     } else {
-        tls_writer.writeAll(util.PROBE_HTTP_STEADY) catch |err| {
+        tls_writer.writeAll(target.steady) catch |err| {
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
         netutil.flushTls(tls_writer, &stream_writer.interface) catch |err| {
@@ -309,8 +312,7 @@ pub fn probe(
     }
     http_len = 0;
     try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
-    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.PROBE_UA_STEADY))
-        return error.ProbeResponseMismatch;
+    try target.steady_reply.check(http_buf[0..http_len]);
 
     return netutil.elapsedMs(attempt_start, io);
 }
@@ -351,7 +353,7 @@ test "trojanHash empty password" {
 
 test "buildRequest wire layout" {
     var buf: [256]u8 = undefined;
-    const n = try buildRequest("password", &buf);
+    const n = try buildRequest("password", util.LATENCY_TARGET, &buf);
     try std.testing.expectEqual(@as(usize, 82 + util.PROBE_HTTP.len), n);
 
     var want_hex: [56]u8 = undefined;
@@ -369,4 +371,12 @@ test "buildRequest wire layout" {
     try std.testing.expectEqual(@as(u8, '\r'), buf[80]);
     try std.testing.expectEqual(@as(u8, '\n'), buf[81]);
     try std.testing.expectEqualStrings(util.PROBE_HTTP, buf[82..n]);
+}
+
+test "buildRequest tunnels the volume check to its own domain" {
+    var buf: [256]u8 = undefined;
+    const n = try buildRequest("password", util.VOLUME_TARGET, &buf);
+    try std.testing.expectEqual(@as(u8, util.VOLUME_DOMAIN.len), buf[60]);
+    try std.testing.expectEqualStrings(util.VOLUME_DOMAIN, buf[61..][0..util.VOLUME_DOMAIN.len]);
+    try std.testing.expect(std.mem.endsWith(u8, buf[0..n], util.VOLUME_TARGET.warmup));
 }
