@@ -7,6 +7,7 @@ const fetch = @import("fetch.zig");
 const subscription = @import("subscription.zig");
 const proxy_uri = @import("proxy_uri.zig");
 const probe = @import("probe.zig");
+const util = @import("util.zig");
 const trojan = @import("trojan.zig");
 
 const utf8_console = if (builtin.target.os.tag == .windows)
@@ -150,8 +151,9 @@ fn runPing(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
         std.process.exit(2);
     }
 
-    const latency = probe.probeLatency(gpa, io, proxy, opts.timeout_secs, opts.interface, opts.check_volume) catch |err| {
-        std.log.warn("FAIL: {f}: {s} ({})", .{ probe.HostIdent{ .name = proxy.name, .host = proxy.host }, probe.failHint(err), err });
+    var stage: util.Stage = .setup;
+    const latency = probe.probeLatency(gpa, io, proxy, opts.timeout_secs, opts.interface, opts.check_volume, &stage) catch |err| {
+        std.log.warn("FAIL: {f}: {f} ({})", .{ probe.HostIdent{ .name = proxy.name, .host = proxy.host }, probe.FailReason{ .err = err, .stage = stage }, err });
         std.process.exit(1);
     };
 

@@ -193,6 +193,23 @@ pub const Target = struct {
     steady_reply: ProbeReply,
 };
 
+/// How far one probe attempt got before it failed. A reset or timeout in `handshake`
+/// (TCP up, first flight unanswered) is the DPI signature; in `reply` the tunnel
+/// itself was built.
+pub const Stage = enum {
+    /// URI decoding and side checks, before the dial.
+    setup,
+    /// TCP connect.
+    connect,
+    /// First flight sent, waiting for the peer: TLS / REALITY up to Finished, or the
+    /// SS server salt.
+    handshake,
+    /// Inside TLS: WS upgrade, HTTP/2 preface, Vision's inner TLS.
+    tunnel,
+    /// Test requests sent, reading the replies.
+    reply,
+};
+
 /// Default probe: two small trace requests, timed.
 pub const LATENCY_TARGET: Target = .{
     .domain = PROBE_DOMAIN,

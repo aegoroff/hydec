@@ -115,12 +115,14 @@ pub fn probeOne(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
+    stage: *util.Stage,
 ) !u64 {
+    stage.* = .setup;
     return switch (proxy.kind) {
         .shadowsocks => blk: {
             const method = proxy.method orelse return error.InvalidProxyUri;
             const password = proxy.password orelse return error.InvalidProxyUri;
-            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind);
+            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind, stage);
         },
         .trojan => blk: {
             const sni_owned = try proxy.getParamDecoded(gpa, "sni");
@@ -147,7 +149,7 @@ pub fn probeOne(
                 .ws_host = host_hdr,
                 .alpn = alpn_list,
                 .allow_insecure = allow_insecure,
-            }, target, timeout_secs, bind);
+            }, target, timeout_secs, bind, stage);
         },
         .vless => blk: {
             if (proxy.security != .reality) return error.UnsupportedSecurity;
@@ -198,6 +200,7 @@ pub fn probeOne(
                 target,
                 timeout_secs,
                 bind,
+                stage,
             );
         },
         .vmess => error.SkippedVmess,
@@ -267,7 +270,8 @@ fn collectSamples(prober: anytype, samples: []u64) !usize {
 
 /// Run `PROBE_ATTEMPTS` full probes (one retry on a transient error).
 /// With `check_volume`, then one untimed `util.VOLUME_TARGET` download (see `checkVolume`).
-/// On success returns the median latency and the sample spread.
+/// On success returns the median latency and the sample spread; on failure `stage`
+/// holds how far the failing attempt got.
 pub fn probeLatency(
     gpa: std.mem.Allocator,
     io: Io,
@@ -275,6 +279,7 @@ pub fn probeLatency(
     timeout_secs: u32,
     bind: ?[]const u8,
     check_volume: bool,
+    stage: *util.Stage,
 ) !Latency {
     const Prober = struct {
         gpa: std.mem.Allocator,
@@ -282,17 +287,18 @@ pub fn probeLatency(
         proxy: proxy_uri.Proxy,
         timeout_secs: u32,
         bind: ?[]const u8,
+        stage: *util.Stage,
 
         fn probe(self: @This()) !u64 {
-            return probeOne(self.gpa, self.io, self.proxy, util.LATENCY_TARGET, self.timeout_secs, self.bind);
+            return probeOne(self.gpa, self.io, self.proxy, util.LATENCY_TARGET, self.timeout_secs, self.bind, self.stage);
         }
     };
     var samples: [PROBE_ATTEMPTS]u64 = undefined;
-    const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind }, &samples);
+    const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind, .stage = stage }, &samples);
     var latency = Latency.fromSamples(&samples);
     latency.retries = retries;
     if (check_volume) {
-        _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind) catch |err| switch (err) {
+        _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, stage) catch |err| switch (err) {
             // Cloudflare said no; the node carried the warmup, so do not fail it.
             error.VolumeRefused => std.log.warn("volume check skipped for {s}:{d}: download refused", .{ proxy.host, proxy.port }),
             else => return volumeError(err),
@@ -527,6 +533,18 @@ pub const HostIdent = struct {
     }
 };
 
+/// `failHint`, then `@stage` once the failing attempt got past setup:
+/// `rejected/closed@handshake` is a reset on the first flight.
+pub const FailReason = struct {
+    err: anyerror,
+    stage: util.Stage,
+
+    pub fn format(self: FailReason, w: *Io.Writer) Io.Writer.Error!void {
+        try w.writeAll(failHint(self.err));
+        if (self.stage != .setup) try w.print("@{t}", .{self.stage});
+    }
+};
+
 /// Short hint for FAIL logs (why the probe likely failed).
 pub fn failHint(err: anyerror) []const u8 {
     return switch (err) {
@@ -651,9 +669,10 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
         }
 
         // Three probes (one transient retry); ranking uses their median.
-        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, shared.check_volume) catch |err| {
+        var stage: util.Stage = .setup;
+        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, shared.check_volume, &stage) catch |err| {
             if (shared.verbose) {
-                std.log.warn("FAIL: {f}: {s} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, failHint(err), err });
+                std.log.warn("FAIL: {f}: {f} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, FailReason{ .err = err, .stage = stage }, err });
             }
             if (dead_host.record(proxy.port, err)) {
                 skipDeadHost(shared, items[i + 1 ..]);
@@ -853,6 +872,22 @@ test "OK/FAIL log formatters render both named and unnamed proxies" {
     try std.testing.expectEqualStrings(
         "FAIL: 1.2.3.4: slow/timeout",
         try std.mem.print(&buf, "FAIL: {f}: {s}", .{ HostIdent{ .name = null, .host = "1.2.3.4" }, failHint(error.Timeout) }),
+    );
+}
+
+test "FailReason appends the stage once the attempt got past setup" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "rejected/closed@handshake",
+        try std.mem.print(&buf, "{f}", .{FailReason{ .err = error.ConnectionResetByPeer, .stage = .handshake }}),
+    );
+    try std.testing.expectEqualStrings(
+        "slow/timeout@connect",
+        try std.mem.print(&buf, "{f}", .{FailReason{ .err = error.ConnectTimeout, .stage = .connect }}),
+    );
+    try std.testing.expectEqualStrings(
+        "alpn/h2-breaks-ws",
+        try std.mem.print(&buf, "{f}", .{FailReason{ .err = error.WsAlpnHttp2, .stage = .setup }}),
     );
 }
 

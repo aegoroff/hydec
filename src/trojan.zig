@@ -189,6 +189,7 @@ pub fn probe(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
+    stage: *util.Stage,
 ) !u64 {
     const start = netutil.monoNow(io);
     const sni_use = if (opts.sni.len > 0) opts.sni else host;
@@ -225,8 +226,10 @@ pub fn probe(
     // Measured from the real dial: a client negotiates ALPN inside its own handshake,
     // so the side check's extra connection is not part of the latency.
     const attempt_start = netutil.monoNow(io);
+    stage.* = .connect;
     const stream = try netutil.connectHostPort(io, host, port, connect_secs, bind);
     defer stream.close(io);
+    stage.* = .handshake;
 
     const remain = netutil.remainingTimeoutNs(start, io, timeout_secs);
     if (remain == 0) return error.Timeout;
@@ -254,6 +257,7 @@ pub fn probe(
         &stream_writer.interface,
         tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, opts.allow_insecure, bundle),
     ) catch |err| return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
+    stage.* = .tunnel;
 
     const tls_writer = &tls_client.writer;
     const conn: ws.Conn = .{
@@ -285,6 +289,7 @@ pub fn probe(
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     }
+    stage.* = .reply;
 
     // Warmup: drain first HTTP response; require echoed warmup UA (same as gRPC/SS/Vision).
     const http_buf = try gpa.alloc(u8, util.PROBE_HTTP_BUF_LEN);

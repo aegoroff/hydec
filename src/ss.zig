@@ -237,6 +237,7 @@ pub fn probe(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
+    stage: *util.Stage,
 ) !u64 {
     const method = Method.fromName(method_name) orelse return error.UnsupportedSsMethod;
 
@@ -245,8 +246,10 @@ pub fn probe(
     evpBytesToKey(password, method.keyLen(), master[0..method.keyLen()]);
 
     const start = netutil.monoNow(io);
+    stage.* = .connect;
     const stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind);
     defer stream.close(io);
+    stage.* = .handshake;
 
     const read_deadline_ns: ?i128 = if (timeout_secs == 0)
         null
@@ -296,6 +299,7 @@ pub fn probe(
     netutil.waitReadableUntil(stream, io, read_deadline_ns) catch |err| return netutil.classifyDeadlineErr(err, fired.load(.acquire));
     var server_salt: [32]u8 = undefined;
     r.interface.readSliceAll(server_salt[0..method.saltLen()]) catch |err| return netutil.classifyIoErr(err, null, r.err, fired.load(.acquire));
+    stage.* = .reply;
 
     var server_subkey: [32]u8 = undefined;
     @memset(&server_subkey, 0);
@@ -521,4 +525,29 @@ test "HTTP_BUF_LEN leaves room for a full chunk behind a carried leftover" {
     // bytes at the front of `http_buf`, and `openLength` rejects a chunk that does not
     // fit in what remains. Shrinking `HTTP_BUF_LEN` back to one chunk reintroduces that.
     try std.testing.expect(HTTP_BUF_LEN - MAX_CHUNK_PAYLOAD >= MAX_CHUNK_PAYLOAD);
+}
+
+test "probe reports the stage it failed at" {
+    // Arrange: a loopback peer that accepts and hangs up without sending a salt.
+    const io = std.testing.io;
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+    const Peer = struct {
+        fn run(s: *Io.net.Server) void {
+            const conn = s.accept(std.testing.io) catch return;
+            conn.close(std.testing.io);
+        }
+    };
+    const peer = try std.Thread.spawn(.{}, Peer.run, .{&server});
+
+    // Act
+    var stage: util.Stage = .setup;
+    const result = probe(std.testing.allocator, io, "127.0.0.1", port, "aes-128-gcm", "pw", util.LATENCY_TARGET, 2, null, &stage);
+    peer.join();
+
+    // Assert: TCP came up, the first flight went unanswered.
+    try std.testing.expectError(error.EndOfStream, result);
+    try std.testing.expectEqual(util.Stage.handshake, stage);
 }

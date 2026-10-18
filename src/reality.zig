@@ -645,6 +645,7 @@ fn connect(
     sid_hex: []const u8,
     timeout_secs: u32,
     bind: ?[]const u8,
+    stage: *util.Stage,
 ) !void {
     var server_pub: [32]u8 = undefined;
     try decodePublicKey(pbk_b64, &server_pub);
@@ -681,6 +682,7 @@ fn connect(
         null
     else
         dial_start + @as(i128, timeout_secs) * std.time.ns_per_s;
+    stage.* = .connect;
     rc.* = .{
         .stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind),
         .io = io,
@@ -688,6 +690,7 @@ fn connect(
         .read_deadline_ns = read_deadline_ns,
     };
     errdefer rc.deinit();
+    stage.* = .handshake;
 
     const remain = netutil.remainingTimeoutNs(dial_start, io, timeout_secs);
     if (remain == 0) return error.Timeout;
@@ -861,17 +864,19 @@ pub fn probeVless(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
+    stage: *util.Stage,
 ) !u64 {
     const sni_use = if (sni.len > 0) sni else host;
 
     // Full attempt: dial, REALITY handshake and the tunneled requests.
     const start = netutil.monoNow(io);
     var rc: RealityConn = undefined;
-    try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind);
+    try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind, stage);
     defer rc.deinit();
+    stage.* = .tunnel;
 
     if (!grpc) {
-        return probeVlessTcpHttps(&rc, io, uuid, flow, target, start);
+        return probeVlessTcpHttps(&rc, io, uuid, flow, target, start, stage);
     }
 
     var vless_buf: [1024]u8 = undefined;
@@ -939,6 +944,8 @@ pub fn probeVless(
                     saw_grpc_data = false;
                 }
                 try rc.writeApp(flight[0..fl]);
+                // The stream open carries the VLESS request and the warmup.
+                if (request_sent) stage.* = .reply;
             } else if (ftyp == 0x06 and (fflags & 0x01) == 0 and frame_len == 8) {
                 var pong: [17]u8 = undefined;
                 const pong_len = try grpc_gun.buildPingAck(&pong, payload[0..8]);
@@ -1191,7 +1198,7 @@ const VisionPipe = struct {
     }
 };
 
-fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []const u8, target: util.Target, start: i128) !u64 {
+fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []const u8, target: util.Target, start: i128, stage: *util.Stage) !u64 {
     const use_vision = std.mem.find(u8, flow, "vision") != null;
     var uuid: [16]u8 = undefined;
     try vless.parseUuid(uuid_text, &uuid);
@@ -1229,6 +1236,7 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
     };
     pipe.writer.flush() catch |err| return unwrapPipeErr(&pipe, err);
     pipe.handshake_done = true;
+    stage.* = .reply;
 
     // One CF HTTPS request after inner TLS — fail-closed on distinct steady UA.
     // Nested handshake dominates wall time; a separate warmup RTT is not needed.
