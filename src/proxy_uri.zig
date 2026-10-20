@@ -54,10 +54,6 @@ pub const Proxy = struct {
         self.* = undefined;
     }
 
-    pub fn getParam(self: Proxy, key: []const u8) ?[]const u8 {
-        return util.getQueryParam(self.query, key);
-    }
-
     /// Percent-decoded query value; caller owns the slice. `null` if the key is absent.
     pub fn getParamDecoded(self: Proxy, gpa: std.mem.Allocator, key: []const u8) !?[]u8 {
         const raw = util.getQueryParam(self.query, key) orelse return null;
@@ -350,7 +346,7 @@ test "getParamDecoded percent-decodes probe values" {
     defer gpa.free(sni.?);
     try std.testing.expectEqualStrings("a.b.example", sni.?);
     // Raw getParam stays encoded
-    try std.testing.expectEqualStrings("foo%2Fbar", p.getParam("serviceName").?);
+    try std.testing.expectEqualStrings("foo%2Fbar", util.getQueryParam(p.query, "serviceName").?);
 }
 
 test "classify case-insensitive scheme" {
@@ -439,8 +435,8 @@ test "parse trojan ws" {
     try std.testing.expect(p.transport == .ws);
     try std.testing.expect(p.security == .tls);
     try std.testing.expectEqualStrings("test-password", p.userinfo);
-    try std.testing.expectEqualStrings("example.com", p.getParam("sni").?);
-    try std.testing.expectEqualStrings("%2F", p.getParam("path").?);
+    try std.testing.expectEqualStrings("example.com", util.getQueryParam(p.query, "sni").?);
+    try std.testing.expectEqualStrings("%2F", util.getQueryParam(p.query, "path").?);
     try std.testing.expectEqualStrings("tag", p.name.?);
 }
 
@@ -487,7 +483,7 @@ test "parse keeps query and transport past a path" {
     try std.testing.expectEqual(@as(u16, 2058), p.port);
     try std.testing.expect(p.transport == .ws);
     try std.testing.expect(p.security == .tls);
-    try std.testing.expectEqualStrings("example.com", p.getParam("sni").?);
+    try std.testing.expectEqualStrings("example.com", util.getQueryParam(p.query, "sni").?);
 }
 
 test "stripPath does not touch a slash inside userinfo" {

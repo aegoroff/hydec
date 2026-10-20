@@ -254,7 +254,7 @@ pub fn negotiated(
     if (remain == 0) return error.Timeout;
     var done = std.atomic.Value(bool).init(false);
     var fired = std.atomic.Value(bool).init(false);
-    var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
+    var guard = try netutil.DeadlineShutdown.arm(io, stream, remain, &done, &fired);
     defer guard.disarm();
 
     var random: [32]u8 = undefined;

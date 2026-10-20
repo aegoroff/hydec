@@ -694,7 +694,7 @@ fn connect(
 
     const remain = netutil.remainingTimeoutNs(dial_start, io, timeout_secs);
     if (remain == 0) return error.Timeout;
-    rc.deadline_guard = try netutil.DeadlineShutdown.arm(rc.stream.socket.handle, remain, &rc.deadline_done, &rc.deadline_fired);
+    rc.deadline_guard = try netutil.DeadlineShutdown.arm(io, rc.stream, remain, &rc.deadline_done, &rc.deadline_fired);
 
     rc.stream_reader = rc.stream.reader(io, &rc.sock_rbuf);
     rc.stream_writer = rc.stream.writer(io, &rc.sock_wbuf);

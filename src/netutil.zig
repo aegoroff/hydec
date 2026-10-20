@@ -522,23 +522,26 @@ pub fn waitReadableUntil(stream: Io.net.Stream, io: Io, deadline_ns: ?i128) !voi
 /// `fired` is set by the watchdog right before calling `shutdown(2)`, so callers
 /// can distinguish a timeout-induced I/O error (fired=true) from a genuine
 /// server-side close/reset (fired=false).
+///
+/// Also the only read deadline on Windows, where `waitReadableUntil` does not poll.
 pub const DeadlineShutdown = struct {
     done: *std.atomic.Value(bool),
     fired: *std.atomic.Value(bool),
     thread: ?std.Thread,
 
     pub fn arm(
-        fd: posix.fd_t,
+        io: Io,
+        stream: Io.net.Stream,
         timeout_ns: u64,
         done: *std.atomic.Value(bool),
         fired: *std.atomic.Value(bool),
     ) !DeadlineShutdown {
         done.* = std.atomic.Value(bool).init(false);
         fired.* = std.atomic.Value(bool).init(false);
-        if (builtin.target.os.tag == .windows or timeout_ns == 0) {
+        if (timeout_ns == 0) {
             return .{ .done = done, .fired = fired, .thread = null };
         }
-        const thread = try std.Thread.spawn(.{}, watchdog, .{ fd, timeout_ns, done, fired });
+        const thread = try std.Thread.spawn(.{}, watchdog, .{ io, stream, timeout_ns, done, fired });
         return .{ .done = done, .fired = fired, .thread = thread };
     }
 
@@ -551,7 +554,8 @@ pub const DeadlineShutdown = struct {
     }
 
     fn watchdog(
-        fd: posix.fd_t,
+        io: Io,
+        stream: Io.net.Stream,
         timeout_ns: u64,
         done: *std.atomic.Value(bool),
         fired: *std.atomic.Value(bool),
@@ -560,27 +564,14 @@ pub const DeadlineShutdown = struct {
         var left = timeout_ns;
         while (left > 0 and !done.load(.acquire)) {
             const step = @min(left, chunk);
-            sleepNs(step);
+            io.sleep(.fromNanoseconds(step), .awake) catch {};
             left -= step;
         }
         if (!done.load(.acquire)) {
             fired.store(true, .release);
-            _ = posix.system.shutdown(fd, posix.SHUT.RDWR);
-        }
-    }
-
-    fn sleepNs(ns: u64) void {
-        var req = posix.timespec{
-            .sec = @intCast(ns / std.time.ns_per_s),
-            .nsec = @intCast(ns % std.time.ns_per_s),
-        };
-        while (true) {
-            const rc = posix.system.nanosleep(&req, &req);
-            switch (posix.errno(rc)) {
-                .SUCCESS => return,
-                .INTR => continue,
-                else => return,
-            }
+            // Io's shutdown, not posix: it is the one that also exists on Windows.
+            // A failure leaves the probe to its own error path; nothing to do here.
+            stream.shutdown(io, .both) catch {};
         }
     }
 };
@@ -650,6 +641,45 @@ pub fn remainingTimeoutSecs(start_ns: i128, io: Io, timeout_secs: u32) u32 {
 pub fn flushTls(tls_writer: *Io.Writer, socket_writer: *Io.Writer) !void {
     try tls_writer.flush();
     try socket_writer.flush();
+}
+
+test "DeadlineShutdown unblocks a blocking read on a silent peer" {
+    // Arrange: a loopback peer that accepts and then says nothing until released.
+    const io = std.testing.io;
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var release = std.atomic.Value(bool).init(false);
+    const Peer = struct {
+        fn run(s: *Io.net.Server, rel: *std.atomic.Value(bool)) void {
+            const conn = s.accept(std.testing.io) catch return;
+            defer conn.close(std.testing.io);
+            while (!rel.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(10), .awake) catch {};
+        }
+    };
+    const peer = try std.Thread.spawn(.{}, Peer.run, .{ &server, &release });
+    defer {
+        release.store(true, .release);
+        peer.join();
+    }
+    const stream = try connectHostPort(io, "127.0.0.1", server.socket.address.getPort(), 2, null);
+    defer stream.close(io);
+    var rbuf: [16]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var done = std.atomic.Value(bool).init(false);
+    var fired = std.atomic.Value(bool).init(false);
+    const start = monoNow(io);
+
+    // Act: no poll first, so only the watchdog can end this read.
+    var guard = try DeadlineShutdown.arm(io, stream, 200 * std.time.ns_per_ms, &done, &fired);
+    var byte: [1]u8 = undefined;
+    const result = r.interface.readSliceAll(&byte);
+    guard.disarm();
+
+    // Assert
+    try std.testing.expectError(error.EndOfStream, result);
+    try std.testing.expect(fired.load(.acquire));
+    try std.testing.expect(elapsedMs(start, io) < 1500);
 }
 
 test "classifyDeadlineErr: genuine timeouts always map to Timeout" {

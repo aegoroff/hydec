@@ -154,21 +154,6 @@ fn openLength(
     return payload_len;
 }
 
-/// Decrypt one AEAD chunk from `in` into `out`. Returns plaintext length.
-fn openChunk(ctx: *AeadCtx, in: []const u8, out: []u8) error{ AuthenticationFailed, InvalidSsChunk, BufferTooSmall }!usize {
-    if (in.len < 2 + 16) return error.InvalidSsChunk;
-
-    const payload_len = try openLength(ctx, in[0..2][0..2], in[2..18][0..16], out.len);
-
-    const need = 2 + 16 + payload_len + 16;
-    if (in.len < need) return error.InvalidSsChunk;
-
-    const payload_ct = in[18 .. 18 + payload_len];
-    const payload_tag = in[18 + payload_len ..][0..16];
-    try ctx.open(out[0..payload_len], payload_ct, payload_tag);
-    return payload_len;
-}
-
 /// Read and decrypt one AEAD chunk from the stream (matches Trojan: first tunneled bytes).
 /// `scratch` holds ciphertext; plaintext is written to `out`.
 fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8, scratch: []u8) !usize {
@@ -290,7 +275,7 @@ pub fn probe(
     if (remain == 0) return error.Timeout;
     var done = std.atomic.Value(bool).init(false);
     var fired = std.atomic.Value(bool).init(false);
-    var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
+    var guard = try netutil.DeadlineShutdown.arm(io, stream, remain, &done, &fired);
     defer guard.disarm();
 
     w.interface.writeAll(packet[0..off]) catch |err| return netutil.classifyIoErr(err, w.err, null, fired.load(.acquire));
@@ -354,7 +339,9 @@ test "aead seal/open chunk roundtrip" {
         .key = @splat(0x11),
     };
     var out: [64]u8 = undefined;
-    const got = try openChunk(&open_ctx, sealed[0..n], &out);
+    var scratch: [64]u8 = undefined;
+    var in: Io.Reader = .fixed(sealed[0..n]);
+    const got = try readOpenChunk(&open_ctx, &in, &out, &scratch);
     try std.testing.expectEqualStrings(plain, out[0..got]);
 }
 
@@ -373,7 +360,9 @@ test "aead sealChunk accepts payload larger than 512" {
         .key = @splat(0x33),
     };
     var out: [600]u8 = undefined;
-    const got = try openChunk(&open_ctx, sealed[0..n], &out);
+    var scratch: [600]u8 = undefined;
+    var in: Io.Reader = .fixed(sealed[0..n]);
+    const got = try readOpenChunk(&open_ctx, &in, &out, &scratch);
     try std.testing.expectEqual(@as(usize, 600), got);
     try std.testing.expectEqualSlices(u8, &plain, out[0..got]);
 }
@@ -407,7 +396,9 @@ test "aead open rejects bad tag" {
         .key = @splat(0x22),
     };
     var out: [16]u8 = undefined;
-    try std.testing.expectError(error.AuthenticationFailed, openChunk(&open_ctx, sealed[0..n], &out));
+    var scratch: [16]u8 = undefined;
+    var in: Io.Reader = .fixed(sealed[0..n]);
+    try std.testing.expectError(error.AuthenticationFailed, readOpenChunk(&open_ctx, &in, &out, &scratch));
 }
 
 test "method from name" {

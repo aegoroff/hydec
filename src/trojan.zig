@@ -243,7 +243,7 @@ pub fn probe(
     // std.crypto.tls blocks without our poll deadlines — force-unblock via shutdown.
     var done = std.atomic.Value(bool).init(false);
     var fired = std.atomic.Value(bool).init(false);
-    var guard = try netutil.DeadlineShutdown.arm(stream.socket.handle, remain, &done, &fired);
+    var guard = try netutil.DeadlineShutdown.arm(io, stream, remain, &done, &fired);
     defer guard.disarm();
 
     var sock_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;

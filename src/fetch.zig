@@ -192,11 +192,17 @@ fn takeHttpsRedirect(
         error.ReadFailed => return response.bodyErr().?,
     };
 
+    return resolveHttpsRedirect(gpa, base, loc_copy);
+}
+
+/// Resolve `location` against `base`; only an HTTPS result is kept. Returns an owned
+/// absolute URL.
+fn resolveHttpsRedirect(gpa: std.mem.Allocator, base: std.Uri, location: []const u8) ![]u8 {
     var resolve_storage: [16 * 1024]u8 = undefined;
-    if (loc_copy.len > resolve_storage.len) return error.HttpRedirectLocationOversize;
-    @memcpy(resolve_storage[0..loc_copy.len], loc_copy);
+    if (location.len > resolve_storage.len) return error.HttpRedirectLocationOversize;
+    @memcpy(resolve_storage[0..location.len], location);
     var aux: []u8 = &resolve_storage;
-    const new_uri = base.resolveInPlace(loc_copy.len, &aux) catch |err| switch (err) {
+    const new_uri = base.resolveInPlace(location.len, &aux) catch |err| switch (err) {
         error.NoSpaceLeft => return error.HttpRedirectLocationOversize,
         else => return error.HttpRedirectLocationInvalid,
     };
@@ -230,6 +236,27 @@ test "requireHttpsUri rejects plaintext and normalizes scheme case" {
     try std.testing.expectError(error.InsecureSubscriptionUrl, requireHttpsUri("ftp://example.com/sub"));
     const uri = try requireHttpsUri("HTTPS://example.com/sub");
     try std.testing.expectEqualStrings("https", uri.scheme);
+}
+
+test "resolveHttpsRedirect keeps HTTPS targets and rejects plaintext hops" {
+    const gpa = std.testing.allocator;
+    const base = try std.Uri.parse("https://sub.example/s/abc?x=1");
+
+    // Rejected: an absolute plaintext target, in any case.
+    try std.testing.expectError(error.InsecureSubscriptionUrl, resolveHttpsRedirect(gpa, base, "http://evil.example/s"));
+    try std.testing.expectError(error.InsecureSubscriptionUrl, resolveHttpsRedirect(gpa, base, "HTTP://evil.example/s"));
+
+    // Kept: relative and scheme-relative targets inherit the HTTPS base.
+    for ([_][2][]const u8{
+        .{ "/s/def", "https://sub.example/s/def" },
+        .{ "def", "https://sub.example/s/def" },
+        .{ "//other.example/s", "https://other.example/s" },
+        .{ "HTTPS://other.example/s", "https://other.example/s" },
+    }) |case| {
+        const got = try resolveHttpsRedirect(gpa, base, case[0]);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(case[1], got);
+    }
 }
 
 test "ensureHttpsScheme rejects http redirect targets" {

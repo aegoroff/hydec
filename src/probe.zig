@@ -239,16 +239,8 @@ pub const Latency = struct {
 /// for a given URI, so they still fail the candidate on the first occurrence.
 pub fn isTransient(err: anyerror) bool {
     return switch (err) {
-        error.Timeout,
-        error.ConnectTimeout,
-        error.ConnectionTimedOut,
-        error.ConnectionResetByPeer,
-        error.EndOfStream,
-        error.UnexpectedEndOfStream,
-        error.BrokenPipe,
-        error.TlsConnectionTruncated,
-        => true,
-        else => false,
+        error.Timeout, error.ConnectTimeout, error.ConnectionTimedOut => true,
+        else => util.isPeerClosed(err),
     };
 }
 
@@ -551,13 +543,6 @@ pub fn failHint(err: anyerror) []const u8 {
     return switch (err) {
         error.VolumeStalled => "volume/stalled",
         error.Timeout, error.ConnectTimeout, error.ConnectionTimedOut => "slow/timeout",
-        error.ConnectionResetByPeer,
-        error.EndOfStream,
-        error.UnexpectedEndOfStream,
-        error.BrokenPipe,
-        error.TlsConnectionTruncated,
-        error.SocketUnconnected,
-        => "rejected/closed",
         // REALITY/TLS alert — rejected ClientHello (wrong pbk/sid/sni/client ver) or dest fallback.
         error.TlsAlert, error.TlsUnexpectedMessage, error.TlsFinishedVerifyFailed => "handshake/alert",
         error.CertificateBundleLoadFailure => "tls/cert",
@@ -619,7 +604,7 @@ pub fn failHint(err: anyerror) []const u8 {
         // Opaque Io wrappers — Reality/Vision should unwrap socket causes first.
         error.WriteFailed => "write/failed",
         error.ReadFailed => "read/failed",
-        else => "error",
+        else => if (util.isPeerClosed(err)) "rejected/closed" else "error",
     };
 }
 
@@ -1048,6 +1033,11 @@ test "isTransient splits network blips from deterministic failures" {
     try std.testing.expect(isTransient(error.ConnectTimeout));
     try std.testing.expect(isTransient(error.ConnectionResetByPeer));
     try std.testing.expect(isTransient(error.EndOfStream));
+    // Same "peer closed" set the log calls rejected/closed.
+    for ([_]anyerror{ error.SocketUnconnected, error.NotOpenForReading, error.NotOpenForWriting }) |e| {
+        try std.testing.expect(isTransient(e));
+        try std.testing.expectEqualStrings("rejected/closed", failHint(e));
+    }
     try std.testing.expect(!isTransient(error.TlsAlert));
     try std.testing.expect(!isTransient(error.ProbeResponseMismatch));
     try std.testing.expect(!isTransient(error.UnknownHostName));
