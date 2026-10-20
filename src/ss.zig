@@ -519,7 +519,9 @@ test "HTTP_BUF_LEN leaves room for a full chunk behind a carried leftover" {
 }
 
 test "probe reports the stage it failed at" {
-    // Arrange: a loopback peer that accepts and hangs up without sending a salt.
+    // Arrange: a loopback peer that accepts and hangs up without sending a salt. It only
+    // half-closes, then drains until the client leaves: closing with the first flight
+    // still unread makes the kernel send RST, and the probe sees a reset instead.
     const io = std.testing.io;
     const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try addr.listen(io, .{ .reuse_address = true });
@@ -527,8 +529,13 @@ test "probe reports the stage it failed at" {
     const port = server.socket.address.getPort();
     const Peer = struct {
         fn run(s: *Io.net.Server) void {
-            const conn = s.accept(std.testing.io) catch return;
-            conn.close(std.testing.io);
+            const io_peer = std.testing.io;
+            const conn = s.accept(io_peer) catch return;
+            defer conn.close(io_peer);
+            conn.shutdown(io_peer, .send) catch return;
+            var buf: [256]u8 = undefined;
+            var r = conn.reader(io_peer, &buf);
+            _ = r.interface.discardRemaining() catch {};
         }
     };
     const peer = try std.Thread.spawn(.{}, Peer.run, .{&server});
