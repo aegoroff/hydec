@@ -125,6 +125,7 @@ pub fn probeOne(
             break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind, stage);
         },
         .trojan => blk: {
+            if (proxy.transport == .grpc or proxy.transport == .other) return error.UnsupportedTransport;
             const sni_owned = try proxy.getParamDecoded(gpa, "sni");
             defer if (sni_owned) |s| gpa.free(s);
             const sni = sni_owned orelse proxy.host;
@@ -574,6 +575,7 @@ pub fn failHint(err: anyerror) []const u8 {
         error.ExpectedVisionPadding => "vision/framing",
         error.InvalidSsChunk => "ss/chunk",
         error.UnsupportedVlessEncryption => "unsupported-encryption",
+        error.UnsupportedTransport => "unsupported-transport",
         error.BufferTooSmall, error.RecordTooLarge => "buffer/overflow",
         error.SystemResources => "sys/resources",
         // Socket creation / bind failures: netutil.openSocket for our own probe
@@ -724,6 +726,13 @@ fn freeGroups(gpa: std.mem.Allocator, groups: *std.array_hash_map.String(std.Arr
     groups.deinit(gpa);
 }
 
+/// Never logs `line` itself: it carries the UUID / password.
+fn logParseFail(gpa: std.mem.Allocator, index: usize, line: []const u8, err: anyerror) void {
+    const name = proxy_uri.parseName(gpa, line) catch null;
+    defer if (name) |n| gpa.free(n);
+    std.log.warn("parse fail: entry {d}{f}: {}", .{ index + 1, NameSuffix{ .name = name }, err });
+}
+
 /// Build host→proxies map. Same host (IP) shares one sequential queue.
 fn collectGroups(
     gpa: std.mem.Allocator,
@@ -734,7 +743,7 @@ fn collectGroups(
     var groups: std.array_hash_map.String(std.ArrayList(WorkItem)) = .empty;
     errdefer freeGroups(gpa, &groups);
 
-    for (lines) |line| {
+    for (lines, 0..) |line, i| {
         const kind = proxy_uri.classify(line);
         switch (kind) {
             .vmess => {
@@ -750,7 +759,7 @@ fn collectGroups(
 
         var proxy = proxy_uri.parse(gpa, line) catch |err| {
             stats.parse_failed += 1;
-            if (verbose) std.log.warn("parse fail: {s}: {}", .{ line, err });
+            if (verbose) logParseFail(gpa, i, line, err);
             continue;
         };
         errdefer proxy.deinit(gpa);
@@ -873,6 +882,23 @@ test "OK/FAIL log formatters render both named and unnamed proxies" {
         "FAIL: 1.2.3.4: slow/timeout",
         try std.mem.print(&buf, "FAIL: {f}: {s}", .{ HostIdent{ .name = null, .host = "1.2.3.4" }, failHint(error.Timeout) }),
     );
+}
+
+test "probeOne rejects Trojan transports it cannot carry before dialing" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{
+        "trojan://pw@192.0.2.1:443?type=grpc&serviceName=x#g",
+        "trojan://pw@192.0.2.1:443?type=httpupgrade#h",
+    }) |line| {
+        // Arrange
+        var proxy = try proxy_uri.parse(gpa, line);
+        defer proxy.deinit(gpa);
+        var stage: util.Stage = .setup;
+
+        // Act / Assert: 192.0.2.1 is TEST-NET, so reaching the dial would hang or fail differently.
+        try std.testing.expectError(error.UnsupportedTransport, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, &stage));
+        try std.testing.expectEqual(util.Stage.setup, stage);
+    }
 }
 
 test "FailReason appends the stage once the attempt got past setup" {

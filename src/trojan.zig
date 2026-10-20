@@ -133,23 +133,29 @@ fn readHttpUntilReady(
                 if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
                 return e;
             }
-        else blk: {
-            const got = conn.reader.readSliceShort(frame_buf) catch |err| {
+        else
+            readTlsChunk(conn.reader, frame_buf) catch |err| {
                 const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
                 if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
                 return e;
             };
-            if (got == 0) {
-                const e = netutil.classifyDeadlineErr(error.EndOfStream, fired.load(.acquire));
-                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
-                return e;
-            }
-            break :blk got;
-        };
         if (http_len.* + n > http_buf.len) return error.BufferTooSmall;
         @memcpy(http_buf[http_len.*..][0..n], frame_buf[0..n]);
         http_len.* += n;
     }
+}
+
+/// Whatever decrypted bytes are ready (at least one), copied into `out`.
+///
+/// Not `readSliceShort`: it keeps reading until `out` is full, which on a keep-alive
+/// tunnel blocks after the reply until `DeadlineShutdown` fires.
+fn readTlsChunk(reader: *Io.Reader, out: []u8) !usize {
+    try reader.fill(1);
+    const chunk = reader.buffered();
+    const n = @min(chunk.len, out.len);
+    @memcpy(out[0..n], chunk[0..n]);
+    reader.toss(n);
+    return n;
 }
 
 /// How much of the caller's `-t` budget the ALPN side check may spend.
@@ -335,6 +341,41 @@ test "AlpnBudget always leaves the probe part of the budget" {
     // Skipping is `null`, never 0 — `alpn.negotiated` reads 0 as "no limit".
     try std.testing.expectEqual(@as(?u32, null), AlpnBudget.forTimeout(1).negotiateSecs());
     try std.testing.expectEqual(@as(?u32, 2), AlpnBudget.forTimeout(5).negotiateSecs());
+}
+
+/// Hands out `reply` on the first read; any further read fails the test, standing in
+/// for a keep-alive socket that would block.
+const OneReplyReader = struct {
+    reply: []const u8,
+    calls: usize = 0,
+    r: Io.Reader,
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *OneReplyReader = @fieldParentPtr("r", r);
+        self.calls += 1;
+        if (self.calls > 1) return error.ReadFailed;
+        const n = @min(self.reply.len, @backingInt(limit));
+        try w.writeAll(self.reply[0..n]);
+        return n;
+    }
+};
+
+test "readTlsChunk returns the ready reply without waiting to fill the buffer" {
+    // Arrange
+    const reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    var buf: [64]u8 = undefined;
+    var src: OneReplyReader = .{
+        .reply = reply,
+        .r = .{ .vtable = &.{ .stream = OneReplyReader.stream }, .buffer = &buf, .seek = 0, .end = 0 },
+    };
+    var out: [4096]u8 = undefined;
+
+    // Act
+    const n = try readTlsChunk(&src.r, &out);
+
+    // Assert
+    try std.testing.expectEqualStrings(reply, out[0..n]);
+    try std.testing.expectEqual(@as(usize, 1), src.calls);
 }
 
 test "trojanHash matches SHA-224 hex (lowercase)" {
