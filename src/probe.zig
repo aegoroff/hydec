@@ -61,8 +61,6 @@ pub const Stats = struct {
     skipped_vmess: usize = 0,
     skipped_other: usize = 0,
     parse_failed: usize = 0,
-    /// Entries not probed because an earlier entry on the same host could not even connect.
-    skipped_dead_host: usize = 0,
 };
 
 const WorkItem = struct {
@@ -303,8 +301,7 @@ pub fn probeLatency(
 /// The volume download runs once and is never retried: a DPI freeze past the first
 /// ~16–20 KB repeats on every attempt, and a retry would only double its cost.
 /// A timeout there is that freeze, so it gets its own name; other errors pass through.
-/// A connect timeout counts too: this candidate already connected, so it must not
-/// feed `DeadHost`.
+/// A connect timeout counts too: the latency probes just connected to this candidate.
 fn volumeError(err: anyerror) anyerror {
     return switch (err) {
         error.Timeout, error.ConnectTimeout => error.VolumeStalled,
@@ -608,37 +605,8 @@ pub fn failHint(err: anyerror) []const u8 {
     };
 }
 
-/// Decides when a host's remaining entries are not worth probing.
-///
-/// Only a timed-out TCP connect counts: a timeout after connecting can be specific to
-/// one port or protocol (a REALITY dest fallback that hangs while SS on the same IP
-/// works). Even a connect timeout can be one throttled port on a live host, so the
-/// host is dead only after it on two different ports, with no entry having connected.
-const DeadHost = struct {
-    timed_out_port: ?u16 = null,
-    /// Some entry got past the TCP connect (passed, or failed later).
-    alive: bool = false,
-
-    /// Record one candidate's outcome (`null` = passed); true once the host is dead.
-    fn record(self: *DeadHost, port: u16, err: ?anyerror) bool {
-        const e = err orelse {
-            self.alive = true;
-            return false;
-        };
-        if (e != error.ConnectTimeout) {
-            self.alive = true;
-            return false;
-        }
-        if (self.alive) return false;
-        if (self.timed_out_port) |p| return p != port;
-        self.timed_out_port = port;
-        return false;
-    }
-};
-
 fn probeGroup(shared: *Shared, items: []WorkItem) void {
-    var dead_host: DeadHost = .{};
-    for (items, 0..) |*item, i| {
+    for (items) |*item| {
         const proxy = item.proxy;
 
         {
@@ -661,13 +629,8 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
             if (shared.verbose) {
                 std.log.warn("FAIL: {f}: {f} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, FailReason{ .err = err, .stage = stage }, err });
             }
-            if (dead_host.record(proxy.port, err)) {
-                skipDeadHost(shared, items[i + 1 ..]);
-                return;
-            }
             continue;
         };
-        _ = dead_host.record(proxy.port, null);
 
         {
             shared.lock();
@@ -681,20 +644,6 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
 
         const class = PrefClass.fromProxy(proxy) orelse continue;
         considerBest(shared, class, latency, item.raw, proxy.host);
-    }
-}
-
-fn skipDeadHost(shared: *Shared, rest: []const WorkItem) void {
-    if (rest.len == 0) return;
-    {
-        shared.lock();
-        shared.stats.skipped_dead_host += rest.len;
-        shared.unlock();
-    }
-    if (shared.verbose) {
-        for (rest) |item| {
-            std.log.warn("SKIP: {f}: host did not accept a connection", .{HostIdent{ .name = item.proxy.name, .host = item.proxy.host }});
-        }
     }
 }
 
@@ -1003,34 +952,10 @@ test "collectSamples does not retry deterministic errors" {
     try std.testing.expectEqual(@as(usize, 1), calls);
 }
 
-test "DeadHost needs connect timeouts on two different ports" {
-    // Arrange
-    var host: DeadHost = .{};
-
-    // Act / Assert: one throttled port (live 84.32.177.169:2058) is not enough.
-    try std.testing.expect(!host.record(2058, error.ConnectTimeout));
-    try std.testing.expect(!host.record(2058, error.ConnectTimeout));
-    try std.testing.expect(host.record(8443, error.ConnectTimeout));
-}
-
-test "DeadHost never skips a host that connected once" {
-    var passed: DeadHost = .{};
-    _ = passed.record(443, null);
-    try std.testing.expect(!passed.record(2058, error.ConnectTimeout));
-    try std.testing.expect(!passed.record(8443, error.ConnectTimeout));
-
-    // Connected, then stalled: may be one port/protocol only — the host is alive.
-    var stalled: DeadHost = .{};
-    try std.testing.expect(!stalled.record(443, error.Timeout));
-    try std.testing.expect(!stalled.record(2058, error.ConnectTimeout));
-    try std.testing.expect(!stalled.record(8443, error.ConnectTimeout));
-
-    try std.testing.expectEqualStrings("slow/timeout", failHint(error.ConnectTimeout));
-}
-
 test "isTransient splits network blips from deterministic failures" {
     try std.testing.expect(isTransient(error.Timeout));
     try std.testing.expect(isTransient(error.ConnectTimeout));
+    try std.testing.expectEqualStrings("slow/timeout", failHint(error.ConnectTimeout));
     try std.testing.expect(isTransient(error.ConnectionResetByPeer));
     try std.testing.expect(isTransient(error.EndOfStream));
     // Same "peer closed" set the log calls rejected/closed.
@@ -1245,11 +1170,6 @@ test "volumeError names a stalled download and keeps other errors" {
     try std.testing.expectEqual(error.VolumeStalled, volumeError(error.ConnectTimeout));
     try std.testing.expectEqual(error.ProbeResponseMismatch, volumeError(error.ProbeResponseMismatch));
     try std.testing.expectEqualStrings("volume/stalled", failHint(error.VolumeStalled));
-    // Connected and then stalled: the host is alive, other entries on it still run.
-    var host: DeadHost = .{};
-    try std.testing.expect(!host.record(443, error.VolumeStalled));
-    try std.testing.expect(!host.record(2058, error.ConnectTimeout));
-    try std.testing.expect(!host.record(8443, error.ConnectTimeout));
 }
 
 test "failHint names the ALPN failures" {

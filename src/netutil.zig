@@ -349,7 +349,7 @@ fn startConnect(sock: posix.socket_t, address: Io.net.IpAddress) !void {
 }
 
 /// A dial that runs out of time fails with `ConnectTimeout`, not `Timeout`: the host
-/// never answered at all, which `probe.zig` uses to skip its remaining entries.
+/// never answered at all, which the FAIL log names apart from a stalled reply.
 fn waitConnectedUntil(io: Io, sock: posix.socket_t, deadline: ?i128) !void {
     while (true) {
         const now = monoNow(io);
