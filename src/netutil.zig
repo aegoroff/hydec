@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const posix = std.posix;
+const util = @import("util.zig");
 
 /// Optional bind spec for outbound probe sockets (see `applyBind`).
 /// `null` → kernel chooses the source (unchanged behavior). An empty spec is
@@ -104,12 +105,9 @@ fn connectHostnameTimed(
         };
 
         if (n == 0) {
-            var nap = DNS_POLL_INTERVAL_NS;
-            if (deadline) |d| {
-                const now = monoNow(io);
-                if (now >= d) return error.Timeout;
-                nap = @min(nap, @as(u64, @intCast(d - now)));
-            }
+            const now = monoNow(io);
+            if (now >= deadline) return error.Timeout;
+            const nap = @min(DNS_POLL_INTERVAL_NS, @as(u64, @intCast(deadline - now)));
             io.sleep(.fromNanoseconds(nap), .awake) catch {};
             continue;
         }
@@ -118,9 +116,7 @@ fn connectHostnameTimed(
             .canonical_name => {},
             .address => |address| {
                 saw_address = true;
-                if (deadline) |d| {
-                    if (monoNow(io) >= d) return error.Timeout;
-                }
+                if (monoNow(io) >= deadline) return error.Timeout;
                 if (connectIpUntil(io, address, deadline, bind)) |stream| {
                     setTcpNoDelay(stream);
                     return stream;
@@ -195,7 +191,7 @@ fn connectIpTimed(
 fn connectIpUntil(
     io: Io,
     address: Io.net.IpAddress,
-    deadline: ?i128,
+    deadline: i128,
     bind: ?[]const u8,
 ) !Io.net.Stream {
     if (builtin.target.os.tag == .windows) {
@@ -350,16 +346,11 @@ fn startConnect(sock: posix.socket_t, address: Io.net.IpAddress) !void {
 
 /// A dial that runs out of time fails with `ConnectTimeout`, not `Timeout`: the host
 /// never answered at all, which the FAIL log names apart from a stalled reply.
-fn waitConnectedUntil(io: Io, sock: posix.socket_t, deadline: ?i128) !void {
+fn waitConnectedUntil(io: Io, sock: posix.socket_t, deadline: i128) !void {
     while (true) {
         const now = monoNow(io);
-        if (deadline) |d| {
-            if (now >= d) return error.ConnectTimeout;
-        }
-        const timeout_ms: i32 = if (deadline) |d|
-            @intCast(@min(@divTrunc(d - now, std.time.ns_per_ms), std.math.maxInt(i32)))
-        else
-            -1;
+        if (now >= deadline) return error.ConnectTimeout;
+        const timeout_ms: i32 = @intCast(@min(@divTrunc(deadline - now, std.time.ns_per_ms), std.math.maxInt(i32)));
 
         var fds = [_]posix.pollfd{.{
             .fd = sock,
@@ -480,15 +471,13 @@ pub fn elapsedMs(start_ns: i128, io: Io) u64 {
     return @intCast(@divTrunc(now - start_ns, std.time.ns_per_ms));
 }
 
-pub fn deadlineNs(io: Io, timeout_secs: u32) ?i128 {
-    if (timeout_secs == 0) return null;
+pub fn deadlineNs(io: Io, timeout_secs: u32) i128 {
     return monoNow(io) + @as(i128, timeout_secs) * std.time.ns_per_s;
 }
 
 /// Wait until the socket is readable or the absolute deadline passes.
 /// Uses poll(2) — safe with Zig Threaded Io (unlike SO_RCVTIMEO).
-pub fn waitReadableUntil(stream: Io.net.Stream, io: Io, deadline_ns: ?i128) !void {
-    const deadline = deadline_ns orelse return;
+pub fn waitReadableUntil(stream: Io.net.Stream, io: Io, deadline: i128) !void {
     if (builtin.target.os.tag == .windows) return;
 
     while (true) {
@@ -527,7 +516,7 @@ pub fn waitReadableUntil(stream: Io.net.Stream, io: Io, deadline_ns: ?i128) !voi
 pub const DeadlineShutdown = struct {
     done: *std.atomic.Value(bool),
     fired: *std.atomic.Value(bool),
-    thread: ?std.Thread,
+    thread: std.Thread,
 
     pub fn arm(
         io: Io,
@@ -538,19 +527,13 @@ pub const DeadlineShutdown = struct {
     ) !DeadlineShutdown {
         done.* = std.atomic.Value(bool).init(false);
         fired.* = std.atomic.Value(bool).init(false);
-        if (timeout_ns == 0) {
-            return .{ .done = done, .fired = fired, .thread = null };
-        }
         const thread = try std.Thread.spawn(.{}, watchdog, .{ io, stream, timeout_ns, done, fired });
         return .{ .done = done, .fired = fired, .thread = thread };
     }
 
     pub fn disarm(self: *DeadlineShutdown) void {
-        if (self.thread) |t| {
-            self.done.store(true, .release);
-            t.join();
-            self.thread = null;
-        }
+        self.done.store(true, .release);
+        self.thread.join();
     }
 
     fn watchdog(
@@ -577,7 +560,6 @@ pub const DeadlineShutdown = struct {
 };
 
 pub fn remainingTimeoutNs(start_ns: i128, io: Io, timeout_secs: u32) u64 {
-    if (timeout_secs == 0) return std.math.maxInt(u64);
     const budget: i128 = @as(i128, timeout_secs) * std.time.ns_per_s;
     const elapsed = monoNow(io) - start_ns;
     if (elapsed >= budget) return 0;
@@ -598,18 +580,10 @@ pub fn classifyDeadlineErr(err: anyerror, fired: bool) anyerror {
         error.ConnectionTimedOut,
         error.Timeout,
         => error.Timeout,
-        error.EndOfStream,
-        error.UnexpectedEndOfStream,
-        error.BrokenPipe,
-        error.ConnectionResetByPeer,
-        error.TlsConnectionTruncated,
-        error.SocketUnconnected,
-        error.NotOpenForReading,
-        error.NotOpenForWriting,
         error.WriteFailed,
         error.ReadFailed,
         => if (fired) error.Timeout else err,
-        else => err,
+        else => if (fired and util.isPeerClosed(err)) error.Timeout else err,
     };
 }
 

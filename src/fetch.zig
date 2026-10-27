@@ -54,8 +54,6 @@ fn fetchWorker(ctx: *FetchCtx) void {
 
 /// Download URL body with an overall wall-clock deadline.
 pub fn fetchUrl(gpa: std.mem.Allocator, io: Io, url: []const u8, timeout_secs: u32) ![]u8 {
-    if (timeout_secs == 0) return fetchUrlInner(gpa, io, url);
-
     const url_owned = try gpa.dupe(u8, url);
     const ctx = gpa.create(FetchCtx) catch |err| {
         gpa.free(url_owned);
