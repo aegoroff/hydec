@@ -11,6 +11,7 @@ const X25519 = std.crypto.dh.X25519;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const HmacSha512 = std.crypto.auth.hmac.sha2.HmacSha512;
 const HkdfSha256 = std.crypto.kdf.hkdf.Hkdf(HmacSha256);
 
 const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
@@ -51,7 +52,8 @@ fn decodeShortId(sid_hex: []const u8, out: *[8]u8) !void {
     @memcpy(out[0..blen], bytes[0..blen]);
 }
 
-/// Derive REALITY auth key and encrypt session_id in-place (32 bytes).
+/// Derive REALITY auth key and encrypt session_id in-place (32 bytes); returns the
+/// auth key for `verifyRealityCert`.
 /// AAD is the ClientHello with the 32-byte session_id field zeroed (xray/sing-box).
 fn sealSessionId(
     session_id: *[32]u8,
@@ -59,7 +61,7 @@ fn sealSessionId(
     client_random: *const [32]u8,
     our_priv: *const [32]u8,
     server_pub: *const [32]u8,
-) !void {
+) ![32]u8 {
     var auth_key = try X25519.scalarmult(our_priv.*, server_pub.*);
 
     // Go hkdf.New(hash, secret=authKey, salt=random[:20], info="REALITY")
@@ -85,12 +87,82 @@ fn sealSessionId(
     @memcpy(sealed[16..32], &tag);
     @memcpy(session_id, &sealed);
     @memcpy(hello_raw[39..][0..32], session_id);
+    return auth_key;
+}
+
+/// A REALITY server signs its temporary ed25519 leaf with HMAC-SHA512(auth key,
+/// public key) instead of a real signature (Xray `VerifyPeerCertificate`). Any other
+/// leaf is the dest site the server fell back to after rejecting our auth, and that
+/// site must never be sent the VLESS request with its UUID.
+/// `cert_msg` is the TLS 1.3 Certificate message body; only the leaf is checked.
+fn verifyRealityCert(cert_msg: []const u8, auth_key: *const [32]u8) error{RealityAuthFailed}!void {
+    // certificate_request_context<0..255>, certificate_list<0..2^24-1>, then the
+    // first CertificateEntry's cert_data<1..2^24-1>.
+    if (cert_msg.len < 1) return error.RealityAuthFailed;
+    var i: usize = 1 + @as(usize, cert_msg[0]) + 3;
+    if (cert_msg.len < i + 3) return error.RealityAuthFailed;
+    const leaf_len = std.mem.readInt(u24, cert_msg[i..][0..3], .big);
+    i += 3;
+    if (cert_msg.len - i < leaf_len) return error.RealityAuthFailed;
+
+    const leaf = parseEd25519Leaf(cert_msg[i..][0..leaf_len]) catch return error.RealityAuthFailed;
+    var expected: [HmacSha512.mac_length]u8 = undefined;
+    HmacSha512.create(&expected, leaf.pub_key, auth_key);
+    if (!std.mem.eql(u8, leaf.signature, &expected)) return error.RealityAuthFailed;
+}
+
+/// Public key and raw signature of an ed25519 X.509 leaf.
+///
+/// Not `std.crypto.Certificate.parse`: it trusts DER lengths and indexes out of
+/// bounds on malformed input, and these bytes come straight from the peer.
+fn parseEd25519Leaf(der: []const u8) error{InvalidCertificate}!struct { pub_key: []const u8, signature: []const u8 } {
+    var top: usize = 0;
+    const cert = try derNext(der, &top, 0x30);
+    var c: usize = 0;
+    const tbs = try derNext(cert, &c, 0x30);
+    _ = try derNext(cert, &c, 0x30); // signatureAlgorithm
+    const sig = try derNext(cert, &c, 0x03);
+
+    var t: usize = 0;
+    if (tbs.len > 0 and tbs[0] == 0xa0) _ = try derNext(tbs, &t, 0xa0); // version
+    _ = try derNext(tbs, &t, 0x02); // serialNumber
+    for (0..4) |_| _ = try derNext(tbs, &t, 0x30); // signature, issuer, validity, subject
+    const spki = try derNext(tbs, &t, 0x30);
+    var k: usize = 0;
+    const algo = try derNext(spki, &k, 0x30);
+    const key = try derNext(spki, &k, 0x03);
+
+    const ED25519_OID = [_]u8{ 0x06, 0x03, 0x2b, 0x65, 0x70 };
+    if (!std.mem.eql(u8, algo, &ED25519_OID)) return error.InvalidCertificate;
+    // BIT STRINGs: one leading "unused bits" byte, which must be 0.
+    if (key.len != 1 + 32 or key[0] != 0) return error.InvalidCertificate;
+    if (sig.len != 1 + HmacSha512.mac_length or sig[0] != 0) return error.InvalidCertificate;
+    return .{ .pub_key = key[1..], .signature = sig[1..] };
+}
+
+/// Body of the DER element at `pos.*`, which must carry `tag`; advances past it.
+/// Lengths take at most two bytes, plenty for one certificate.
+fn derNext(buf: []const u8, pos: *usize, tag: u8) error{InvalidCertificate}![]const u8 {
+    var i = pos.*;
+    if (buf.len - i < 2 or buf[i] != tag) return error.InvalidCertificate;
+    var len: usize = buf[i + 1];
+    i += 2;
+    if (len >= 0x80) {
+        const n = len - 0x80;
+        if (n == 0 or n > 2 or buf.len - i < n) return error.InvalidCertificate;
+        len = 0;
+        for (buf[i..][0..n]) |b| len = (len << 8) | b;
+        i += n;
+    }
+    if (buf.len - i < len) return error.InvalidCertificate;
+    pos.* = i + len;
+    return buf[i..][0..len];
 }
 
 /// Xray core version embedded in the REALITY session_id (bytes 0..2).
 /// xray-core ≥26.7.11 defaults inbound `minClientVer` to 26.3.27 when unset; reporting
 /// the old sing-box 1.8.1 triple fails auth and the peer falls through to the dest
-/// (often visible here as `TlsAlert` after we write VLESS).
+/// (`RealityAuthFailed` from `verifyRealityCert`, before any VLESS is written).
 const REALITY_CLIENT_VER: [3]u8 = .{ 26, 7, 11 };
 
 fn fillSessionIdPlain(session_id: *[32]u8, short_id: *const [8]u8, unix_secs: u32) void {
@@ -437,8 +509,8 @@ const RealityConn = struct {
     conn: RecordConn = undefined,
     transcript: Sha256 = undefined,
     open: bool = false,
-    /// Absolute awake-clock deadline for subsequent reads; null = no limit.
-    read_deadline_ns: ?i128 = null,
+    /// Absolute awake-clock deadline for subsequent reads.
+    read_deadline_ns: i128,
     deadline_done: std.atomic.Value(bool) = .init(false),
     deadline_fired: std.atomic.Value(bool) = .init(false),
     deadline_guard: ?netutil.DeadlineShutdown = null,
@@ -462,40 +534,26 @@ const RealityConn = struct {
         }
     }
 
-    /// Zig `Io.Writer` collapses socket failures to `WriteFailed`; the cause is on `stream_writer.err`.
-    fn mapWriterErr(self: *const RealityConn, err: anyerror) anyerror {
-        const cause: anyerror = if (err == error.WriteFailed)
-            (self.stream_writer.err orelse err)
-        else
-            err;
-        return netutil.classifyDeadlineErr(cause, self.deadlineFired());
-    }
-
-    /// Zig `Io.Reader` collapses socket failures to `ReadFailed`; the cause is on `stream_reader.err`.
-    fn mapReaderErr(self: *const RealityConn, err: anyerror) anyerror {
-        const cause: anyerror = if (err == error.ReadFailed)
-            (self.stream_reader.err orelse err)
-        else
-            err;
-        return netutil.classifyDeadlineErr(cause, self.deadlineFired());
+    fn mapIoErr(self: *const RealityConn, err: anyerror) anyerror {
+        return netutil.classifyIoErr(err, self.stream_writer.err, self.stream_reader.err, self.deadlineFired());
     }
 
     fn writeApp(self: *RealityConn, data: []const u8) !void {
         if (self.xtls_raw_write) {
             // After Vision PaddingDirect: peer expects raw TCP (xray UnwrapRawConn).
-            self.conn.writer.writeAll(data) catch |err| return self.mapWriterErr(err);
-            self.conn.writer.flush() catch |err| return self.mapWriterErr(err);
+            self.conn.writer.writeAll(data) catch |err| return self.mapIoErr(err);
+            self.conn.writer.flush() catch |err| return self.mapIoErr(err);
             return;
         }
-        self.conn.writeRecord(23, data, false) catch |err| return self.mapWriterErr(err);
+        self.conn.writeRecord(23, data, false) catch |err| return self.mapIoErr(err);
     }
 
     fn writeClear(self: *RealityConn, content_type: u8, data: []const u8) !void {
-        self.conn.writeClear(content_type, data) catch |err| return self.mapWriterErr(err);
+        self.conn.writeClear(content_type, data) catch |err| return self.mapIoErr(err);
     }
 
     fn writeHandshake(self: *RealityConn, data: []const u8) !void {
-        self.conn.writeRecord(22, data, true) catch |err| return self.mapWriterErr(err);
+        self.conn.writeRecord(22, data, true) catch |err| return self.mapIoErr(err);
     }
 
     fn waitForReadable(self: *RealityConn) !void {
@@ -510,7 +568,7 @@ const RealityConn = struct {
 
     fn readRecordDeadline(self: *RealityConn, out: []u8, handshake_keys: bool) !TlsRecord {
         try self.waitForReadable();
-        return self.conn.readRecord(out, handshake_keys) catch |err| return self.mapReaderErr(err);
+        return self.conn.readRecord(out, handshake_keys) catch |err| return self.mapIoErr(err);
     }
 
     fn readApp(self: *RealityConn, out: []u8) !usize {
@@ -559,13 +617,13 @@ const RealityConn = struct {
         }
         if (builtin.target.os.tag == .windows) {
             const n = self.conn.reader.readSliceShort(out[0..@min(out.len, 1)]) catch |err| {
-                return self.mapReaderErr(err);
+                return self.mapIoErr(err);
             };
             if (n == 0) return error.EndOfStream;
             return n;
         }
         const n = std.posix.read(self.stream.socket.handle, out) catch |err| {
-            return self.mapReaderErr(err);
+            return self.mapIoErr(err);
         };
         if (n == 0) return error.EndOfStream;
         return n;
@@ -669,19 +727,14 @@ fn connect(
     const hello_len = try buildClientHello(&hello_raw, sni, &client_random, &session_id, &kp.public_key);
 
     // Seal session id (AAD = hello_raw)
-    try sealSessionId(&session_id, hello_raw[0..hello_len], &client_random, &kp.secret_key, &server_pub);
-
-    // Rebuild hello with sealed session id already patched by sealSessionId into hello_raw[39..]
-    // sealSessionId already updated hello_raw session id bytes.
+    // Also patches the sealed session id into hello_raw[39..].
+    const auth_key = try sealSessionId(&session_id, hello_raw[0..hello_len], &client_random, &kp.secret_key, &server_pub);
 
     const dial_start = netutil.monoNow(io);
     // Absolute read deadline from dial_start so poll matches DeadlineShutdown
     // (remainingTimeoutNs below). Post-connect deadlineNs would be later by
     // dial_duration and could allow ~2× timeout if the watchdog were disarmed.
-    const read_deadline_ns: ?i128 = if (timeout_secs == 0)
-        null
-    else
-        dial_start + @as(i128, timeout_secs) * std.time.ns_per_s;
+    const read_deadline_ns = dial_start + @as(i128, timeout_secs) * std.time.ns_per_s;
     stage.* = .connect;
     rc.* = .{
         .stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind),
@@ -756,6 +809,7 @@ fn connect(
     // Transcript is updated per handshake message so Finished verify_data can be checked
     // against Hash(messages before Finished).
     var saw_finished = false;
+    var cert_verified = false;
     var hs_pending: [32768]u8 = undefined;
     var hs_pending_len: usize = 0;
     while (!saw_finished) {
@@ -779,6 +833,7 @@ fn connect(
             if (off + 4 + hl > hs_pending_len) break;
             const msg = hs_pending[off .. off + 4 + hl];
             if (ht == 20) {
+                if (!cert_verified) return error.RealityAuthFailed;
                 if (hl != 32) return error.TlsDecodeError;
                 var pre_fin_hash: [32]u8 = undefined;
                 {
@@ -794,6 +849,10 @@ fn connect(
                 // hash any further handshake bytes that may follow in this buffer.
                 break;
             } else {
+                if (ht == 11) {
+                    try verifyRealityCert(msg[4..], &auth_key);
+                    cert_verified = true;
+                }
                 rc.transcript.update(msg);
             }
             off += 4 + hl;
@@ -1860,6 +1919,79 @@ test "buildClientHello rejects oversized SNI" {
         error.SniTooLong,
         buildClientHello(&out, &long_sni, &random, &sid, &pubk),
     );
+}
+
+/// A leaf built the way XTLS/REALITY builds it (Go `x509.CreateCertificate` on an
+/// empty template, ed25519 key from seed 00..1f), with the signature replaced by
+/// HMAC-SHA512(`TEST_AUTH_KEY`, public key).
+const TEST_REALITY_LEAF_HEX =
+    "3081af3063a003020102020100300506032b657030003022180f303030313031" ++
+    "30313030303030305a180f30303031303130313030303030305a3000302a3005" ++
+    "06032b657003210003a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f" ++
+    "1ddc8664125531b8300506032b65700341001fb368cab325711d6990d1f239f5" ++
+    "f22f7c244ac4a2a71f5c019ef41516716d9e01ca1f0a66131c507d1b7e1e09dc" ++
+    "90f7fce2792f4f5fa47f363e1c023d7449e2";
+const TEST_AUTH_KEY: [32]u8 = @splat(0xa5);
+
+/// Wrap `leaf` into a TLS 1.3 Certificate message body (empty context, no extensions).
+fn testCertMsg(buf: []u8, leaf: []const u8) []const u8 {
+    buf[0] = 0; // certificate_request_context
+    std.mem.writeInt(u24, buf[1..4], @intCast(3 + leaf.len + 2), .big);
+    std.mem.writeInt(u24, buf[4..7], @intCast(leaf.len), .big);
+    @memcpy(buf[7..][0..leaf.len], leaf);
+    std.mem.writeInt(u16, buf[7 + leaf.len ..][0..2], 0, .big);
+    return buf[0 .. 7 + leaf.len + 2];
+}
+
+test "verifyRealityCert accepts the HMAC-signed REALITY leaf" {
+    // Arrange
+    var leaf: [TEST_REALITY_LEAF_HEX.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&leaf, TEST_REALITY_LEAF_HEX);
+    var buf: [256]u8 = undefined;
+
+    // Act / Assert
+    try verifyRealityCert(testCertMsg(&buf, &leaf), &TEST_AUTH_KEY);
+}
+
+test "verifyRealityCert rejects a dest-site leaf and malformed messages" {
+    // Arrange
+    var leaf: [TEST_REALITY_LEAF_HEX.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&leaf, TEST_REALITY_LEAF_HEX);
+    var buf: [256]u8 = undefined;
+    const other_key: [32]u8 = @splat(0x5a);
+
+    // Act / Assert: another connection's auth key, as when the server fell back.
+    try std.testing.expectError(error.RealityAuthFailed, verifyRealityCert(testCertMsg(&buf, &leaf), &other_key));
+
+    // A signature that is not the HMAC (here: one flipped bit).
+    var forged = leaf;
+    forged[forged.len - 1] ^= 1;
+    try std.testing.expectError(error.RealityAuthFailed, verifyRealityCert(testCertMsg(&buf, &forged), &TEST_AUTH_KEY));
+
+    // Truncated message and a leaf that is not a certificate.
+    const msg = testCertMsg(&buf, &leaf);
+    try std.testing.expectError(error.RealityAuthFailed, verifyRealityCert(msg[0..20], &TEST_AUTH_KEY));
+    try std.testing.expectError(error.RealityAuthFailed, verifyRealityCert(&.{}, &TEST_AUTH_KEY));
+    const junk: [32]u8 = @splat(0x30);
+    try std.testing.expectError(error.RealityAuthFailed, verifyRealityCert(testCertMsg(&buf, &junk), &TEST_AUTH_KEY));
+}
+
+test "verifyRealityCert fails closed on every truncated or corrupted leaf" {
+    // The leaf is peer-controlled: no cut or byte flip may read past the buffer. A cut
+    // always loses the signature; a flip in a field REALITY does not bind (serial,
+    // validity) may still pass, as in Xray, so only the flip must not crash.
+    var leaf: [TEST_REALITY_LEAF_HEX.len / 2]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&leaf, TEST_REALITY_LEAF_HEX);
+    var buf: [256]u8 = undefined;
+
+    for (0..leaf.len) |cut| {
+        try std.testing.expectError(error.RealityAuthFailed, verifyRealityCert(testCertMsg(&buf, leaf[0..cut]), &TEST_AUTH_KEY));
+    }
+    for (0..leaf.len) |at| {
+        var bad = leaf;
+        bad[at] ^= 0xff;
+        verifyRealityCert(testCertMsg(&buf, &bad), &TEST_AUTH_KEY) catch {};
+    }
 }
 
 test "decodePublicKey length" {

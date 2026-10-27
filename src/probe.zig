@@ -542,6 +542,8 @@ pub fn failHint(err: anyerror) []const u8 {
         error.Timeout, error.ConnectTimeout, error.ConnectionTimedOut => "slow/timeout",
         // REALITY/TLS alert — rejected ClientHello (wrong pbk/sid/sni/client ver) or dest fallback.
         error.TlsAlert, error.TlsUnexpectedMessage, error.TlsFinishedVerifyFailed => "handshake/alert",
+        // The leaf was not REALITY's HMAC-signed one: the server fell back to its dest.
+        error.RealityAuthFailed => "reality/auth",
         error.CertificateBundleLoadFailure => "tls/cert",
         error.ConnectionRefused,
         error.NetworkUnreachable,
@@ -647,6 +649,20 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
     }
 }
 
+/// Host groups handed out one at a time to `findBest`'s workers.
+const HostQueue = struct {
+    lists: []std.ArrayList(WorkItem),
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn work(self: *HostQueue, shared: *Shared) void {
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= self.lists.len) return;
+            probeGroup(shared, self.lists[i].items);
+        }
+    }
+};
+
 fn freeGroups(gpa: std.mem.Allocator, groups: *std.array_hash_map.String(std.ArrayList(WorkItem))) void {
     for (groups.keys()) |key| {
         gpa.free(key);
@@ -748,24 +764,19 @@ pub fn findBest(
     };
     errdefer shared.deinitBests();
 
-    const lists = groups.values();
-    const n = lists.len;
-    const threads = try gpa.alloc(std.Thread, @min(n, MAX_PARALLEL_HOSTS));
+    // Each worker takes the next host as soon as it is free, so one slow host holds
+    // up only its own thread, not a whole batch of others.
+    var queue: HostQueue = .{ .lists = groups.values() };
+    const threads = try gpa.alloc(std.Thread, @min(queue.lists.len, MAX_PARALLEL_HOSTS));
     defer gpa.free(threads);
 
-    var next: usize = 0;
-    while (next < n) {
-        const batch = @min(MAX_PARALLEL_HOSTS, n - next);
+    {
         var spawned: usize = 0;
-        errdefer for (threads[0..spawned]) |t| t.join();
-
-        for (lists[next..][0..batch]) |*list| {
-            threads[spawned] = try std.Thread.spawn(.{}, probeGroup, .{ &shared, list.items });
+        defer for (threads[0..spawned]) |t| t.join();
+        for (threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, HostQueue.work, .{ &queue, &shared });
             spawned += 1;
         }
-
-        for (threads[0..spawned]) |t| t.join();
-        next += batch;
     }
 
     var ranks: std.EnumArray(PrefClass, ?Rank) = .initFill(null);

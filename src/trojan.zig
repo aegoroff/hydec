@@ -177,7 +177,7 @@ const AlpnBudget = union(enum) {
     }
 
     /// The `timeout_secs` argument for `alpn.negotiated`, or `null` when no check
-    /// may run. Never 0, which `alpn.negotiated` would read as "no limit".
+    /// may run. Never 0, which would leave `alpn.negotiated` no time at all.
     fn negotiateSecs(self: AlpnBudget) ?u32 {
         return switch (self) {
             .skip => null,
@@ -338,7 +338,7 @@ test "AlpnBudget always leaves the probe part of the budget" {
     try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 2 }), AlpnBudget.forTimeout(5));
     try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 15 }), AlpnBudget.forTimeout(30));
 
-    // Skipping is `null`, never 0 — `alpn.negotiated` reads 0 as "no limit".
+    // Skipping is `null`, never 0 — 0 would leave `alpn.negotiated` no time at all.
     try std.testing.expectEqual(@as(?u32, null), AlpnBudget.forTimeout(1).negotiateSecs());
     try std.testing.expectEqual(@as(?u32, 2), AlpnBudget.forTimeout(5).negotiateSecs());
 }

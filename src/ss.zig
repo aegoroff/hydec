@@ -236,10 +236,7 @@ pub fn probe(
     defer stream.close(io);
     stage.* = .handshake;
 
-    const read_deadline_ns: ?i128 = if (timeout_secs == 0)
-        null
-    else
-        start + @as(i128, timeout_secs) * std.time.ns_per_s;
+    const read_deadline_ns = start + @as(i128, timeout_secs) * std.time.ns_per_s;
 
     var wbuf: [2048]u8 = undefined;
     var rbuf: [2048]u8 = undefined;
@@ -318,11 +315,21 @@ pub fn probe(
     return netutil.elapsedMs(start, io);
 }
 
-test "evpBytesToKey chacha length" {
-    var key: [32]u8 = undefined;
-    evpBytesToKey("test-password", 32, &key);
-    // Non-zero key material
-    try std.testing.expect(key[0] != 0 or key[31] != 0);
+test "evpBytesToKey matches OpenSSL EVP_BytesToKey(MD5)" {
+    // Reference: `openssl enc -aes-{128,256}-cbc -md md5 -nosalt -k password -P`.
+    var key16: [16]u8 = undefined;
+    evpBytesToKey("password", 16, &key16);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x5f, 0x4d, 0xcc, 0x3b, 0x5a, 0xa7, 0x65, 0xd6, 0x1d, 0x83, 0x27, 0xde, 0xb8, 0x82, 0xcf, 0x99,
+    }, &key16);
+
+    // 32 bytes needs the second MD5 block, chained over the first.
+    var key32: [32]u8 = undefined;
+    evpBytesToKey("password", 32, &key32);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x5f, 0x4d, 0xcc, 0x3b, 0x5a, 0xa7, 0x65, 0xd6, 0x1d, 0x83, 0x27, 0xde, 0xb8, 0x82, 0xcf, 0x99,
+        0x2b, 0x95, 0x99, 0x0a, 0x91, 0x51, 0x37, 0x4a, 0xbd, 0x8f, 0xf8, 0xc5, 0xa7, 0xa0, 0xfe, 0x08,
+    }, &key32);
 }
 
 test "aead seal/open chunk roundtrip" {
