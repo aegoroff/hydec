@@ -300,11 +300,11 @@ pub fn probeLatency(
 
 /// The volume download runs once and is never retried: a DPI freeze past the first
 /// ~16–20 KB repeats on every attempt, and a retry would only double its cost.
-/// A timeout there is that freeze, so it gets its own name; other errors pass through.
-/// A connect timeout counts too: the latency probes just connected to this candidate.
+/// A read timeout there is that freeze, so it gets its own name; other errors pass through.
+/// A connect timeout stays a connect failure: no download has started yet.
 fn volumeError(err: anyerror) anyerror {
     return switch (err) {
-        error.Timeout, error.ConnectTimeout => error.VolumeStalled,
+        error.Timeout, error.ConnectionTimedOut => error.VolumeStalled,
         else => err,
     };
 }
@@ -1213,11 +1213,13 @@ test "failHint covers every Io.net.IpAddress.BindError member" {
     }
 }
 
-test "volumeError names a stalled download and keeps other errors" {
+test "volumeError names only read stalls and keeps other errors" {
     try std.testing.expectEqual(error.VolumeStalled, volumeError(error.Timeout));
-    try std.testing.expectEqual(error.VolumeStalled, volumeError(error.ConnectTimeout));
+    try std.testing.expectEqual(error.VolumeStalled, volumeError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.ConnectTimeout, volumeError(error.ConnectTimeout));
     try std.testing.expectEqual(error.ProbeResponseMismatch, volumeError(error.ProbeResponseMismatch));
     try std.testing.expectEqualStrings("volume/stalled", failHint(error.VolumeStalled));
+    try std.testing.expectEqualStrings("slow/timeout", failHint(volumeError(error.ConnectTimeout)));
 }
 
 test "failHint names the ALPN failures" {

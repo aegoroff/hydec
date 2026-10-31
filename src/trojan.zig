@@ -75,7 +75,7 @@ fn ensureCaBundle(gpa: std.mem.Allocator, io: Io) !*Certificate.Bundle {
 pub fn deinitCaBundle(gpa: std.mem.Allocator, io: Io) void {
     ca_state.mutex.lockUncancelable(io);
     defer ca_state.mutex.unlock(io);
-    if (!ca_state.loaded) return;
+    // A failed rescan can leave allocations even though `loaded` is false.
     ca_state.bundle.deinit(gpa);
     ca_state.bundle = .empty;
     ca_state.loaded = false;
@@ -331,6 +331,21 @@ pub fn probe(
     try target.steady_reply.check(http_buf[0..http_len]);
 
     return netutil.elapsedMs(attempt_start, io);
+}
+
+test "deinitCaBundle frees a partial failed rescan" {
+    // Arrange: rescan can allocate before returning an error, leaving loaded=false.
+    const gpa = std.testing.allocator;
+    try ca_state.bundle.bytes.append(gpa, 0x01);
+    ca_state.loaded = false;
+
+    // Act
+    deinitCaBundle(gpa, std.testing.io);
+
+    // Assert
+    try std.testing.expectEqual(@as(usize, 0), ca_state.bundle.bytes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ca_state.bundle.bytes.capacity);
+    try std.testing.expectEqual(@as(usize, 0), ca_state.bundle.map.count());
 }
 
 test "AlpnBudget always leaves the probe part of the budget" {
