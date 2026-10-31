@@ -82,7 +82,7 @@ pub fn classify(line: []const u8) Kind {
 
 fn parseTransport(type_param: ?[]const u8) Transport {
     const t = type_param orelse return .tcp;
-    if (std.ascii.eqlIgnoreCase(t, "tcp") or t.len == 0) return .tcp;
+    if (std.ascii.eqlIgnoreCase(t, "tcp") or std.ascii.eqlIgnoreCase(t, "raw") or t.len == 0) return .tcp;
     if (std.ascii.eqlIgnoreCase(t, "ws")) return .ws;
     if (std.ascii.eqlIgnoreCase(t, "grpc")) return .grpc;
     return .other;
@@ -366,6 +366,11 @@ test "parse type security case-insensitive" {
     defer p.deinit(gpa);
     try std.testing.expect(p.transport == .tcp);
     try std.testing.expect(p.security == .reality);
+}
+
+test "parseTransport treats raw as tcp" {
+    try std.testing.expect(parseTransport("raw") == .tcp);
+    try std.testing.expect(parseTransport("RAW") == .tcp);
 }
 
 test "parse ss sip002" {

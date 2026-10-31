@@ -13,9 +13,10 @@ const Method = enum {
     chacha20_ietf_poly1305,
 
     pub fn fromName(name: []const u8) ?Method {
-        if (std.mem.eql(u8, name, "aes-128-gcm")) return .aes_128_gcm;
-        if (std.mem.eql(u8, name, "aes-256-gcm")) return .aes_256_gcm;
-        if (std.mem.eql(u8, name, "chacha20-ietf-poly1305")) return .chacha20_ietf_poly1305;
+        if (std.ascii.eqlIgnoreCase(name, "aes-128-gcm")) return .aes_128_gcm;
+        if (std.ascii.eqlIgnoreCase(name, "aes-256-gcm")) return .aes_256_gcm;
+        if (std.ascii.eqlIgnoreCase(name, "chacha20-ietf-poly1305") or
+            std.ascii.eqlIgnoreCase(name, "chacha20-poly1305")) return .chacha20_ietf_poly1305;
         return null;
     }
 
@@ -414,6 +415,8 @@ test "aead open rejects bad tag" {
 
 test "method from name" {
     try std.testing.expect(Method.fromName("chacha20-ietf-poly1305") == .chacha20_ietf_poly1305);
+    try std.testing.expect(Method.fromName("AES-256-GCM") == .aes_256_gcm);
+    try std.testing.expect(Method.fromName("chacha20-poly1305") == .chacha20_ietf_poly1305);
 }
 
 const TEST_WARM_RESP =
