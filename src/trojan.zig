@@ -134,23 +134,23 @@ fn readHttpUntilReady(
     stream_writer: *Io.net.Stream.Writer,
     io: Io,
     fired: *const std.atomic.Value(bool),
+    expect: util.ProbeReply,
 ) !void {
-    while (true) {
-        switch (util.httpResponseState(http_buf[0..http_len.*])) {
-            .complete => return,
-            .malformed => return error.ProbeResponseMismatch,
-            .incomplete, .close_delimited => {},
-        }
+    while (!try util.takeProbeResponse(http_buf, http_len, expect, false)) {
         const n = if (transport_ws)
             ws.readBinaryFrame(conn, io, frame_buf) catch |err| {
                 const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
-                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
+                if (util.isPeerClosed(e)) {
+                    if (try util.takeProbeResponse(http_buf, http_len, expect, true)) return;
+                }
                 return e;
             }
         else
             readTlsChunk(conn.reader, frame_buf) catch |err| {
                 const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
-                if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) return;
+                if (util.isPeerClosed(e)) {
+                    if (try util.takeProbeResponse(http_buf, http_len, expect, true)) return;
+                }
                 return e;
             };
         if (http_len.* + n > http_buf.len) return error.BufferTooSmall;
@@ -271,9 +271,7 @@ pub fn probe(
     // A `--check-volume` download may come as one large WS frame.
     const frame_buf = try gpa.alloc(u8, util.PROBE_HTTP_BUF_LEN);
     defer gpa.free(frame_buf);
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
-    if (!util.looksLikeCloudflareTraceUag(http_buf[0..http_len], util.PROBE_UA_WARMUP))
-        return error.ProbeResponseMismatch;
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired, .{ .trace = util.PROBE_UA_WARMUP });
 
     // Steady-state: require a real keep-alive reply (same fail-closed policy as gRPC/Vision).
     if (opts.transport_ws) {
@@ -288,9 +286,7 @@ pub fn probe(
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     }
-    http_len = 0;
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired);
-    try target.steady_reply.check(http_buf[0..http_len]);
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired, target.steady_reply);
 
     return netutil.elapsedMs(attempt_start, io);
 }

@@ -41,13 +41,6 @@ fn connectHostnameTimed(
     bind: ?[]const u8,
 ) !Io.net.Stream {
     const hostname = try Io.net.HostName.init(host);
-    if (builtin.target.os.tag == .windows) {
-        // Best-effort: timed IP connect is Linux/posix-only below.
-        const stream = try hostname.connect(io, port, .{ .mode = .stream });
-        setTcpNoDelay(stream);
-        return stream;
-    }
-
     const deadline = deadlineNs(io, timeout_secs);
 
     var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
@@ -216,6 +209,7 @@ test "hostname dial fails fast when no unit of concurrency is available" {
 }
 
 test "classifyPoll lets the requested event win and splits hangup from error" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const OUT = posix.POLL.OUT;
     const IN = posix.POLL.IN;
     const ERR = posix.POLL.ERR;
@@ -243,12 +237,14 @@ test "classifyPoll lets the requested event win and splits hangup from error" {
 }
 
 test "applyBind treats null as no-op and empty spec as an error" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     // Neither touches the (invalid) socket fd: they return before any syscall.
     try applyBind(0, null);
     try std.testing.expectError(error.EmptyInterfaceName, applyBind(0, ""));
 }
 
 test "bindToDevice rejects over-long interface name without calling setsockopt" {
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     // 16 chars == IFNAMSIZ: rejected before setsockopt, so a bogus fd is safe.
     try std.testing.expectError(error.InterfaceNameTooLong, bindToDevice(0, "0123456789abcdef"));
 }
@@ -269,8 +265,7 @@ fn connectIpUntil(
     bind: ?[]const u8,
 ) !Io.net.Stream {
     if (builtin.target.os.tag == .windows) {
-        // Best-effort: Zig Windows connect timeout is also TODO.
-        return address.connect(io, .{ .mode = .stream });
+        return connectIpWindowsUntil(io, address, deadline);
     }
 
     const family: posix.sa_family_t = switch (address) {
@@ -287,6 +282,100 @@ fn connectIpUntil(
     try clearNonblock(sock);
 
     return .{ .socket = .{ .handle = sock, .address = address } };
+}
+
+/// Windows sockets used by `std.Io` are asynchronous AFD handles, not Winsock
+/// descriptors. Start an overlapped connect and wait on that handle so the same
+/// absolute deadline covers both direct IP dials and resolved hostname addresses.
+fn connectIpWindowsUntil(io: Io, address: Io.net.IpAddress, deadline: i128) !Io.net.Stream {
+    const windows = std.os.windows;
+    const local_address: Io.net.IpAddress = switch (address) {
+        .ip4 => .{ .ip4 = .unspecified(0) },
+        .ip6 => .{ .ip6 = .unspecified(0) },
+    };
+    const socket = try local_address.bind(io, .{ .mode = .stream });
+    errdefer socket.close(io);
+
+    const Storage = extern struct {
+        Reserved0: [3]usize = @splat(0),
+        Address: Io.Threaded.PosixAddress,
+    };
+    var storage: Storage = .{ .Address = undefined };
+    const addr_len = Io.Threaded.addressToPosix(&address, &storage.Address);
+    const input = @as([]const u8, @ptrCast(&storage))[0 .. @offsetOf(Storage, "Address") + addr_len];
+    var iosb: windows.IO_STATUS_BLOCK = undefined;
+    const status = windows.ntdll.NtDeviceIoControlFile(
+        socket.handle,
+        null,
+        null,
+        null,
+        &iosb,
+        windows.IOCTL.AFD.CONNECT,
+        input.ptr,
+        @intCast(input.len),
+        null,
+        0,
+    );
+    if (status != .PENDING) {
+        try checkWindowsConnectStatus(status);
+        return .{ .socket = socket };
+    }
+
+    while (true) {
+        const now = monoNow(io);
+        if (now >= deadline) {
+            cancelWindowsConnect(socket.handle, &iosb);
+            return error.ConnectTimeout;
+        }
+        const remaining_100ns = @divTrunc(deadline - now, 100);
+        const timeout: windows.LARGE_INTEGER = -@as(i64, @intCast(@min(remaining_100ns, std.math.maxInt(i64))));
+        switch (windows.ntdll.NtWaitForSingleObject(socket.handle, .FALSE, &timeout)) {
+            .SUCCESS => {
+                try checkWindowsConnectStatus(iosb.u.Status);
+                return .{ .socket = socket };
+            },
+            .TIMEOUT => {
+                cancelWindowsConnect(socket.handle, &iosb);
+                return error.ConnectTimeout;
+            },
+            else => |wait_status| return windows.unexpectedStatus(wait_status),
+        }
+    }
+}
+
+fn cancelWindowsConnect(handle: std.os.windows.HANDLE, iosb: *std.os.windows.IO_STATUS_BLOCK) void {
+    const windows = std.os.windows;
+    var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
+    _ = windows.ntdll.NtCancelIoFileEx(handle, iosb, &cancel_iosb);
+    // The status block and input buffer are stack-owned: drain completion even
+    // when cancellation loses a race with the connect finishing.
+    _ = windows.ntdll.NtWaitForSingleObject(handle, .FALSE, null);
+}
+
+fn checkWindowsConnectStatus(status: std.os.windows.NTSTATUS) !void {
+    switch (status) {
+        .SUCCESS => {},
+        .CANCELLED, .IO_TIMEOUT, .LINK_TIMEOUT => return error.ConnectTimeout,
+        .CONNECTION_REFUSED => return error.ConnectionRefused,
+        .CONNECTION_RESET => return error.ConnectionResetByPeer,
+        .NETWORK_UNREACHABLE => return error.NetworkUnreachable,
+        .HOST_UNREACHABLE => return error.HostUnreachable,
+        .ACCESS_DENIED, .NETWORK_ACCESS_DENIED => return error.AccessDenied,
+        .INSUFFICIENT_RESOURCES => return error.SystemResources,
+        else => return std.os.windows.unexpectedStatus(status),
+    }
+}
+
+test "Windows connect completion status preserves socket errors" {
+    try checkWindowsConnectStatus(.SUCCESS);
+    try std.testing.expectError(error.ConnectTimeout, checkWindowsConnectStatus(.CANCELLED));
+    try std.testing.expectError(error.ConnectTimeout, checkWindowsConnectStatus(.IO_TIMEOUT));
+    try std.testing.expectError(error.ConnectionRefused, checkWindowsConnectStatus(.CONNECTION_REFUSED));
+    try std.testing.expectError(error.ConnectionResetByPeer, checkWindowsConnectStatus(.CONNECTION_RESET));
+    try std.testing.expectError(error.NetworkUnreachable, checkWindowsConnectStatus(.NETWORK_UNREACHABLE));
+    try std.testing.expectError(error.HostUnreachable, checkWindowsConnectStatus(.HOST_UNREACHABLE));
+    try std.testing.expectError(error.AccessDenied, checkWindowsConnectStatus(.ACCESS_DENIED));
+    try std.testing.expectError(error.SystemResources, checkWindowsConnectStatus(.INSUFFICIENT_RESOURCES));
 }
 
 fn openSocket(family: posix.sa_family_t, flags: u32) !posix.socket_t {
@@ -588,6 +677,13 @@ pub fn waitReadableUntil(stream: Io.net.Stream, io: Io, deadline: i128) !void {
 ///
 /// Also the only read deadline on Windows, where `waitReadableUntil` does not poll.
 pub const DeadlineShutdown = struct {
+    const State = struct {
+        wake: Io.Event = .unset,
+        started: Io.Event = .unset,
+    };
+
+    io: Io,
+    state: *State,
     done: *std.atomic.Value(bool),
     fired: *std.atomic.Value(bool),
     thread: std.Thread,
@@ -601,13 +697,18 @@ pub const DeadlineShutdown = struct {
     ) !DeadlineShutdown {
         done.* = std.atomic.Value(bool).init(false);
         fired.* = std.atomic.Value(bool).init(false);
-        const thread = try std.Thread.spawn(.{}, watchdog, .{ io, stream, timeout_ns, done, fired });
-        return .{ .done = done, .fired = fired, .thread = thread };
+        const state = try std.heap.c_allocator.create(State);
+        state.* = .{};
+        errdefer std.heap.c_allocator.destroy(state);
+        const thread = try std.Thread.spawn(.{}, watchdog, .{ io, stream, timeout_ns, done, fired, state });
+        return .{ .io = io, .state = state, .done = done, .fired = fired, .thread = thread };
     }
 
     pub fn disarm(self: *DeadlineShutdown) void {
         self.done.store(true, .release);
+        self.state.wake.set(self.io);
         self.thread.join();
+        std.heap.c_allocator.destroy(self.state);
     }
 
     fn watchdog(
@@ -616,14 +717,16 @@ pub const DeadlineShutdown = struct {
         timeout_ns: u64,
         done: *std.atomic.Value(bool),
         fired: *std.atomic.Value(bool),
+        state: *State,
     ) void {
-        const chunk: u64 = 50 * std.time.ns_per_ms;
-        var left = timeout_ns;
-        while (left > 0 and !done.load(.acquire)) {
-            const step = @min(left, chunk);
-            io.sleep(.fromNanoseconds(step), .awake) catch {};
-            left -= step;
-        }
+        state.started.set(io);
+        state.wake.waitTimeout(io, .{ .duration = .{
+            .raw = .fromNanoseconds(timeout_ns),
+            .clock = .awake,
+        } }) catch |err| switch (err) {
+            error.Timeout => {},
+            error.Canceled => unreachable,
+        };
         if (!done.load(.acquire)) {
             fired.store(true, .release);
             // Io's shutdown, not posix: it is the one that also exists on Windows.
@@ -689,6 +792,23 @@ pub fn remainingTimeoutSecs(start_ns: i128, io: Io, timeout_secs: u32) u32 {
 pub fn flushTls(tls_writer: *Io.Writer, socket_writer: *Io.Writer) !void {
     try tls_writer.flush();
     try socket_writer.flush();
+}
+
+test "DeadlineShutdown disarm interrupts a pending watchdog wait" {
+    // Arrange: a watchdog with plenty of time left, known to have reached its wait.
+    const io = std.testing.io;
+    var done = std.atomic.Value(bool).init(false);
+    var fired = std.atomic.Value(bool).init(false);
+    var guard = try DeadlineShutdown.arm(io, undefined, 5 * std.time.ns_per_s, &done, &fired);
+    try guard.state.started.wait(io);
+
+    // Act: disarm must wake the watchdog instead of waiting out a polling chunk.
+    const start = monoNow(io);
+    guard.disarm();
+
+    // Assert
+    try std.testing.expect(elapsedMs(start, io) < 50);
+    try std.testing.expect(!fired.load(.acquire));
 }
 
 test "DeadlineShutdown unblocks a blocking read on a silent peer" {

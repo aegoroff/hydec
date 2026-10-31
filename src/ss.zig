@@ -172,23 +172,9 @@ fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8, scratch: []u8) !u
     return payload_len;
 }
 
-/// Consume one complete HTTP response from the front of `http_buf`.
-///
-/// Returns false while the response is still short. On completion the echoed UA is
-/// checked against that response only (not the whole buffer, which may already hold
-/// the pipelined next one), and any leftover bytes are shifted down to offset 0 so
-/// the following call continues from them.
+/// Consume informational replies and one final response, preserving pipelined bytes.
 fn takeResponse(http_buf: []u8, http_len: *usize, expect: util.ProbeReply) error{ ProbeResponseMismatch, VolumeRefused }!bool {
-    const lens = switch (util.httpResponseState(http_buf[0..http_len.*])) {
-        .incomplete, .close_delimited => return false,
-        .malformed => return error.ProbeResponseMismatch,
-        .complete => |lens| lens,
-    };
-    try expect.check(http_buf[0..lens.total]);
-    const remain = http_len.* - lens.total;
-    if (remain > 0) std.mem.copyForwards(u8, http_buf[0..remain], http_buf[lens.total..http_len.*]);
-    http_len.* = remain;
-    return true;
+    return util.takeProbeResponse(http_buf, http_len, expect, false);
 }
 
 /// Read AEAD chunks until `takeResponse` consumes one response matching `expect`.
@@ -205,10 +191,8 @@ fn readProbeResponse(
         const n = readOpenChunk(server_ctx, &sr.interface, http_buf[http_len.*..], chunk_buf) catch |err| {
             const e = netutil.classifyIoErr(err, null, sr.err, fired.load(.acquire));
             // Unframed responses complete at peer close; truncated CL/chunked must fail.
-            if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) {
-                try expect.check(http_buf[0..http_len.*]);
-                http_len.* = 0;
-                return;
+            if (util.isPeerClosed(e)) {
+                if (try util.takeProbeResponse(http_buf, http_len, expect, true)) return;
             }
             return e;
         };
@@ -337,6 +321,96 @@ test "evpBytesToKey matches OpenSSL EVP_BytesToKey(MD5)" {
     }, &key32);
 }
 
+test "HKDF-SHA1 and AEAD chunk known-answer vectors" {
+    // Independent reference: Node.js crypto.hkdfSync("sha1") and createCipheriv.
+    // sealChunk seals 00 03 with nonce 0, then "abc" with nonce 1.
+    const master: [32]u8 = .{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    };
+    const salt: [32]u8 = .{
+        0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+        0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+        0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+        0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+    };
+    const Vector = struct {
+        method: Method,
+        subkey: []const u8,
+        wire: []const u8,
+    };
+    const vectors: []const Vector = &.{
+        .{
+            .method = .aes_128_gcm,
+            .subkey = &.{
+                0xf0, 0xa4, 0xbe, 0x5d, 0x42, 0x09, 0xa6, 0x16, 0x8b, 0x93,
+                0x6a, 0x2b, 0xa4, 0x4c, 0xa3, 0x40,
+            },
+            .wire = &.{
+                0x5d, 0xce, 0xfd, 0x40, 0xbf, 0x0d, 0xe8, 0x99, 0xeb, 0xf0,
+                0x8c, 0xc3, 0x9c, 0xd2, 0xdb, 0xb1, 0xea, 0x8d, 0xcb, 0xb9,
+                0x6e, 0x9a, 0xc0, 0x1c, 0x96, 0xca, 0x21, 0xc5, 0xe4, 0x5e,
+                0xee, 0xe7, 0x46, 0xb4, 0xcf, 0xf8, 0xbc,
+            },
+        },
+        .{
+            .method = .aes_256_gcm,
+            .subkey = &.{
+                0x7d, 0xc1, 0x97, 0xfc, 0xef, 0x2d, 0xc7, 0xe6,
+                0x61, 0x03, 0x27, 0x35, 0x76, 0x75, 0xfc, 0x6a,
+                0x83, 0x16, 0x98, 0x33, 0x5a, 0x9b, 0x23, 0xd1,
+                0x24, 0x22, 0xa6, 0xb2, 0x06, 0x77, 0x91, 0xa6,
+            },
+            .wire = &.{
+                0xac, 0x65, 0xe2, 0x61, 0x21, 0xce, 0x30, 0xf2, 0x97, 0x9a,
+                0xd1, 0x59, 0x39, 0x65, 0xf3, 0x11, 0x80, 0x05, 0x0e, 0x26,
+                0x88, 0x7b, 0xd2, 0xb5, 0x6d, 0xa6, 0x05, 0x4b, 0x02, 0xd9,
+                0xd0, 0x1d, 0x63, 0x35, 0xd4, 0x58, 0x92,
+            },
+        },
+        .{
+            .method = .chacha20_ietf_poly1305,
+            .subkey = &.{
+                0x7d, 0xc1, 0x97, 0xfc, 0xef, 0x2d, 0xc7, 0xe6,
+                0x61, 0x03, 0x27, 0x35, 0x76, 0x75, 0xfc, 0x6a,
+                0x83, 0x16, 0x98, 0x33, 0x5a, 0x9b, 0x23, 0xd1,
+                0x24, 0x22, 0xa6, 0xb2, 0x06, 0x77, 0x91, 0xa6,
+            },
+            .wire = &.{
+                0x19, 0xfb, 0x47, 0x84, 0x24, 0xcd, 0x59, 0xcd, 0xfc, 0x03,
+                0x96, 0xac, 0x29, 0x8e, 0xf7, 0x80, 0xa4, 0xeb, 0xdc, 0xef,
+                0x45, 0x11, 0xfb, 0x28, 0x5e, 0x5e, 0xb3, 0xc6, 0x5b, 0x59,
+                0xcf, 0x50, 0xe5, 0x76, 0x09, 0x27, 0x47,
+            },
+        },
+    };
+
+    for (vectors) |vector| {
+        var key: [32]u8 = @splat(0);
+        hkdfSha1(master[0..vector.method.keyLen()], salt[0..vector.method.saltLen()], key[0..vector.method.keyLen()]);
+        try std.testing.expectEqualSlices(u8, vector.subkey, key[0..vector.method.keyLen()]);
+
+        var ctx: AeadCtx = .{ .method = vector.method, .key = key };
+        var sealed: [2 + 16 + 3 + 16]u8 = undefined;
+        const n = try sealChunk(&ctx, &sealed, "abc");
+        try std.testing.expectEqual(@as(usize, 37), n);
+        try std.testing.expectEqualSlices(u8, vector.wire, sealed[0..n]);
+        var expected_nonce: [12]u8 = @splat(0);
+        expected_nonce[0] = 2;
+        try std.testing.expectEqualSlices(u8, &expected_nonce, &ctx.nonce);
+
+        var open_ctx: AeadCtx = .{ .method = vector.method, .key = key };
+        var reader: Io.Reader = .fixed(vector.wire);
+        var opened: [3]u8 = undefined;
+        var scratch: [3]u8 = undefined;
+        const opened_len = try readOpenChunk(&open_ctx, &reader, &opened, &scratch);
+        try std.testing.expectEqualStrings("abc", opened[0..opened_len]);
+        try std.testing.expectEqualSlices(u8, &expected_nonce, &open_ctx.nonce);
+    }
+}
+
 test "aead seal/open chunk roundtrip" {
     var seal_ctx: AeadCtx = .{
         .method = .chacha20_ietf_poly1305,
@@ -423,6 +497,20 @@ const TEST_WARM_RESP =
     "HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\nvisit_scheme=http\nuag=hydec-warmup\n";
 const TEST_STEADY_RESP =
     "HTTP/1.1 200 OK\r\nContent-Length: 35\r\n\r\nvisit_scheme=http\nuag=hydec-steady\n";
+
+test "takeResponse skips informational replies before both responses" {
+    const steady_wire = "HTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n" ++ TEST_STEADY_RESP;
+    const wire = "HTTP/1.1 100 Continue\r\n\r\n" ++ TEST_WARM_RESP ++ steady_wire;
+    var buf: [512]u8 = undefined;
+    @memcpy(buf[0..wire.len], wire);
+    var len = wire.len;
+
+    try std.testing.expect(try takeResponse(&buf, &len, .{ .trace = util.PROBE_UA_WARMUP }));
+    try std.testing.expectEqual(steady_wire.len, len);
+    try std.testing.expectEqualStrings(steady_wire, buf[0..len]);
+    try std.testing.expect(try takeResponse(&buf, &len, .{ .trace = util.PROBE_UA_STEADY }));
+    try std.testing.expectEqual(@as(usize, 0), len);
+}
 
 test "takeResponse keeps bytes of the pipelined next response" {
     var buf: [512]u8 = undefined;

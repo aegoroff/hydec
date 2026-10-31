@@ -73,11 +73,14 @@ fn headerContainsToken(response: []const u8, name: []const u8, token: []const u8
 }
 
 fn validateUpgradeResponse(hdr: []const u8, key_b64: []const u8) !void {
-    if (!std.mem.startsWith(u8, hdr, "HTTP/1.1 101") and
-        !std.mem.startsWith(u8, hdr, "HTTP/1.0 101"))
-    {
-        return error.WebSocketUpgradeFailed;
-    }
+    const status_prefix_len = "HTTP/1.1 101".len;
+    const valid_version = std.mem.startsWith(u8, hdr, "HTTP/1.1 101") or
+        std.mem.startsWith(u8, hdr, "HTTP/1.0 101");
+    const status_end = std.mem.find(u8, hdr, "\r\n") orelse return error.WebSocketUpgradeFailed;
+    const status_line = hdr[0..status_end];
+    const valid_delimiter = status_line.len == status_prefix_len or
+        (status_line.len > status_prefix_len and status_line[status_prefix_len] == ' ');
+    if (!valid_version or !valid_delimiter) return error.WebSocketUpgradeFailed;
 
     const upgrade = headerValue(hdr, "Upgrade") orelse return error.WebSocketUpgradeFailed;
     if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return error.WebSocketUpgradeFailed;
@@ -111,6 +114,34 @@ fn consumeUpgradeResponse(reader: *Io.Reader, key_b64: []const u8) !void {
     }
 }
 
+fn isRequestTargetByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or switch (c) {
+        '-', '.', '_', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':', '@', '/', '?' => true,
+        else => false,
+    };
+}
+
+fn writeRequestTarget(writer: *Io.Writer, path: []const u8) !void {
+    const hex = "0123456789ABCDEF";
+    for (path) |c| {
+        if (isRequestTargetByte(c)) {
+            try writer.writeByte(c);
+        } else {
+            const escaped = [3]u8{ '%', hex[c >> 4], hex[c & 0x0f] };
+            try writer.writeAll(&escaped);
+        }
+    }
+}
+
+fn writeUpgradeRequest(writer: *Io.Writer, path: []const u8, host_header: []const u8, key_b64: []const u8) !void {
+    try writer.writeAll("GET ");
+    try writeRequestTarget(writer, path);
+    try writer.print(
+        " HTTP/1.1\r\nHost: {s}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        .{ host_header, key_b64 },
+    );
+}
+
 pub fn performUpgrade(
     conn: Conn,
     io: Io,
@@ -126,13 +157,7 @@ pub fn performUpgrade(
     var key_b64_buf: [32]u8 = undefined;
     const key_b64 = std.base64.standard.Encoder.encode(&key_b64_buf, &key_raw);
 
-    var req_buf: [512]u8 = undefined;
-    const req = try std.mem.print(
-        &req_buf,
-        "GET {s} HTTP/1.1\r\nHost: {s}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n\r\n",
-        .{ path, host_header, key_b64 },
-    );
-    try conn.tls.writeAll(req);
+    try writeUpgradeRequest(conn.tls, path, host_header, key_b64);
     try conn.flush();
 
     try consumeUpgradeResponse(conn.reader, key_b64);
@@ -269,6 +294,49 @@ pub fn readBinaryFrame(conn: Conn, io: Io, out: []u8) !usize {
     }
 }
 
+test "writeUpgradeRequest serializes a decoded path as exact request bytes" {
+    var buf: [512]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try writeUpgradeRequest(
+        &writer,
+        "/chat room/100%/caf\u{00e9}?x=a b&y=/ok#frag\r\n\x00",
+        "example.com",
+        "dGhlIHNhbXBsZSBub25jZQ==",
+    );
+    try std.testing.expectEqualStrings(
+        "GET /chat%20room/100%25/caf%C3%A9?x=a%20b&y=/ok%23frag%0D%0A%00 HTTP/1.1\r\n" ++
+            "Host: example.com\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n\r\n",
+        writer.buffered(),
+    );
+}
+
+test "writeUpgradeRequest handles long paths and hosts" {
+    var long_path_buf: [701]u8 = undefined;
+    long_path_buf[0] = '/';
+    @memset(long_path_buf[1..], 'a');
+    var long_host_buf: [608]u8 = undefined;
+    @memset(long_host_buf[0..600], 'b');
+    @memcpy(long_host_buf[600..], ".example");
+
+    var buf: [2048]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try writeUpgradeRequest(&writer, &long_path_buf, &long_host_buf, "dGhlIHNhbXBsZSBub25jZQ==");
+
+    const req = writer.buffered();
+    const path_end = "GET ".len + long_path_buf.len;
+    const host_start = path_end + " HTTP/1.1\r\nHost: ".len;
+    try std.testing.expect(req.len > 512);
+    try std.testing.expectEqualStrings("GET ", req[0..4]);
+    try std.testing.expectEqualStrings(&long_path_buf, req[4..path_end]);
+    try std.testing.expectEqualStrings(" HTTP/1.1\r\nHost: ", req[path_end..host_start]);
+    try std.testing.expectEqualStrings(&long_host_buf, req[host_start..][0..long_host_buf.len]);
+    try std.testing.expect(std.mem.endsWith(u8, req, "Sec-WebSocket-Version: 13\r\n\r\n"));
+}
+
 test "expectAccept matches RFC 6455 example" {
     // RFC 6455 §1.3 example key → accept
     var out: [28]u8 = undefined;
@@ -302,6 +370,34 @@ test "validateUpgradeResponse requires accept" {
         "Sec-WebSocket-Accept: wrong\r\n" ++
         "\r\n";
     try std.testing.expectError(error.WebSocketAcceptMismatch, validateUpgradeResponse(bad, key));
+}
+
+test "validateUpgradeResponse rejects malformed 101 statuses" {
+    const hdr_1010 =
+        "HTTP/1.1 1010 Switching Protocols\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "\r\n";
+    const hdr_garbage =
+        "HTTP/1.1 101garbage\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "\r\n";
+    const hdr_bad_cr =
+        "HTTP/1.1 101\rX\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "\r\n";
+    const headers = [_][]const u8{ hdr_1010, hdr_garbage, hdr_bad_cr };
+    for (headers) |hdr| {
+        try std.testing.expectError(
+            error.WebSocketUpgradeFailed,
+            validateUpgradeResponse(hdr, "dGhlIHNhbXBsZSBub25jZQ=="),
+        );
+    }
 }
 
 test "consumeUpgradeResponse keeps post-header bytes" {

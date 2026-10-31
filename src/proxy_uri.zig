@@ -56,10 +56,14 @@ pub const Proxy = struct {
 
     /// Percent-decoded query value; caller owns the slice. `null` if the key is absent.
     pub fn getParamDecoded(self: Proxy, gpa: std.mem.Allocator, key: []const u8) !?[]u8 {
-        const raw = util.getQueryParam(self.query, key) orelse return null;
-        return try util.urlDecodeStrict(gpa, raw);
+        return decodeQueryParam(gpa, self.query, key);
     }
 };
+
+fn decodeQueryParam(gpa: std.mem.Allocator, query: []const u8, key: []const u8) !?[]u8 {
+    const raw = util.getQueryParam(query, key) orelse return null;
+    return try util.urlDecodeStrict(gpa, raw);
+}
 
 fn startsWithScheme(line: []const u8, scheme: []const u8) bool {
     if (line.len < scheme.len + 3) return false;
@@ -174,6 +178,10 @@ fn parseVless(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     const rest = afterScheme(line);
     const parts = try parseUserAtHost(gpa, rest, 443);
     errdefer if (parts.owns_userinfo) gpa.free(parts.userinfo);
+    const type_param = try decodeQueryParam(gpa, parts.query, "type");
+    defer if (type_param) |value| gpa.free(value);
+    const security_param = try decodeQueryParam(gpa, parts.query, "security");
+    defer if (security_param) |value| gpa.free(value);
     const name = try parseName(gpa, line);
     return .{
         .kind = .vless,
@@ -183,8 +191,8 @@ fn parseVless(gpa: std.mem.Allocator, line: []const u8) !Proxy {
         .userinfo = parts.userinfo,
         .owns_userinfo = parts.owns_userinfo,
         .query = parts.query,
-        .transport = parseTransport(util.getQueryParam(parts.query, "type")),
-        .security = parseSecurity(util.getQueryParam(parts.query, "security")),
+        .transport = parseTransport(type_param),
+        .security = parseSecurity(security_param),
         .name = name,
     };
 }
@@ -193,6 +201,10 @@ fn parseTrojan(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     const rest = afterScheme(line);
     const parts = try parseUserAtHost(gpa, rest, 443);
     errdefer if (parts.owns_userinfo) gpa.free(parts.userinfo);
+    const type_param = try decodeQueryParam(gpa, parts.query, "type");
+    defer if (type_param) |value| gpa.free(value);
+    const security_param = try decodeQueryParam(gpa, parts.query, "security");
+    defer if (security_param) |value| gpa.free(value);
     const name = try parseName(gpa, line);
     return .{
         .kind = .trojan,
@@ -202,8 +214,8 @@ fn parseTrojan(gpa: std.mem.Allocator, line: []const u8) !Proxy {
         .userinfo = parts.userinfo,
         .owns_userinfo = parts.owns_userinfo,
         .query = parts.query,
-        .transport = parseTransport(util.getQueryParam(parts.query, "type")),
-        .security = parseSecurity(util.getQueryParam(parts.query, "security") orelse "tls"),
+        .transport = parseTransport(type_param),
+        .security = if (security_param) |value| parseSecurity(value) else .tls,
         .name = name,
     };
 }
@@ -366,6 +378,22 @@ test "parse type security case-insensitive" {
     defer p.deinit(gpa);
     try std.testing.expect(p.transport == .tcp);
     try std.testing.expect(p.security == .reality);
+}
+
+test "parse percent-decodes type and security" {
+    const gpa = std.testing.allocator;
+    var vless = try parse(
+        gpa,
+        "vless://00000000-1111-2222-3333-444444444444@192.0.2.10:8444?security=re%61lity&type=g%72pc",
+    );
+    defer vless.deinit(gpa);
+    try std.testing.expect(vless.security == .reality);
+    try std.testing.expect(vless.transport == .grpc);
+
+    var trojan = try parse(gpa, "trojan://pw@192.0.2.10:2058?security=t%6Cs&type=w%73");
+    defer trojan.deinit(gpa);
+    try std.testing.expect(trojan.security == .tls);
+    try std.testing.expect(trojan.transport == .ws);
 }
 
 test "parseTransport treats raw as tcp" {

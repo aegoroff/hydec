@@ -21,6 +21,12 @@ const NAMED_GROUP_X25519: u16 = 0x001d;
 /// `RealityConn.readApp` scratch — Vision downlink must accept one full record.
 const MAX_TLS_RECORD_LEN = 16640;
 
+const GRPC_FRAME_HEADER_LEN = 9;
+const GRPC_MAX_FRAME_PAYLOAD_LEN = 16384;
+// A maximum-size frame may be one byte short after the previous read. The next
+// full read must fit before that frame can be parsed and shifted out.
+const GRPC_GATHER_BUF_LEN = 2 * GRPC_MAX_FRAME_PAYLOAD_LEN + GRPC_FRAME_HEADER_LEN - 1;
+
 /// Post-handshake TLS 1.3 messages (typ 22). NewSessionTicket is ignorable;
 /// KeyUpdate would require traffic-secret rotation we do not keep — fail closed.
 fn rejectPostHandshakeKeyUpdate(plaintext: []const u8) !void {
@@ -936,6 +942,25 @@ fn grpcProbeHttpReady(buf: []u8, len: *usize, chunk: []const u8, stripped: *bool
     return true;
 }
 
+fn appendGrpcRead(gather: []u8, gather_len: *usize, chunk: []const u8) !void {
+    if (gather_len.* + chunk.len > gather.len) return error.BufferTooSmall;
+    @memcpy(gather[gather_len.*..][0..chunk.len], chunk);
+    gather_len.* += chunk.len;
+}
+
+fn validateGrpcFrameStream(ftyp: u8, stream_id: u32) !void {
+    switch (ftyp) {
+        // The probe opens only stream 1; response frames on any other stream
+        // cannot establish its status or supply its DATA.
+        0x00, 0x01, 0x03, 0x09 => if (stream_id != 1) return error.InvalidHttp2Framing,
+        // SETTINGS, PING and GOAWAY are connection-level frames.
+        0x04, 0x06, 0x07 => if (stream_id != 0) return error.InvalidHttp2Framing,
+        // PRIORITY, WINDOW_UPDATE and unknown extensions need no response-stream
+        // restriction here; WINDOW_UPDATE is valid on both a stream and the connection.
+        else => {},
+    }
+}
+
 /// Probe VLESS over REALITY (TCP Vision or gRPC gun).
 /// Warmup proves the tunnel; returned latency is the second (steady-state) request.
 pub fn probeVless(
@@ -979,8 +1004,8 @@ pub fn probeVless(
     const plen = try grpc_gun.buildClientPrefaceSettings(&preface);
     try rc.writeApp(preface[0..plen]);
 
-    var app_buf: [16384]u8 = undefined;
-    var gather: [32768]u8 = undefined;
+    var app_buf: [GRPC_MAX_FRAME_PAYLOAD_LEN]u8 = undefined;
+    var gather: [GRPC_GATHER_BUF_LEN]u8 = undefined;
     var gather_len: usize = 0;
     var settings_seen = false;
     var request_sent = false;
@@ -1005,9 +1030,7 @@ pub fn probeVless(
             // and one-shot false positives.
             return err;
         };
-        if (gather_len + n > gather.len) return error.BufferTooSmall;
-        @memcpy(gather[gather_len..][0..n], app_buf[0..n]);
-        gather_len += n;
+        try appendGrpcRead(&gather, &gather_len, app_buf[0..n]);
 
         var off: usize = 0;
         while (off + 9 <= gather_len) {
@@ -1016,6 +1039,8 @@ pub fn probeVless(
             const fflags = gather[off + 4];
             if (off + 9 + frame_len > gather_len) break;
 
+            const stream_id = std.mem.readInt(u32, gather[off + 5 ..][0..4], .big) & 0x7fffffff;
+            try validateGrpcFrameStream(ftyp, stream_id);
             const payload = gather[off + 9 .. off + 9 + frame_len];
             const inflight = warmup_done and off < discard_data_before;
             if (header_block.pending and ftyp != 0x09) return error.InvalidHttp2Framing;
@@ -1137,7 +1162,9 @@ const VisionPipe = struct {
     uplink_padding: bool = true,
     err: ?anyerror = null,
 
-    wire: [MAX_TLS_RECORD_LEN]u8 = undefined,
+    // Leave room for an incomplete frame plus one full read before the completed
+    // prefix can be drained and shifted out.
+    wire: [2 * MAX_TLS_RECORD_LEN]u8 = undefined,
     wire_len: usize = 0,
     plain: [MAX_TLS_RECORD_LEN]u8 = undefined,
     plain_len: usize = 0,
@@ -1511,7 +1538,7 @@ fn appendSealedRecord(
     content_type: u8,
     content: []const u8,
 ) usize {
-    var inner: [64]u8 = undefined;
+    var inner: [MAX_TLS_RECORD_LEN]u8 = undefined;
     @memcpy(inner[0..content.len], content);
     inner[content.len] = content_type;
     const inner_len = content.len + 1;
@@ -1768,6 +1795,92 @@ test "appendStripVlessHeader large first chunk" {
     try appendStripVlessHeader(&buf, &len, &chunk, &stripped);
     try std.testing.expect(stripped);
     try std.testing.expectEqual(@as(usize, 598), len);
+}
+
+test "gRPC gather accepts a maximum frame split across full reads" {
+    // Eight buffered header bytes plus one full read leave a maximum-size frame
+    // one byte short. The next full read must fit before parsing can shift it out.
+    var wire: [8 + 2 * GRPC_MAX_FRAME_PAYLOAD_LEN]u8 = @splat(0xa5);
+    std.mem.writeInt(u24, wire[0..3], GRPC_MAX_FRAME_PAYLOAD_LEN, .big);
+    wire[3] = 0x00; // DATA
+    std.mem.writeInt(u32, wire[5..9], 1, .big);
+    const first_total = GRPC_FRAME_HEADER_LEN + GRPC_MAX_FRAME_PAYLOAD_LEN;
+    std.mem.writeInt(u24, wire[first_total..][0..3], GRPC_MAX_FRAME_PAYLOAD_LEN, .big);
+    wire[first_total + 3] = 0x00;
+    std.mem.writeInt(u32, wire[first_total + 5 ..][0..4], 1, .big);
+
+    var gather: [GRPC_GATHER_BUF_LEN]u8 = undefined;
+    var gather_len: usize = 8;
+    @memcpy(gather[0..8], wire[0..8]);
+    try appendGrpcRead(&gather, &gather_len, wire[8..][0..GRPC_MAX_FRAME_PAYLOAD_LEN]);
+    try std.testing.expectEqual(first_total - 1, gather_len);
+    try appendGrpcRead(&gather, &gather_len, wire[8 + GRPC_MAX_FRAME_PAYLOAD_LEN ..]);
+
+    const frame_len = std.mem.readInt(u24, gather[0..3], .big);
+    try std.testing.expectEqual(GRPC_MAX_FRAME_PAYLOAD_LEN, frame_len);
+    try validateGrpcFrameStream(gather[3], std.mem.readInt(u32, gather[5..9], .big));
+    shiftDown(&gather, &gather_len, first_total);
+    try std.testing.expectEqual(wire.len - first_total, gather_len);
+}
+
+test "gRPC HEADERS and DATA reject the wrong stream" {
+    for ([_]u8{ 0x00, 0x01 }) |ftyp| {
+        try std.testing.expectError(error.InvalidHttp2Framing, validateGrpcFrameStream(ftyp, 0));
+        try std.testing.expectError(error.InvalidHttp2Framing, validateGrpcFrameStream(ftyp, 3));
+        try validateGrpcFrameStream(ftyp, 1);
+    }
+    try std.testing.expectError(error.InvalidHttp2Framing, validateGrpcFrameStream(0x09, 3));
+    try std.testing.expectError(error.InvalidHttp2Framing, validateGrpcFrameStream(0x03, 3));
+}
+
+test "gRPC stream validation accepts valid connection frames" {
+    for ([_]u8{ 0x04, 0x06, 0x07 }) |ftyp| {
+        try validateGrpcFrameStream(ftyp, 0);
+        try std.testing.expectError(error.InvalidHttp2Framing, validateGrpcFrameStream(ftyp, 1));
+    }
+    // WINDOW_UPDATE is valid at connection and stream scope; extensions are ignored.
+    for ([_]u32{ 0, 1, 3 }) |stream_id| try validateGrpcFrameStream(0x08, stream_id);
+    try validateGrpcFrameStream(0xff, 3);
+}
+
+test "VisionPipe drains a frame completed by a full read after incomplete data" {
+    const max_app_len = MAX_TLS_RECORD_LEN - 17; // ciphertext tag and inner content type
+    const first_content_len = MAX_TLS_RECORD_LEN - 21; // UUID plus Vision header
+    const first_content: [first_content_len]u8 = @splat(0x5c);
+    var uuid: [16]u8 = @splat(0x91);
+
+    var clear: [2 * max_app_len]u8 = undefined;
+    clear[0] = 0;
+    clear[1] = 0;
+    var pos: usize = 2;
+    pos += try vless.appendVisionFrame(clear[pos..], vless.VISION_CMD_CONTINUE, &uuid, &first_content, 0);
+    clear[pos] = vless.VISION_CMD_CONTINUE;
+    std.mem.writeInt(u16, clear[pos + 1 ..][0..2], first_content_len - 19, .big);
+    std.mem.writeInt(u16, clear[pos + 3 ..][0..2], 0, .big);
+    pos += 5;
+    @memset(clear[pos..], 0xcd); // one byte short of the second frame's content
+
+    const record_len = max_app_len + 22;
+    var sealed: [2 * record_len]u8 = undefined;
+    var sealed_len = appendSealedRecord(&sealed, &TEST_RECORD_KEY, &TEST_RECORD_IV, 0, 23, clear[0..max_app_len]);
+    sealed_len += appendSealedRecord(sealed[sealed_len..], &TEST_RECORD_KEY, &TEST_RECORD_IV, 1, 23, clear[max_app_len..]);
+    var reader: Io.Reader = .fixed(sealed[0..sealed_len]);
+    var rc = testDecryptConn(&reader, &TEST_RECORD_KEY, &TEST_RECORD_IV);
+    rc.xtls_raw_read = false;
+    var pipe: VisionPipe = .{
+        .rc = &rc,
+        .uuid = uuid,
+        .vless_hdr = "",
+        .use_vision = true,
+        .vision_raw = false,
+    };
+
+    try pipe.fillPlain();
+
+    try std.testing.expectEqualSlices(u8, &first_content, pipe.plain[0..pipe.plain_len]);
+    try std.testing.expectEqual(@as(usize, 16604), pipe.wire_len);
+    try std.testing.expect(pipe.stripped);
+    try std.testing.expectEqual(@as(u64, 2), rc.conn.read_seq);
 }
 
 test "isCompleteTlsAppData one and several records" {

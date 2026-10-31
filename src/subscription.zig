@@ -15,11 +15,9 @@ pub fn decode(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
 
 /// Split decoded subscription into non-empty trimmed lines. Lines are slices into `decoded`.
 pub fn iterLines(decoded: []const u8, comptime callback: anytype, ctx: anytype) !void {
-    var iter = std.mem.splitScalar(u8, decoded, '\n');
+    var iter = std.mem.splitAny(u8, decoded, "\r\n");
     while (iter.next()) |raw| {
-        var line = raw;
-        if (std.mem.findScalar(u8, line, '\r')) |r| line = line[0..r];
-        line = std.mem.trim(u8, line, " \t");
+        const line = std.mem.trim(u8, raw, " \t");
         if (line.len == 0) continue;
         try callback(ctx, line);
     }
@@ -65,4 +63,24 @@ test "iterLines skips blanks" {
     var ctx: Ctx = .{};
     try iterLines("a\n\n b \n\r\nc", Ctx.on, &ctx);
     try std.testing.expectEqual(@as(usize, 3), ctx.count);
+}
+
+test "iterLines splits mixed CRLF, CR-only, and LF lines" {
+    const Ctx = struct {
+        lines: [4][]const u8 = undefined,
+        count: usize = 0,
+        fn on(self: *@This(), line: []const u8) !void {
+            self.lines[self.count] = line;
+            self.count += 1;
+        }
+    };
+    var ctx: Ctx = .{};
+
+    try iterLines("a\r\nb\rc\n d \r\n", Ctx.on, &ctx);
+
+    try std.testing.expectEqual(@as(usize, 4), ctx.count);
+    try std.testing.expectEqualStrings("a", ctx.lines[0]);
+    try std.testing.expectEqualStrings("b", ctx.lines[1]);
+    try std.testing.expectEqualStrings("c", ctx.lines[2]);
+    try std.testing.expectEqualStrings("d", ctx.lines[3]);
 }

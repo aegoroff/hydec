@@ -39,6 +39,18 @@ fn finishWorker(ctx: *FetchCtx) void {
     if (prev == .abandoned) destroyCtx(ctx);
 }
 
+fn createFetchCtx(gpa: std.mem.Allocator, io: Io, url: []const u8) !*FetchCtx {
+    const url_owned = try gpa.dupe(u8, url);
+    errdefer gpa.free(url_owned);
+    const ctx = try gpa.create(FetchCtx);
+    ctx.* = .{
+        .gpa = gpa,
+        .io = io,
+        .url = url_owned,
+    };
+    return ctx;
+}
+
 fn fetchWorker(ctx: *FetchCtx) void {
     const gpa = ctx.gpa;
     const body = fetchUrlInner(gpa, ctx.io, ctx.url) catch |e| {
@@ -54,17 +66,7 @@ fn fetchWorker(ctx: *FetchCtx) void {
 
 /// Download URL body with an overall wall-clock deadline.
 pub fn fetchUrl(gpa: std.mem.Allocator, io: Io, url: []const u8, timeout_secs: u32) ![]u8 {
-    const url_owned = try gpa.dupe(u8, url);
-    const ctx = gpa.create(FetchCtx) catch |err| {
-        gpa.free(url_owned);
-        return err;
-    };
-    ctx.* = .{
-        .gpa = gpa,
-        .io = io,
-        .url = url_owned,
-    };
-
+    const ctx = try createFetchCtx(gpa, io, url);
     const thread = std.Thread.spawn(.{}, fetchWorker, .{ctx}) catch |err| {
         destroyCtx(ctx);
         return err;
@@ -84,9 +86,13 @@ fn takeFinishedResult(ctx: *FetchCtx) ![]u8 {
 }
 
 fn fetchUrlWait(io: Io, ctx: *FetchCtx, thread: std.Thread, timeout_secs: u32) ![]u8 {
-    const start = netutil.monoNow(io);
     // Slack on top of the nominal budget so a nearly-finished worker still wins.
     const budget: i128 = @as(i128, timeout_secs) * std.time.ns_per_s + 250 * std.time.ns_per_ms;
+    return fetchUrlWaitBudget(io, ctx, thread, budget);
+}
+
+fn fetchUrlWaitBudget(io: Io, ctx: *FetchCtx, thread: std.Thread, budget: i128) ![]u8 {
+    const start = netutil.monoNow(io);
     while (ctx.state.load(.acquire) != .done) {
         if (netutil.monoNow(io) - start >= budget) {
             // Claim abandon, or observe that the worker won with `.done`.
@@ -262,4 +268,67 @@ test "ensureHttpsScheme rejects http redirect targets" {
     try ensureHttpsScheme("HTTPS");
     try std.testing.expectError(error.InsecureSubscriptionUrl, ensureHttpsScheme("http"));
     try std.testing.expectError(error.InsecureSubscriptionUrl, ensureHttpsScheme("HTTP"));
+}
+
+const HandoffTestControl = struct {
+    started: Io.Event = .unset,
+    release: Io.Event = .unset,
+    finished: Io.Event = .unset,
+    body: []const u8,
+
+    fn complete(ctx: *FetchCtx, control: *HandoffTestControl) void {
+        defer control.finished.set(std.testing.io);
+        setBody(ctx, control.body);
+    }
+
+    fn completeLate(ctx: *FetchCtx, control: *HandoffTestControl) void {
+        defer control.finished.set(std.testing.io);
+        control.started.set(std.testing.io);
+        control.release.waitUncancelable(std.testing.io);
+        setBody(ctx, control.body);
+    }
+
+    fn setBody(ctx: *FetchCtx, body: []const u8) void {
+        ctx.body = ctx.gpa.dupe(u8, body) catch |err| {
+            ctx.err = err;
+            finishWorker(ctx);
+            return;
+        };
+        finishWorker(ctx);
+    }
+};
+
+test "fetch handoff joins a completed worker and transfers body ownership" {
+    // Arrange: the worker has published its result before the waiter starts.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const ctx = try createFetchCtx(gpa, io, "https://unused.test/sub");
+    var control: HandoffTestControl = .{ .body = "completed body" };
+    const thread = try std.Thread.spawn(.{}, HandoffTestControl.complete, .{ ctx, &control });
+    try control.finished.wait(io);
+
+    // Act: a zero budget still accepts an already-completed worker.
+    const body = try fetchUrlWaitBudget(io, ctx, thread, 0);
+    defer gpa.free(body);
+
+    // Assert: the waiter owns only the returned body; ctx and URL were freed.
+    try std.testing.expectEqualStrings(control.body, body);
+}
+
+test "fetch handoff abandons on timeout and late worker frees its result" {
+    // Arrange: hold the worker until the waiter has abandoned the context.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const ctx = try createFetchCtx(gpa, io, "https://unused.test/sub");
+    var control: HandoffTestControl = .{ .body = "late body" };
+    const thread = try std.Thread.spawn(.{}, HandoffTestControl.completeLate, .{ ctx, &control });
+    try control.started.wait(io);
+
+    // Act: timeout detaches without touching ctx again; then release the worker.
+    try std.testing.expectError(error.Timeout, fetchUrlWaitBudget(io, ctx, thread, 0));
+    control.release.set(io);
+    try control.finished.wait(io);
+
+    // Assert: finished is set after finishWorker, so the late body, URL, and ctx
+    // have all been freed before the testing allocator checks this test.
 }

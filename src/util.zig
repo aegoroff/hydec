@@ -181,16 +181,20 @@ pub const ProbeReply = union(enum) {
     /// `200` with exactly this many body bytes.
     download: usize,
 
-    /// `resp` is one complete response (`httpResponseTotalLen`, or close-delimited).
+    /// `resp` is one complete final response, optionally preceded by informational
+    /// responses (`httpResponseTotalLen`, or close-delimited).
     /// `VolumeRefused`: the download got a well-formed non-200 (Cloudflare rate limit
     /// or block). The warmup trace already crossed the tunnel, so that is not the node.
     pub fn check(self: ProbeReply, resp: []const u8) error{ ProbeResponseMismatch, VolumeRefused }!void {
+        const final = finalHttpResponse(resp) orelse return error.ProbeResponseMismatch;
+        const status = parseHttpStatus(final) orelse return error.ProbeResponseMismatch;
         switch (self) {
-            .trace => |uag| if (!looksLikeCloudflareTraceUag(resp, uag)) return error.ProbeResponseMismatch,
+            .trace => |uag| {
+                if (status != 200 or !traceResponseMatches(final, uag)) return error.ProbeResponseMismatch;
+            },
             .download => |bytes| {
-                const status = parseHttpStatus(resp) orelse return error.ProbeResponseMismatch;
                 if (status != 200) return error.VolumeRefused;
-                if (!downloadComplete(resp, bytes)) return error.ProbeResponseMismatch;
+                if (!downloadComplete(final, bytes)) return error.ProbeResponseMismatch;
             },
         }
     }
@@ -217,6 +221,46 @@ pub const ProbeReply = union(enum) {
         return @as(u16, d0 - '0') * 100 + @as(u16, d1 - '0') * 10 + @as(u16, d2 - '0');
     }
 };
+
+/// Consume one final response matching `expect`, including any informational prefixes.
+/// Buffered bytes after that response are preserved at the front of `buf`.
+/// `peer_closed` permits a final close-delimited body; incomplete framed bodies stay pending.
+pub fn takeProbeResponse(buf: []u8, len: *usize, expect: ProbeReply, peer_closed: bool) error{ ProbeResponseMismatch, VolumeRefused }!bool {
+    const lens = switch (httpResponseState(buf[0..len.*])) {
+        .incomplete => return false,
+        .malformed => return error.ProbeResponseMismatch,
+        .close_delimited => {
+            if (!peer_closed) return false;
+            try expect.check(buf[0..len.*]);
+            len.* = 0;
+            return true;
+        },
+        .complete => |lens| lens,
+    };
+    try expect.check(buf[0..lens.total]);
+    consumeHttpPrefix(buf, len, lens.total);
+    return true;
+}
+
+/// Strip complete informational responses so status/body checks see only the final one.
+fn finalHttpResponse(resp: []const u8) ?[]const u8 {
+    var rest = resp;
+    while (true) {
+        const status = ProbeReply.parseHttpStatus(rest) orelse return null;
+        if (status < 100 or status >= 200) return rest;
+        const lens = switch (httpResponseStateSingle(rest)) {
+            .complete => |lens| lens,
+            else => return null,
+        };
+        rest = rest[lens.total..];
+    }
+}
+
+fn consumeHttpPrefix(buf: []u8, len: *usize, prefix: usize) void {
+    const remain = len.* - prefix;
+    if (remain > 0) std.mem.copyForwards(u8, buf[0..remain], buf[prefix..len.*]);
+    len.* = remain;
+}
 
 /// Where the tunnel goes and which two requests it carries (warmup, then steady).
 pub const Target = struct {
@@ -285,13 +329,34 @@ pub fn httpResponseTotalLen(buf: []const u8) ?usize {
     };
 }
 
-/// Classify the HTTP/1.x response at the front of `buf`.
+/// Classify the first final HTTP/1.x response in `buf`, skipping informational replies.
+/// `total` includes those prefixes; `body` describes only the final response.
 pub fn httpResponseState(buf: []const u8) HttpResponseState {
+    var offset: usize = 0;
+    while (true) {
+        switch (httpResponseStateSingle(buf[offset..])) {
+            .incomplete => return .incomplete,
+            .malformed => return .malformed,
+            .close_delimited => |body_start| return .{ .close_delimited = offset + body_start },
+            .complete => |lens| {
+                const status = ProbeReply.parseHttpStatus(buf[offset..]) orelse return .malformed;
+                if (status >= 100 and status < 200) {
+                    offset += lens.total;
+                    continue;
+                }
+                return .{ .complete = .{ .total = offset + lens.total, .body = lens.body } };
+            },
+        }
+    }
+}
+
+/// Classify one response without skipping informational replies.
+fn httpResponseStateSingle(buf: []const u8) HttpResponseState {
     const sep = std.mem.find(u8, buf, "\r\n\r\n") orelse return .incomplete;
     const headers = buf[0..sep];
     const body_start = sep + 4;
 
-    var chunked = false;
+    var transfer_encoding: TransferEncoding = .{};
     var content_len: ?usize = null;
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
     _ = lines.next() orelse return .malformed;
@@ -299,10 +364,15 @@ pub fn httpResponseState(buf: []const u8) HttpResponseState {
     while (lines.next()) |line| {
         if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
             const v = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
-            if (std.ascii.findIgnoreCase(v, "chunked") != null) chunked = true;
+            addTransferEncoding(v, &transfer_encoding) catch return .malformed;
         } else if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
             const v = std.mem.trim(u8, line["content-length:".len..], " \t");
-            content_len = std.fmt.parseInt(usize, v, 10) catch return .malformed;
+            const parsed = std.fmt.parseInt(usize, v, 10) catch return .malformed;
+            if (content_len) |previous| {
+                if (previous != parsed) return .malformed;
+            } else {
+                content_len = parsed;
+            }
         }
     }
 
@@ -311,7 +381,12 @@ pub fn httpResponseState(buf: []const u8) HttpResponseState {
         return .{ .complete = .{ .total = body_start, .body = 0 } };
     }
 
-    if (chunked) return httpChunkedBodyEnd(buf, body_start);
+    // Transfer-Encoding overrides Content-Length. A final non-chunked coding makes
+    // the body close-delimited; chunked is valid only as the last coding.
+    if (transfer_encoding.present) {
+        if (transfer_encoding.chunked) return httpChunkedBodyEnd(buf, body_start);
+        return .{ .close_delimited = body_start };
+    }
 
     if (content_len) |cl| {
         // `cl` comes straight off the wire, so compare it against the bytes left
@@ -321,6 +396,50 @@ pub fn httpResponseState(buf: []const u8) HttpResponseState {
     }
 
     return .{ .close_delimited = body_start };
+}
+
+const TransferEncoding = struct {
+    present: bool = false,
+    chunked: bool = false,
+};
+
+fn addTransferEncoding(value: []const u8, state: *TransferEncoding) error{InvalidTransferEncoding}!void {
+    var codings = std.mem.splitScalar(u8, value, ',');
+    while (codings.next()) |coding_with_params| {
+        const coding = std.mem.trim(u8, coding_with_params, " \t");
+        const token_end = std.mem.findScalar(u8, coding, ';') orelse coding.len;
+        const token = std.mem.trim(u8, coding[0..token_end], " \t");
+        if (!isHttpToken(token) or state.chunked) return error.InvalidTransferEncoding;
+        state.present = true;
+        if (std.ascii.eqlIgnoreCase(token, "chunked")) state.chunked = true;
+    }
+}
+
+fn isHttpToken(token: []const u8) bool {
+    if (token.len == 0) return false;
+    for (token) |c| switch (c) {
+        'a'...'z',
+        'A'...'Z',
+        '0'...'9',
+        '!',
+        '#',
+        '$',
+        '%',
+        '&',
+        '\'',
+        '*',
+        '+',
+        '-',
+        '.',
+        '^',
+        '_',
+        '`',
+        '|',
+        '~',
+        => {},
+        else => return false,
+    };
+    return true;
 }
 
 /// Parse chunked body starting at `body_start`.
@@ -359,14 +478,112 @@ fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) HttpResponseState {
     }
 }
 
-/// True when `buf` looks like Cloudflare `/cdn-cgi/trace` and echoes `uag=`.
-/// Rejects generic HTTP 400/empty pages from REALITY dest fallback and stale
-/// warmup copies (wrong UA).
-pub fn looksLikeCloudflareTraceUag(buf: []const u8, uag: []const u8) bool {
-    if (std.mem.find(u8, buf, "visit_scheme=") == null) return false;
-    var needle_buf: [64]u8 = undefined;
-    const needle = std.mem.print(&needle_buf, "uag={s}", .{uag}) catch return false;
-    return std.mem.find(u8, buf, needle) != null;
+const TraceBodyMatcher = struct {
+    uag: []const u8,
+    line_len: usize = 0,
+    has_equals: bool = false,
+    uag_candidate: bool = true,
+    visit_candidate: bool = true,
+    saw_uag: bool = false,
+    saw_visit_scheme: bool = false,
+    valid: bool = true,
+
+    fn feed(self: *TraceBodyMatcher, bytes: []const u8) void {
+        for (bytes) |c| {
+            if (!self.valid) return;
+            if (c == '\n') {
+                self.finishLine();
+                continue;
+            }
+            if (self.uag_candidate) {
+                const prefix = "uag=";
+                if (self.line_len < prefix.len) {
+                    if (c != prefix[self.line_len]) self.uag_candidate = false;
+                } else {
+                    const value_pos = self.line_len - prefix.len;
+                    if (value_pos >= self.uag.len or c != self.uag[value_pos]) self.uag_candidate = false;
+                }
+            }
+            if (self.visit_candidate) {
+                const prefix = "visit_scheme=";
+                if (self.line_len < prefix.len and c != prefix[self.line_len]) self.visit_candidate = false;
+            }
+            if (c == '=') {
+                if (self.line_len == 0) {
+                    self.valid = false;
+                    return;
+                }
+                self.has_equals = true;
+            }
+            self.line_len += 1;
+        }
+    }
+
+    fn finishLine(self: *TraceBodyMatcher) void {
+        if (self.line_len == 0) return;
+        if (!self.has_equals) self.valid = false;
+        if (self.uag_candidate and self.line_len == "uag=".len + self.uag.len) self.saw_uag = true;
+        if (self.visit_candidate and self.line_len > "visit_scheme=".len) self.saw_visit_scheme = true;
+        self.line_len = 0;
+        self.has_equals = false;
+        self.uag_candidate = true;
+        self.visit_candidate = true;
+    }
+
+    fn finish(self: *TraceBodyMatcher) bool {
+        if (self.line_len > 0) self.finishLine();
+        return self.valid and self.saw_uag and self.saw_visit_scheme;
+    }
+};
+
+/// True for a trace body whose exact `uag=` and `visit_scheme=` lines match.
+pub fn looksLikeCloudflareTraceUag(body: []const u8, uag: []const u8) bool {
+    var matcher: TraceBodyMatcher = .{ .uag = uag };
+    matcher.feed(body);
+    return matcher.finish();
+}
+
+fn traceResponseMatches(resp: []const u8, uag: []const u8) bool {
+    const sep = std.mem.find(u8, resp, "\r\n\r\n") orelse return false;
+    const body_start = sep + 4;
+    var matcher: TraceBodyMatcher = .{ .uag = uag };
+    const lens = switch (httpResponseState(resp)) {
+        .complete => |lens| lens,
+        .close_delimited => {
+            matcher.feed(resp[body_start..]);
+            return matcher.finish();
+        },
+        else => return false,
+    };
+    if (!responseHasChunkedEncoding(resp[0..sep])) {
+        matcher.feed(resp[body_start..lens.total]);
+        return matcher.finish();
+    }
+
+    var pos = body_start;
+    while (true) {
+        const line_end = std.mem.findPos(u8, resp, pos, "\r\n") orelse return false;
+        const size_line = resp[pos..line_end];
+        const size_tok = if (std.mem.findScalar(u8, size_line, ';')) |sc| size_line[0..sc] else size_line;
+        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_tok, " \t"), 16) catch return false;
+        pos = line_end + 2;
+        if (size == 0) return matcher.finish();
+        matcher.feed(resp[pos..][0..size]);
+        pos += size + 2;
+    }
+}
+
+fn responseHasChunkedEncoding(headers: []const u8) bool {
+    var transfer_encoding: TransferEncoding = .{};
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
+            const value = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
+            addTransferEncoding(value, &transfer_encoding) catch return false;
+        }
+    }
+    return transfer_encoding.chunked;
 }
 
 /// True when the peer closed the tunnel (an unframed response may complete at close).
@@ -415,6 +632,80 @@ test "looksLikeCloudflareTraceUag matches echoed UA" {
     // Not a Cloudflare trace body (no visit_scheme=).
     try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 400 Bad Request\r\n\r\n", PROBE_UA_STEADY));
     try std.testing.expect(!looksLikeCloudflareTraceUag("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", PROBE_UA_STEADY));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("visit_scheme=http\nuag=hydec-steady-extra\n", PROBE_UA_STEADY));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("visit_scheme=http\nx-uag=hydec-steady\n", PROBE_UA_STEADY));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("x-visit_scheme=http\nuag=hydec-steady\n", PROBE_UA_STEADY));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("prefix-visit_scheme=http\nuag=hydec-steady\n", PROBE_UA_STEADY));
+    try std.testing.expect(!looksLikeCloudflareTraceUag("visit_scheme=http\nuag=hydec-steady\nnot-a-pair\n", PROBE_UA_STEADY));
+}
+
+test "ProbeReply.trace requires status 200 and exact body lines" {
+    const body = "fl=1\nvisit_scheme=http\nuag=hydec-steady\n";
+    const ok = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    const refused = std.fmt.comptimePrint("HTTP/1.1 403 Forbidden\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    const reply: ProbeReply = .{ .trace = PROBE_UA_STEADY };
+    try reply.check(ok);
+    try std.testing.expectError(error.ProbeResponseMismatch, reply.check(refused));
+    try std.testing.expectError(error.ProbeResponseMismatch, reply.check(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Trace: visit_scheme=http; uag=hydec-steady\r\n\r\n",
+    ));
+    const longer_body = "visit_scheme=http\nuag=hydec-steady-extra\n";
+    const longer = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ longer_body.len, longer_body });
+    try std.testing.expectError(error.ProbeResponseMismatch, reply.check(longer));
+}
+
+test "ProbeReply.trace validates lines across chunk boundaries" {
+    try ProbeReply.check(.{ .trace = PROBE_UA_STEADY }, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
+        "d\r\nvisit_scheme=\r\n" ++
+        "f\r\nhttp\nuag=hydec-\r\n" ++
+        "7\r\nsteady\n\r\n" ++
+        "0\r\n\r\n");
+}
+
+test "takeProbeResponse skips informational replies and preserves buffered bytes" {
+    const body = "visit_scheme=http\nuag=hydec-steady\n";
+    const final = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    const trailing = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab";
+    const wire = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n" ++ final ++ trailing;
+    var buf: [512]u8 = undefined;
+    @memcpy(buf[0..wire.len], wire);
+    var len = wire.len;
+
+    try std.testing.expect(try takeProbeResponse(&buf, &len, .{ .trace = PROBE_UA_STEADY }, false));
+    try std.testing.expectEqual(trailing.len, len);
+    try std.testing.expectEqualStrings(trailing, buf[0..len]);
+    try std.testing.expect(!try takeProbeResponse(&buf, &len, .{ .download = 5 }, false));
+    try std.testing.expectEqualStrings(trailing, buf[0..len]);
+}
+
+test "shared response state and check validate only the final response" {
+    const body = "visit_scheme=http\nuag=hydec-steady\n";
+    const informational = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </x>\r\n\r\n";
+    const final = std.fmt.comptimePrint("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    const trailing = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    const wire = informational ++ final ++ trailing;
+
+    // This is the state/check sequence used by callers that do their own reads.
+    const total = httpResponseTotalLen(wire).?;
+    try std.testing.expectEqual(informational.len + final.len, total);
+    try ProbeReply.check(.{ .trace = PROBE_UA_STEADY }, wire[0..total]);
+    try std.testing.expect(httpResponseTotalLen(informational) == null);
+
+    const wrong_final = informational ++ "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Trace: visit_scheme=http; uag=hydec-steady\r\n\r\n";
+    const wrong_len = httpResponseTotalLen(wrong_final).?;
+    try std.testing.expectError(error.ProbeResponseMismatch, ProbeReply.check(.{ .trace = PROBE_UA_STEADY }, wrong_final[0..wrong_len]));
+}
+
+test "takeProbeResponse validates a close-delimited final after informational replies" {
+    const wire = "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.0 200 OK\r\nConnection: close\r\n\r\n" ++
+        "visit_scheme=http\nuag=hydec-steady\n";
+    var buf: [256]u8 = undefined;
+    @memcpy(buf[0..wire.len], wire);
+    var len = wire.len;
+
+    try std.testing.expect(!try takeProbeResponse(&buf, &len, .{ .trace = PROBE_UA_STEADY }, false));
+    try std.testing.expect(try takeProbeResponse(&buf, &len, .{ .trace = PROBE_UA_STEADY }, true));
+    try std.testing.expectEqual(@as(usize, 0), len);
 }
 
 test "ProbeReply.download needs a 200 with the exact body length" {
@@ -583,6 +874,42 @@ test "httpResponseState distinguishes malformed framing from incomplete data" {
     try std.testing.expect(std.meta.activeTag(httpResponseState(bad_chunk_end)) == .malformed);
     const partial = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab";
     try std.testing.expect(std.meta.activeTag(httpResponseState(partial)) == .incomplete);
+}
+
+test "httpResponseState parses exact transfer codings and consistent lengths" {
+    const not_chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: notchunked\r\n\r\nabc";
+    try std.testing.expect(std.meta.activeTag(httpResponseState(not_chunked)) == .close_delimited);
+    const chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+    try std.testing.expectEqual(@as(?usize, chunked.len), httpResponseTotalLen(chunked));
+
+    const same = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc";
+    try std.testing.expectEqual(@as(?usize, same.len), httpResponseTotalLen(same));
+    const conflict = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc";
+    try std.testing.expect(std.meta.activeTag(httpResponseState(conflict)) == .malformed);
+}
+
+test "httpResponseState rejects non-final or invalid transfer codings" {
+    const invalid = [_][]const u8{
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked, deflate\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip,, chunked\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: ,chunked\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked garbage\r\n\r\n0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding:\r\n\r\n",
+    };
+    for (invalid) |response| {
+        try std.testing.expect(std.meta.activeTag(httpResponseState(response)) == .malformed);
+    }
+}
+
+test "httpResponseState combines TE fields and lets TE override Content-Length" {
+    const chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n";
+    try std.testing.expectEqual(@as(?usize, chunked.len), httpResponseTotalLen(chunked));
+
+    const close_delimited = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 3\r\n\r\nabc";
+    try std.testing.expect(std.meta.activeTag(httpResponseState(close_delimited)) == .close_delimited);
 }
 
 test "httpResponseTotalLen survives peer-controlled lengths that would overflow" {

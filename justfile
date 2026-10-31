@@ -8,47 +8,45 @@ abi := "musl"
 ver := default_version
 cpu := "core2"
 
-# Local build target (just build / just test)
-local_target := "x86_64-linux-musl"
-local_cpu := "core2"
-
 zig := "mise exec -- zig"
 triple := arch + "-" + os + "-" + abi
 prefix := "bin-" + arch + "-" + os + "-" + abi
 cpu_flag := if cpu != "" { "-Dcpu=" + cpu } else { "" }
 
-# Local small-optimized build (x86_64-linux-musl / core2)
+# Local small-optimized native build
 build:
-    {{ zig }} build -Doptimize={{ optimize }} -Dtarget={{ local_target }} -Dcpu={{ local_cpu }} -Dversion={{ ver }} --summary all
+    {{ zig }} build -Doptimize={{ optimize }} -Dversion={{ ver }} --summary all
 
-# Local unit tests for the default target
+# Local unit tests for the native target
 test:
-    {{ zig }} build test -Doptimize={{ optimize }} -Dtarget={{ local_target }} -Dcpu={{ local_cpu }} -Dversion={{ ver }} --summary all
+    {{ zig }} build test -Doptimize={{ optimize }} -Dversion={{ ver }} --summary all
 
-# Build + archive one target; runs tests for x86_64-linux
+# Build + archive one target; run its tests only when the host can execute them
 # Example: just arch=x86_64 os=linux abi=musl ver=0.1.0 cpu=core2 release
 release: maybe-test archive-target
-
-[private]
-build-target:
-    {{ zig }} build \
-        -Doptimize={{ optimize }} \
-        {{ cpu_flag }} \
-        -Dtarget={{ triple }} \
-        -Dversion={{ ver }} \
-        --summary all \
-        --prefix-exe-dir {{ prefix }}
 
 [private]
 maybe-test:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [[ "{{ arch }}" == "x86_64" && "{{ os }}" == "linux" ]]; then
+    host_arch="$(uname -m)"
+    host_os="$(uname -s)"
+    case "$host_arch" in
+      arm64) host_arch=aarch64 ;;
+    esac
+    case "$host_os" in
+      Linux) host_os=linux ;;
+      Darwin) host_os=macos ;;
+      *) host_os=unsupported ;;
+    esac
+    if [[ "$host_arch" == "{{ arch }}" && "$host_os" == "{{ os }}" ]]; then
       {{ zig }} build test \
         -Doptimize={{ optimize }} \
         {{ cpu_flag }} \
         -Dtarget={{ triple }} \
         --summary all
+    else
+      echo "Skipping tests for cross target {{ triple }} on ${host_arch}-${host_os}"
     fi
 
 [private]
@@ -91,6 +89,13 @@ openwrt-apk:
 openwrt-apk-one:
     #!/usr/bin/env bash
     set -euo pipefail
+    case "{{ zig_arch }}:{{ openwrt_arch }}" in
+      x86_64:x86_64|aarch64:aarch64_cortex-a53|aarch64:aarch64_generic) ;;
+      *)
+        echo "error: unsupported OpenWrt arch pair: zig_arch={{ zig_arch }} openwrt_arch={{ openwrt_arch }}" >&2
+        exit 2
+        ;;
+    esac
     apk_ver="$(./packaging/openwrt-apk/build-apk.sh --sanitize-version "{{ ver }}")"
     cpu_args=()
     if [[ -n "{{ zig_cpu }}" ]]; then
