@@ -11,9 +11,9 @@ pub fn encodeRequestDomain(
     flow: []const u8,
 ) error{ BufferTooSmall, DomainTooLong, FlowTooLong }!usize {
     if (domain.len > 255) return error.DomainTooLong;
+    if (flow.len >= 128) return error.FlowTooLong;
     // protobuf Addons { string Flow = 1; } when flow is set — addon_len is a u8.
     const addon_len: usize = if (flow.len == 0) 0 else 1 + 1 + flow.len;
-    if (addon_len > 255) return error.FlowTooLong;
     const need = 1 + 16 + 1 + addon_len + 1 + 2 + 1 + 1 + domain.len;
     if (out.len < need) return error.BufferTooSmall;
 
@@ -202,8 +202,10 @@ test "encodeRequestDomain rejects oversized domain and flow" {
     var uuid: [16]u8 = @splat(0);
     const long_domain: [256]u8 = @splat('a');
     try std.testing.expectError(error.DomainTooLong, encodeRequestDomain(&buf, &uuid, &long_domain, 443, ""));
-    // addon_len = 2 + flow.len must fit in u8 → flow.len > 253 overflows.
-    const long_flow: [254]u8 = @splat('f');
+    // A one-byte protobuf string length can hold at most 127 bytes.
+    const max_flow: [127]u8 = @splat('f');
+    _ = try encodeRequestDomain(&buf, &uuid, "x.com", 443, &max_flow);
+    const long_flow: [128]u8 = @splat('f');
     try std.testing.expectError(error.FlowTooLong, encodeRequestDomain(&buf, &uuid, "x.com", 443, &long_flow));
 }
 
