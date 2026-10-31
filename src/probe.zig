@@ -551,6 +551,7 @@ pub fn failHint(err: anyerror) []const u8 {
         error.NetworkDown,
         => "unreachable",
         error.GrpcEmptyResponse => "empty/no-data",
+        error.GrpcBadStatus => "grpc/status",
         // Server picked h2 for a ws transport: the HTTP/1.1 upgrade gets HTTP/2 frames.
         error.WsAlpnHttp2 => "alpn/h2-breaks-ws",
         // The URI listed more ALPN protocols than a probe will carry.

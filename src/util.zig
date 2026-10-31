@@ -176,12 +176,33 @@ pub const ProbeReply = union(enum) {
         switch (self) {
             .trace => |uag| if (!looksLikeCloudflareTraceUag(resp, uag)) return error.ProbeResponseMismatch,
             .download => |bytes| {
-                if (!std.mem.startsWith(u8, resp, "HTTP/1.")) return error.ProbeResponseMismatch;
-                if (!std.mem.startsWith(u8, resp["HTTP/1.".len..], "1 200 ") and
-                    !std.mem.startsWith(u8, resp["HTTP/1.".len..], "0 200 ")) return error.VolumeRefused;
+                const status = parseHttpStatus(resp) orelse return error.ProbeResponseMismatch;
+                if (status != 200) return error.VolumeRefused;
                 if (!downloadComplete(resp, bytes)) return error.ProbeResponseMismatch;
             },
         }
+    }
+
+    /// Parse a well-formed HTTP/1.0 or HTTP/1.1 status line prefix and return the
+    /// three-digit status code. Returns null if the response does not start with a
+    /// valid status line (e.g. `HTTP/1.1 nonsense`).
+    fn parseHttpStatus(resp: []const u8) ?u16 {
+        const prefix = "HTTP/1.";
+        if (!std.mem.startsWith(u8, resp, prefix)) return null;
+        // HTTP/1.x SP 3DIGIT (SP | CR)
+        const code_start = prefix.len + 2; // '0'/'1' + SP
+        const min_len = code_start + 3 + 1;
+        if (resp.len < min_len) return null;
+        const minor = resp[prefix.len];
+        if (minor != '0' and minor != '1') return null;
+        if (resp[prefix.len + 1] != ' ') return null;
+        const d0 = resp[code_start];
+        const d1 = resp[code_start + 1];
+        const d2 = resp[code_start + 2];
+        if (d0 < '0' or d0 > '9' or d1 < '0' or d1 > '9' or d2 < '0' or d2 > '9') return null;
+        const tail = resp[code_start + 3];
+        if (tail != ' ' and tail != '\r') return null;
+        return @as(u16, d0 - '0') * 100 + @as(u16, d1 - '0') * 10 + @as(u16, d2 - '0');
     }
 };
 
@@ -228,9 +249,8 @@ pub const VOLUME_TARGET: Target = .{
 
 /// Response whose body is exactly `bytes` long (status checked by the caller).
 fn downloadComplete(resp: []const u8, bytes: usize) bool {
-    const sep = std.mem.find(u8, resp, "\r\n\r\n") orelse return false;
-    const total = httpResponseTotalLen(resp) orelse return false;
-    return total - (sep + 4) == bytes;
+    const lens = httpResponseLens(resp) orelse return false;
+    return lens.body == bytes;
 }
 
 /// True when headers are complete and the body is HTTP/1.0 close-delimited
@@ -258,6 +278,15 @@ pub fn httpCloseDelimitedReady(buf: []const u8) bool {
 /// when neither is present (RFC 7230 §3.3.3). HTTP/1.0 without framing stays
 /// incomplete until the peer closes (see warmup loops + `httpCloseDelimitedReady`).
 pub fn httpResponseTotalLen(buf: []const u8) ?usize {
+    const lens = httpResponseLens(buf) orelse return null;
+    return lens.total;
+}
+
+/// Sizes of one complete response: `total` on the wire, `body` the payload alone
+/// (chunk sizes summed, without chunked framing or trailers).
+const HttpLens = struct { total: usize, body: usize };
+
+fn httpResponseLens(buf: []const u8) ?HttpLens {
     const sep = std.mem.find(u8, buf, "\r\n\r\n") orelse return null;
     const headers = buf[0..sep];
     const body_start = sep + 4;
@@ -282,18 +311,20 @@ pub fn httpResponseTotalLen(buf: []const u8) ?usize {
         // `cl` comes straight off the wire, so compare it against the bytes left
         // rather than adding: `body_start + cl` overflows on a hostile length.
         if (cl > buf.len - body_start) return null;
-        return body_start + cl;
+        return .{ .total = body_start + cl, .body = cl };
     }
 
     // No Content-Length / chunked: HTTP/1.1+ means empty body. HTTP/1.0 is
     // close-delimited — caller must accept via peer close after headers.
     if (std.mem.startsWith(u8, status, "HTTP/1.0")) return null;
-    return body_start;
+    return .{ .total = body_start, .body = 0 };
 }
 
-/// Parse chunked body starting at `body_start`; return end offset past the final chunk, or null.
-fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?usize {
+/// Parse chunked body starting at `body_start`; return the offset past the final chunk
+/// and the summed chunk sizes, or null.
+fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?HttpLens {
     var pos = body_start;
+    var data: usize = 0;
     while (true) {
         const line_end = std.mem.findPos(u8, buf, pos, "\r\n") orelse return null;
         const size_line = buf[pos..line_end];
@@ -308,9 +339,9 @@ fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?usize {
             // Check this before scanning for trailers, otherwise a pipelined next
             // response's own "\r\n\r\n" is mistaken for the trailer terminator and the
             // reported length runs past the end of this response.
-            if (pos + 2 <= buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') return pos + 2;
+            if (pos + 2 <= buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') return .{ .total = pos + 2, .body = data };
             // Optional trailers, then terminating CRLF.
-            if (std.mem.findPos(u8, buf, pos, "\r\n\r\n")) |end| return end + 4;
+            if (std.mem.findPos(u8, buf, pos, "\r\n\r\n")) |end| return .{ .total = end + 4, .body = data };
             return null;
         }
         // Same reason as `Content-Length` above: `size` is peer-controlled, so the
@@ -320,7 +351,9 @@ fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?usize {
         // check bounds `pos + size + 2` by `buf.len`.
         const avail = buf.len - pos;
         if (avail < 2 or size > avail - 2) return null;
+        if (!std.mem.eql(u8, buf[pos + size ..][0..2], "\r\n")) return null;
         pos += size + 2; // chunk data + CRLF
+        data += size;
     }
 }
 
@@ -385,10 +418,22 @@ test "ProbeReply.download needs a 200 with the exact body length" {
     try std.testing.expectError(error.ProbeResponseMismatch, reply.check("garbage"));
 }
 
+test "ProbeReply.download counts chunked payload without framing" {
+    const reply: ProbeReply = .{ .download = 5 };
+    try reply.check("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n");
+    try reply.check("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;x=1\r\nabcde\r\n0\r\nX-A: 1\r\n\r\n");
+    try std.testing.expectError(error.ProbeResponseMismatch, ProbeReply.check(.{ .download = 4 }, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabcde\r\n0\r\n\r\n"));
+}
+
 test "ProbeReply.download tells a Cloudflare refusal from a broken node" {
     const reply: ProbeReply = .{ .download = 3 };
     try std.testing.expectError(error.VolumeRefused, reply.check("HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n"));
     try std.testing.expectError(error.VolumeRefused, reply.check("HTTP/1.1 403 Forbidden\r\nContent-Length: 3\r\n\r\nabc"));
+    try std.testing.expectError(error.VolumeRefused, reply.check("HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"));
+    // Malformed status lines are the node's fault, not a Cloudflare refusal.
+    try std.testing.expectError(error.ProbeResponseMismatch, reply.check("HTTP/1.1 nonsense\r\n\r\n"));
+    try std.testing.expectError(error.ProbeResponseMismatch, reply.check("HTTP/1.1  200 OK\r\nContent-Length: 3\r\n\r\nabc"));
+    try std.testing.expectError(error.ProbeResponseMismatch, reply.check("HTTP/1.2 200 OK\r\nContent-Length: 3\r\n\r\nabc"));
     // The trace check is unchanged: any mismatch is the node's fault.
     try std.testing.expectError(error.ProbeResponseMismatch, ProbeReply.check(.{ .trace = PROBE_UA_STEADY }, "HTTP/1.1 429 Too Many Requests\r\n\r\n"));
 }
@@ -535,6 +580,8 @@ test "httpResponseTotalLen survives peer-controlled lengths that would overflow"
     try std.testing.expectEqual(@as(?usize, null), httpResponseTotalLen(chunk_one));
 
     // A chunk-size line with no room left for even the trailing CRLF.
+    // Chunk data longer than its size line: the CRLF is not where the size says.
+    try std.testing.expect(httpResponseTotalLen("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcde\r\n0\r\n\r\n") == null);
     const truncated = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n";
     try std.testing.expectEqual(@as(?usize, null), httpResponseTotalLen(truncated));
 }

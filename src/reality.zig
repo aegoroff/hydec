@@ -1012,13 +1012,16 @@ pub fn probeVless(
             } else if (inflight and (ftyp == 0x00 or ftyp == 0x01)) {
                 // Warmup leftover DATA / trailers — ack framing only.
             } else if (ftyp == 0x01 and request_sent) {
-                if (grpc_gun.headersIndicateStatus200(payload, fflags)) {
-                    saw_headers_ok = true;
-                }
+                // Each HEADERS decides on its own: a later non-200 must not inherit the
+                // warmup's 200 and let the DATA after it through.
+                saw_headers_ok = grpc_gun.headersIndicateStatus200(payload, fflags);
                 if ((fflags & 0x01) != 0 and !saw_headers_ok) return error.GrpcStreamEnded;
                 // Empty 200 before any DATA is a failure; trailer END_STREAM after DATA is normal.
                 if ((fflags & 0x01) != 0 and saw_headers_ok and !saw_grpc_data) return error.GrpcEmptyResponse;
             } else if (ftyp == 0x00 and request_sent) {
+                // The gun stream's one HEADERS must carry `:status 200` before any DATA:
+                // grpc-go (Xray) drops the stream on anything else, so the reply cannot count.
+                if (!saw_headers_ok) return error.GrpcBadStatus;
                 if (grpc_stream_len + payload.len > grpc_stream.len) return error.BufferTooSmall;
                 @memcpy(grpc_stream[grpc_stream_len..][0..payload.len], payload);
                 grpc_stream_len += payload.len;
@@ -1033,7 +1036,6 @@ pub fn probeVless(
                             finished_warmup = true;
                             // Fresh buffer for the keep-alive request; VLESS header already stripped.
                             http_len = 0;
-                            saw_headers_ok = false;
                             saw_grpc_data = false;
                             var hunk: [256]u8 = undefined;
                             const hunk_len = try grpc_gun.wrapHunk(&hunk, target.steady);
