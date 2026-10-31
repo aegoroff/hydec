@@ -6,6 +6,13 @@ pub fn decodeBase64(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     return util.decodeBase64Url(gpa, input, true);
 }
 
+pub fn decode(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
+    return decodeBase64(gpa, input) catch |err| {
+        if (std.mem.find(u8, input, "://") == null) return err;
+        return gpa.dupe(u8, input);
+    };
+}
+
 /// Split decoded subscription into non-empty trimmed lines. Lines are slices into `decoded`.
 pub fn iterLines(decoded: []const u8, comptime callback: anytype, ctx: anytype) !void {
     var iter = std.mem.splitScalar(u8, decoded, '\n');
@@ -31,6 +38,20 @@ test "decodeBase64 url-safe" {
     const got = try decodeBase64(gpa, "Pj4-");
     defer gpa.free(got);
     try std.testing.expectEqualStrings(">>>", got);
+}
+
+test "decode accepts plaintext URI lines" {
+    const gpa = std.testing.allocator;
+    const input = "vless://one@192.0.2.1:443\nss://two@192.0.2.2:8388\n";
+
+    const got = try decode(gpa, input);
+    defer gpa.free(got);
+
+    try std.testing.expectEqualStrings(input, got);
+}
+
+test "decode still rejects invalid non-subscription input" {
+    try std.testing.expectError(error.InvalidCharacter, decode(std.testing.allocator, "not:a subscription"));
 }
 
 test "iterLines skips blanks" {

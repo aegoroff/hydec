@@ -722,9 +722,11 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             const subject = try subject_cert.parse();
                             if (cert_index == 0) {
                                 // Verify the host on the first certificate.
-                                switch (options.host) {
-                                    .no_verification => {},
-                                    .explicit => try subject.verifyHostName(host),
+                                if (options.ca != .no_verification) {
+                                    switch (options.host) {
+                                        .no_verification => {},
+                                        .explicit => try subject.verifyHostName(host),
+                                    }
                                 }
 
                                 // Keep track of the public key for the

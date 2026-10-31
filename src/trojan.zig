@@ -100,8 +100,8 @@ fn tlsOptions(
     allow_insecure: bool,
     bundle: ?*Certificate.Bundle,
 ) tls.Client.Options {
-    // Keep host.explicit so SNI is still sent; Zig couples SNI with hostname
-    // checks, so allowInsecure only skips the CA chain (common for self-signed).
+    // Keep host.explicit so SNI is still sent; ca.no_verification also skips
+    // hostname checks for allowInsecure.
     return .{
         .host = .{ .explicit = sni },
         .ca = if (allow_insecure)

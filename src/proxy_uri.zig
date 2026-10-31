@@ -311,9 +311,10 @@ fn decodeLegacyBlobExact(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
 }
 
 fn decodeUserinfo(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
-    // SIP002: userinfo may percent-encode `+` `/` `=` before base64(method:password).
+    // SIP002: userinfo may be plaintext or base64(method:password), percent-encoded.
     const pct = try util.urlDecodeStrict(gpa, encoded);
     defer gpa.free(pct);
+    if (std.mem.findScalar(u8, pct, ':') != null) return gpa.dupe(u8, pct);
     return util.decodeBase64Url(gpa, pct, false);
 }
 
@@ -393,6 +394,23 @@ test "parse ss sip002 percent-encoded userinfo" {
     try std.testing.expectEqualStrings("aes-256-gcm", p.method.?);
     try std.testing.expectEqualStrings("p@ss/word!", p.password.?);
     try std.testing.expectEqual(@as(u16, 2060), p.port);
+}
+
+test "parse ss sip002 plaintext userinfo" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "ss://chacha20-ietf-poly1305:pass@192.0.2.10:8388",
+        "ss://aes-256-gcm:p%40ss%2Fword@192.0.2.10:8388",
+    };
+    const passwords = [_][]const u8{ "pass", "p@ss/word" };
+
+    for (lines, passwords, [_][]const u8{ "chacha20-ietf-poly1305", "aes-256-gcm" }) |line, password, method| {
+        var p = try parse(gpa, line);
+        defer p.deinit(gpa);
+        try std.testing.expectEqualStrings(method, p.method.?);
+        try std.testing.expectEqualStrings(password, p.password.?);
+        try std.testing.expectEqual(@as(u16, 8388), p.port);
+    }
 }
 
 test "parse ss legacy owns host" {

@@ -84,7 +84,7 @@ fn runBest(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     };
     defer gpa.free(body);
 
-    const decoded = subscription.decodeBase64(gpa, body) catch |err| {
+    const decoded = subscription.decode(gpa, body) catch |err| {
         std.log.err("failed to base64-decode subscription: {}", .{err});
         std.process.exit(1);
     };
