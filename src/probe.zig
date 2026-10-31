@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const proxy_uri = @import("proxy_uri.zig");
 const util = @import("util.zig");
 const ss = @import("ss.zig");
@@ -118,6 +119,17 @@ pub fn probeOne(
     stage.* = .setup;
     return switch (proxy.kind) {
         .shadowsocks => blk: {
+            var query_params = std.mem.splitScalar(u8, proxy.query, '&');
+            while (query_params.next()) |pair| {
+                const eq = std.mem.findScalar(u8, pair, '=');
+                const name = if (eq) |i| pair[0..i] else pair;
+                if (!std.mem.eql(u8, name, "plugin")) continue;
+                const raw = if (eq) |i| pair[i + 1 ..] else "";
+                const plugin = try util.urlDecodeStrict(gpa, raw);
+                defer gpa.free(plugin);
+                // An empty first value must not hide a plugin in a later parameter.
+                if (plugin.len > 0) return error.UnsupportedPlugin;
+            }
             const method = proxy.method orelse return error.InvalidProxyUri;
             const password = proxy.password orelse return error.InvalidProxyUri;
             break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind, stage);
@@ -556,11 +568,13 @@ pub fn failHint(err: anyerror) []const u8 {
         error.WsAlpnHttp2 => "alpn/h2-breaks-ws",
         // The URI listed more ALPN protocols than a probe will carry.
         error.TooManyAlpnProtocols => "alpn/too-many",
+        error.InvalidAlpnProtocol => "alpn/invalid",
         error.ProbeResponseMismatch => "bad/response",
         error.ExpectedVisionPadding => "vision/framing",
         error.InvalidSsChunk => "ss/chunk",
         error.UnsupportedVlessEncryption => "unsupported-encryption",
         error.UnsupportedTransport => "unsupported-transport",
+        error.UnsupportedPlugin => "unsupported-plugin",
         error.BufferTooSmall, error.RecordTooLarge => "buffer/overflow",
         error.SystemResources => "sys/resources",
         // Socket creation / bind failures: netutil.openSocket for our own probe
@@ -864,6 +878,52 @@ test "probeOne rejects Trojan transports it cannot carry before dialing" {
         try std.testing.expectError(error.UnsupportedTransport, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, &stage));
         try std.testing.expectEqual(util.Stage.setup, stage);
     }
+}
+
+test "probeOne rejects SS plugins before opening a socket" {
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
+
+    // Arrange: both URI forms point at a real listener, so a direct SS dial is observable.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+
+    var sip_buf: [256]u8 = undefined;
+    const sip = try std.fmt.bufPrint(&sip_buf, "ss://{s}@127.0.0.1:{d}/?plugin=obfs%2Dlocal", .{
+        "Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3Jk",
+        port,
+    });
+    var sip_duplicate_buf: [256]u8 = undefined;
+    const sip_duplicate = try std.fmt.bufPrint(&sip_duplicate_buf, "ss://{s}@127.0.0.1:{d}/?plugin=&plugin=obfs%2Dlocal", .{
+        "Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3Jk",
+        port,
+    });
+    var plain_buf: [128]u8 = undefined;
+    const plain = try std.fmt.bufPrint(&plain_buf, "chacha20-ietf-poly1305:test-password@127.0.0.1:{d}", .{port});
+    var blob_buf: [256]u8 = undefined;
+    const blob = std.base64.standard_no_pad.Encoder.encode(&blob_buf, plain);
+    var legacy_buf: [384]u8 = undefined;
+    const legacy = try std.fmt.bufPrint(&legacy_buf, "ss://{s}/?plugin=obfs-local", .{blob});
+    var legacy_duplicate_buf: [384]u8 = undefined;
+    const legacy_duplicate = try std.fmt.bufPrint(&legacy_duplicate_buf, "ss://{s}/?plugin=&plugin=obfs-local", .{blob});
+
+    for ([_][]const u8{ sip, sip_duplicate, legacy, legacy_duplicate }) |line| {
+        var proxy = try proxy_uri.parse(gpa, line);
+        defer proxy.deinit(gpa);
+        var stage: util.Stage = .setup;
+        try std.testing.expectError(error.UnsupportedPlugin, probeOne(gpa, io, proxy, util.LATENCY_TARGET, 1, null, &stage));
+        try std.testing.expectEqual(util.Stage.setup, stage);
+    }
+
+    var fds = [_]std.posix.pollfd{.{
+        .fd = server.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 0), try std.posix.poll(&fds, 0));
 }
 
 test "FailReason appends the stage once the attempt got past setup" {
@@ -1222,7 +1282,9 @@ test "volumeError names only read stalls and keeps other errors" {
     try std.testing.expectEqualStrings("slow/timeout", failHint(volumeError(error.ConnectTimeout)));
 }
 
-test "failHint names the ALPN failures" {
+test "failHint names the ALPN and plugin failures" {
     try std.testing.expectEqualStrings("alpn/h2-breaks-ws", failHint(error.WsAlpnHttp2));
     try std.testing.expectEqualStrings("alpn/too-many", failHint(error.TooManyAlpnProtocols));
+    try std.testing.expectEqualStrings("alpn/invalid", failHint(error.InvalidAlpnProtocol));
+    try std.testing.expectEqualStrings("unsupported-plugin", failHint(error.UnsupportedPlugin));
 }

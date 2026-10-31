@@ -2,7 +2,7 @@ const std = @import("std");
 const util = @import("util.zig");
 const netutil = @import("netutil.zig");
 const ws = @import("ws.zig");
-const alpn = @import("alpn.zig");
+const tls = @import("tls_client.zig");
 const Io = std.Io;
 const Certificate = std.crypto.Certificate;
 
@@ -94,11 +94,12 @@ fn tlsOptions(
     sni: []const u8,
     read_buf: []u8,
     write_buf: []u8,
-    entropy: *const [std.crypto.tls.Client.Options.entropy_len]u8,
+    entropy: *const [tls.Client.Options.entropy_len]u8,
     now: std.Io.Timestamp,
+    application_protocols: []const []const u8,
     allow_insecure: bool,
     bundle: ?*Certificate.Bundle,
-) std.crypto.tls.Client.Options {
+) tls.Client.Options {
     // Keep host.explicit so SNI is still sent; Zig couples SNI with hostname
     // checks, so allowInsecure only skips the CA chain (common for self-signed).
     return .{
@@ -112,6 +113,7 @@ fn tlsOptions(
                 .lock = &ca_state.rw,
                 .bundle = bundle.?,
             } },
+        .application_protocols = application_protocols,
         .read_buffer = read_buf,
         .write_buffer = write_buf,
         .entropy = entropy,
@@ -170,34 +172,6 @@ fn readTlsChunk(reader: *Io.Reader, out: []u8) !usize {
     return n;
 }
 
-/// How much of the caller's `-t` budget the ALPN side check may spend.
-///
-/// The check dials its own connection before the real probe, so whatever it burns is
-/// taken from the probe that actually decides the verdict — and a check that times
-/// out would otherwise leave nothing, failing the candidate as `Timeout` without ever
-/// testing it. Half the budget is ample for one ClientHello/ServerHello round trip;
-/// below two seconds there is no room to split, so the probe keeps everything.
-const AlpnBudget = union(enum) {
-    /// Nothing to split: run no check, leaving the whole budget to the probe.
-    skip,
-    /// Seconds the check may spend.
-    secs: u32,
-
-    fn forTimeout(timeout_secs: u32) AlpnBudget {
-        const half = timeout_secs / 2;
-        return if (half == 0) .skip else .{ .secs = half };
-    }
-
-    /// The `timeout_secs` argument for `alpn.negotiated`, or `null` when no check
-    /// may run. Never 0, which would leave `alpn.negotiated` no time at all.
-    fn negotiateSecs(self: AlpnBudget) ?u32 {
-        return switch (self) {
-            .skip => null,
-            .secs => |s| s,
-        };
-    }
-};
-
 pub fn probe(
     gpa: std.mem.Allocator,
     io: Io,
@@ -212,37 +186,12 @@ pub fn probe(
     const start = netutil.monoNow(io);
     const sni_use = if (opts.sni.len > 0) opts.sni else host;
 
-    // Xray-family clients negotiate ALPN before the WebSocket upgrade. A server that
-    // answers "h2" then speaks HTTP/2 where the upgrade expects HTTP/1.1, so the
-    // transport is dead for them even though a no-ALPN handshake would succeed.
-    // Only h2 can break it, so an offer without h2 skips the extra round trip.
-    // The `--check-volume` attempt follows latency attempts that already ran it.
-    if (opts.transport_ws and alpn.offersH2(opts.alpn) and target.steady_reply != .download) {
-        if (AlpnBudget.forTimeout(timeout_secs).negotiateSecs()) |alpn_secs| {
-            var selected_buf: [64]u8 = undefined;
-            // Only a confirmed h2 pick is evidence against the node. If the side connection
-            // cannot answer at all — a transient failure, or a TLS 1.3-only server that
-            // rejects the 1.2 hello — fall through and let the real probe judge it, rather
-            // than failing a candidate whose transport may well work.
-            const selected = alpn.negotiated(io, host, port, sni_use, opts.alpn, alpn_secs, bind, &selected_buf) catch |err| skipped: {
-                std.log.debug("ALPN check skipped for {s}:{d}: {t}", .{ host, port, err });
-                break :skipped null;
-            };
-            if (selected) |proto| {
-                if (std.mem.eql(u8, proto, "h2")) return error.WsAlpnHttp2;
-            }
-        }
-    }
-
-    // Loaded once per process; keep it out of the measured time like the ALPN check.
+    // Loaded once per process; keep it out of the measured time.
     const bundle: ?*Certificate.Bundle = if (opts.allow_insecure) null else try ensureCaBundle(gpa, io);
 
-    // The ALPN check already spent part of the caller's budget; the rest of the probe
-    // gets what is left, so `-t` still bounds the whole attempt.
     const connect_secs = netutil.remainingTimeoutSecs(start, io, timeout_secs);
     if (connect_secs == 0) return error.Timeout;
-    // Measured from the real dial: a client negotiates ALPN inside its own handshake,
-    // so the side check's extra connection is not part of the latency.
+    // Measured from the real dial; ALPN is part of this handshake.
     const attempt_start = netutil.monoNow(io);
     stage.* = .connect;
     const stream = try netutil.connectHostPort(io, host, port, connect_secs, bind);
@@ -258,11 +207,11 @@ pub fn probe(
     var guard = try netutil.DeadlineShutdown.arm(io, stream, remain, &done, &fired);
     defer guard.disarm();
 
-    var sock_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
-    var sock_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
-    var tls_read_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
-    var tls_write_buf: [std.crypto.tls.Client.min_buffer_len]u8 = undefined;
-    var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+    var sock_write_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var sock_read_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var tls_read_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var tls_write_buf: [tls.Client.min_buffer_len]u8 = undefined;
+    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
     io.random(&entropy);
 
     var stream_writer = stream.writer(io, &sock_write_buf);
@@ -270,11 +219,17 @@ pub fn probe(
 
     const now = Io.Clock.real.now(io);
 
-    var tls_client = std.crypto.tls.Client.init(
+    var tls_client = tls.Client.init(
         &stream_reader.interface,
         &stream_writer.interface,
-        tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, opts.allow_insecure, bundle),
+        tlsOptions(gpa, io, sni_use, &tls_read_buf, &tls_write_buf, &entropy, now, opts.alpn, opts.allow_insecure, bundle),
     ) catch |err| return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
+    // WebSocket is HTTP/1.1 here; an h2 pick would make the following upgrade invalid.
+    if (opts.transport_ws) {
+        if (tls_client.applicationProtocol()) |proto| {
+            if (std.mem.eql(u8, proto, "h2")) return error.WsAlpnHttp2;
+        }
+    }
     stage.* = .tunnel;
 
     const tls_writer = &tls_client.writer;
@@ -369,21 +324,6 @@ test "ensureCaBundle does not rescan after a previous failure" {
     try std.testing.expectError(error.CertificateBundleLoadFailure, result);
     try std.testing.expectEqual(false, ca_state.loaded);
     try std.testing.expectEqual(true, ca_state.failed);
-}
-
-test "AlpnBudget always leaves the probe part of the budget" {
-    // Too small to split: the probe that decides the verdict keeps everything.
-    try std.testing.expectEqual(@as(AlpnBudget, .skip), AlpnBudget.forTimeout(0));
-    try std.testing.expectEqual(@as(AlpnBudget, .skip), AlpnBudget.forTimeout(1));
-    // Otherwise half, so `remainingTimeoutSecs` can never reach 0 on the check alone.
-    try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 1 }), AlpnBudget.forTimeout(2));
-    try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 1 }), AlpnBudget.forTimeout(3));
-    try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 2 }), AlpnBudget.forTimeout(5));
-    try std.testing.expectEqual(@as(AlpnBudget, .{ .secs = 15 }), AlpnBudget.forTimeout(30));
-
-    // Skipping is `null`, never 0 — 0 would leave `alpn.negotiated` no time at all.
-    try std.testing.expectEqual(@as(?u32, null), AlpnBudget.forTimeout(1).negotiateSecs());
-    try std.testing.expectEqual(@as(?u32, 2), AlpnBudget.forTimeout(5).negotiateSecs());
 }
 
 /// Hands out `reply` on the first read; any further read fails the test, standing in

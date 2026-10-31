@@ -210,6 +210,7 @@ fn parseTrojan(gpa: std.mem.Allocator, line: []const u8) !Proxy {
 
 fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     const rest0 = stripFragment(afterScheme(line));
+    const query = if (std.mem.findScalar(u8, rest0, '?')) |q| rest0[q + 1 ..] else "";
     // SIP002: base64(method:password)@host:port
     if (std.mem.findScalar(u8, rest0, '@')) |at| {
         const encoded_user = rest0[0..at];
@@ -236,7 +237,7 @@ fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
             .host = hp.host,
             .port = hp.port,
             .userinfo = "",
-            .query = "",
+            .query = query,
             .method = method,
             .password = password,
             .owns_method_password = true,
@@ -271,7 +272,7 @@ fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
         .owns_host = true,
         .port = hp.port,
         .userinfo = "",
-        .query = "",
+        .query = query,
         .method = method,
         .password = password,
         .owns_method_password = true,
@@ -534,6 +535,21 @@ test "parse ss legacy accepts a trailing path and query" {
         try std.testing.expectEqual(@as(u16, 2060), p.port);
         try std.testing.expectEqualStrings("chacha20-ietf-poly1305", p.method.?);
         try std.testing.expectEqualStrings("test-password", p.password.?);
+    }
+}
+
+test "parse ss preserves plugin query in SIP002 and legacy URIs" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3Jk@192.0.2.10:2060/?plugin=obfs%2Dlocal#tag",
+        "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3JkQDE5Mi4wLjIuMTA6MjA2MA/?plugin=obfs%2Dlocal#tag",
+    };
+    for (lines) |line| {
+        var p = try parse(gpa, line);
+        defer p.deinit(gpa);
+        const plugin = try p.getParamDecoded(gpa, "plugin");
+        defer gpa.free(plugin.?);
+        try std.testing.expectEqualStrings("obfs-local", plugin.?);
     }
 }
 

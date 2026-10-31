@@ -18,7 +18,7 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 | Protocol | Notes |
 |----------|--------|
 | Shadowsocks | AEAD methods |
-| Trojan | TLS; WebSocket transport. ws side check fails `WsAlpnHttp2` when the server picks h2; without `alpn=` ws offers `http/1.1` only, like Xray (`WithNextProto`) and sing-box / podkop (`SetNextProtos`), so the check runs only for an explicit h2 |
+| Trojan | TLS; WebSocket transport. The main TLS handshake negotiates ALPN and ws fails `WsAlpnHttp2` when the server picks h2; without `alpn=` ws offers `http/1.1` only, like Xray (`WithNextProto`) and sing-box / podkop (`SetNextProtos`) |
 | VLESS | REALITY only; TCP vision (`xtls-rprx-vision`, inner HTTPS) and gRPC gun |
 | VMess | Skipped (counted in stats) |
 
@@ -27,7 +27,7 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 1. Fetch subscription URL (**HTTPS only**; plaintext schemes → `InsecureSubscriptionUrl`). Redirects are followed only while the resolved target stays HTTPS; `http://` hops are rejected. Scheme is normalized to lowercase for `std.http.Client`.
 2. Base64-decode body; iterate URI lines.
 3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**. Every entry is probed: a failure (even a connect timeout) never skips the host's remaining entries.
-4. Each candidate: **3 probes**; one transient failure (timeout / reset / EOF, `isTransient`) is retried once, any other error fails it immediately; keep **median** latency per preference class. With `--check-volume`, a candidate that passed gets one more untimed, unretried attempt: tunnel to `util.VOLUME_DOMAIN` (`speed.cloudflare.com`), trace warmup, then a `VOLUME_BYTES` (40000) download that must arrive whole (`util.VOLUME_TARGET`); a timeout after the connection is established (`Timeout` / `ConnectionTimedOut`) is `VolumeStalled`, while a connect timeout stays `ConnectTimeout`; a well-formed non-200 download reply is `VolumeRefused`, logged and ignored (Cloudflare refused, not the node). Latency = full attempt from dial to the steady reply (handshake, WS upgrade, test requests — warmup + steady, or one request after the inner TLS for vision); Trojan's ALPN side check and CA bundle load are excluded, but still count against `-t`.
+4. Each candidate: **3 probes**; one transient failure (timeout / reset / EOF, `isTransient`) is retried once, any other error fails it immediately; keep **median** latency per preference class. With `--check-volume`, a candidate that passed gets one more untimed, unretried attempt: tunnel to `util.VOLUME_DOMAIN` (`speed.cloudflare.com`), trace warmup, then a `VOLUME_BYTES` (40000) download that must arrive whole (`util.VOLUME_TARGET`); a timeout after the connection is established (`Timeout` / `ConnectionTimedOut`) is `VolumeStalled`, while a connect timeout stays `ConnectTimeout`; a well-formed non-200 download reply is `VolumeRefused`, logged and ignored (Cloudflare refused, not the node). Latency = full attempt from dial to the steady reply (handshake, WS upgrade, test requests — warmup + steady, or one request after the inner TLS for vision); Trojan's CA bundle load is excluded, but still counts against `-t`.
 5. Rank with `selectBestClass` according to `--strategy` (`hydec` default, `fastest`, `strict`). `hydec`: prefer VLESS² (gRPC) / Trojan → VLESS³ (TCP) → SS, where VLESS² and Trojan are one tier represented by the faster of the two (VLESS² on a tie). Demote the VLESS²/Trojan tier→VLESS³ when it is **>2×** slower; tier→SS when **≥3×** (then keep VLESS³ unless it is **>3×** slower than SS); with no VLESS²/Trojan, demote VLESS³→SS when **>2×** slower. Each demotion also needs an absolute gap of **>15 ms** (`MIN_DEMOTE_GAP_MS`). `fastest`: lowest latency (tie → higher class). `strict`: never demote. `--prefer-stable` (orthogonal to the strategy) ranks by `Rank`: the worst sample instead of the median, and a candidate that needed a retry loses to every clean one; `selectBestRanked` lets classes whose best was retried compete only when no class has a clean best.
 6. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
 
@@ -59,7 +59,8 @@ Optional bind spec for **probe** sockets only (subscription fetch unchanged):
 | `src/proxy_uri.zig` | URI parse (kind, host/port, query, `#name`) |
 | `src/probe.zig` | Group-by-host parallel `findBest`, preference ranking, `probeOne` / `probeLatency` |
 | `src/ss.zig` / `trojan.zig` / `reality.zig` | Protocol probes |
-| `src/alpn.zig` | `alpn=` parsing, ALPN negotiation check (TLS 1.2 ClientHello) |
+| `src/tls_client.zig` | TLS client based on Zig 0.17 `std.crypto.tls.Client`, with ALPN support |
+| `src/alpn.zig` | `alpn=` parsing and transport-specific defaults |
 | `src/vless.zig` / `grpc_gun.zig` / `ws.zig` | Framing helpers |
 | `src/netutil.zig` | Timed connect, optional source bind, poll deadlines, TLS watchdog |
 | `src/util.zig` | Shared helpers (URL decode, query params, …); probe `Target` / `ProbeReply` (`LATENCY_TARGET`, `VOLUME_TARGET`) passed to every protocol probe |

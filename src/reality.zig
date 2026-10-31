@@ -518,6 +518,8 @@ const RealityConn = struct {
     xtls_raw_write: bool = false,
     /// After downlink PaddingDirect, further reads are raw TCP (xray UnwrapRawConn).
     xtls_raw_read: bool = false,
+    /// Once buffered bytes are known raw, never reclassify the remaining raw stream.
+    xtls_raw_drained: bool = false,
 
     fn deadlineFired(self: *const RealityConn) bool {
         return self.deadline_fired.load(.acquire);
@@ -573,14 +575,27 @@ const RealityConn = struct {
 
     fn readApp(self: *RealityConn, out: []u8) !usize {
         if (self.xtls_raw_read) {
+            if (self.xtls_raw_drained) {
+                try self.waitForReadable();
+                return try self.recvRawOnce(out);
+            }
             // After Vision PaddingDirect, further downlink is usually raw TCP (xray
-            // UnwrapRawConn). A complete Reality record may still sit in sock_rbuf —
-            // decrypt that first. Then one recv only: Io.Reader.readSliceShort loops
-            // until dest is full, which on a blocking socket stalls until DeadlineShutdown.
-            if (try self.tryDecryptBufferedRealityApp(out)) |n| return n;
-            try self.waitForReadable();
-            if (try self.tryDecryptBufferedRealityApp(out)) |n| return n;
-            return try self.recvRawOnce(out);
+            // UnwrapRawConn). A Reality record may still sit in sock_rbuf: complete
+            // it before deciding that its ciphertext is raw inner-TLS plaintext.
+            // Raw reads remain single-recv; readSliceShort can stall until the deadline.
+            while (true) {
+                switch (try self.tryDecryptBufferedRealityApp(out)) {
+                    .plaintext => |n| return n,
+                    .incomplete => |record_len| {
+                        self.conn.reader.fill(record_len) catch |err| return self.mapIoErr(err);
+                    },
+                    .raw => {
+                        self.xtls_raw_drained = true;
+                        try self.waitForReadable();
+                        return try self.recvRawOnce(out);
+                    },
+                }
+            }
         }
         var scratch: [16640]u8 = undefined;
         var attempts: usize = 0;
@@ -629,9 +644,17 @@ const RealityConn = struct {
         return n;
     }
 
+    const BufferedRealityApp = union(enum) {
+        /// Not a Reality record prefix; safe for the raw TCP path.
+        raw,
+        /// Total record bytes required, including the five-byte header.
+        incomplete: usize,
+        /// Decrypted application bytes copied into the caller's buffer.
+        plaintext: usize,
+    };
+
     /// If sock_rbuf holds a complete REALITY application-data record, decrypt it into
-    /// `out` and return its length. Returns null when there is not a full record yet,
-    /// or when buffered bytes are not Reality ciphertext (raw TCP after splice).
+    /// `out`. A matching but truncated record prefix is never classified as raw TCP.
     /// Peek-decrypts first so a failed AEAD leaves bytes for the raw TCP path.
     ///
     /// Iterative rather than recursive: the ignorable inner types (NewSessionTicket,
@@ -640,16 +663,19 @@ const RealityConn = struct {
     /// backend turns that tail call into a jump and the 16 KiB `plain` frame is not
     /// re-stacked, so nothing overflowed — but a depth the peer chooses should not
     /// rest on an optimisation holding.
-    fn tryDecryptBufferedRealityApp(self: *RealityConn, out: []u8) !?usize {
+    fn tryDecryptBufferedRealityApp(self: *RealityConn, out: []u8) !BufferedRealityApp {
         while (true) {
             const r = self.conn.reader;
             const avail = r.end - r.seek;
-            if (avail < 5) return null;
+            if (avail == 0) return .raw;
             const buf = r.buffer[r.seek..r.end];
-            if (buf[0] != 23 or buf[1] != 0x03 or buf[2] != 0x03) return null;
+            if (buf[0] != 23) return .raw;
+            if (avail > 1 and buf[1] != 0x03) return .raw;
+            if (avail > 2 and buf[2] != 0x03) return .raw;
+            if (avail < 5) return .{ .incomplete = 5 };
             const length: usize = (@as(usize, buf[3]) << 8) | buf[4];
-            if (length < 16 or length > 16640) return null;
-            if (avail < 5 + length) return null;
+            if (length < 16 or length > 16640) return .raw;
+            if (avail < 5 + length) return .{ .incomplete = 5 + length };
 
             const payload = buf[5 .. 5 + length];
             const ct_len = length - 16;
@@ -660,7 +686,7 @@ const RealityConn = struct {
             var tag: [16]u8 = undefined;
             @memcpy(&tag, payload[ct_len..][0..16]);
             Aes128Gcm.decrypt(plain[0..ct_len], payload[0..ct_len], tag, &aad, nonce, self.conn.server_key) catch {
-                return null; // not Reality — leave bytes for raw read
+                return .raw; // not Reality — leave bytes for raw read
             };
 
             // Commit: consume ciphertext and advance seq.
@@ -676,7 +702,7 @@ const RealityConn = struct {
                 23 => {
                     if (msg_len > out.len) return error.BufferTooSmall;
                     @memcpy(out[0..msg_len], plain[0..msg_len]);
-                    return msg_len;
+                    return .{ .plaintext = msg_len };
                 },
                 22 => {
                     try rejectPostHandshakeKeyUpdate(plain[0..msg_len]);
@@ -1552,7 +1578,9 @@ test "tryDecryptBufferedRealityApp drains an ignorable chain the size of sock_rb
     var rc = testDecryptConn(&reader, &TEST_RECORD_KEY, &TEST_RECORD_IV);
 
     var out: [64]u8 = undefined;
-    const n = (try rc.tryDecryptBufferedRealityApp(&out)).?;
+    const result = try rc.tryDecryptBufferedRealityApp(&out);
+    try std.testing.expect(result == .plaintext);
+    const n = result.plaintext;
 
     try std.testing.expectEqualStrings("hello", out[0..n]);
     // Every record was consumed and counted, so the read sequence stays in step
@@ -1578,7 +1606,7 @@ test "tryDecryptBufferedRealityApp fails closed on a KeyUpdate mid-chain" {
     try std.testing.expectError(error.TlsKeyUpdateUnsupported, rc.tryDecryptBufferedRealityApp(&out));
 }
 
-test "tryDecryptBufferedRealityApp reports null on a partial record" {
+test "tryDecryptBufferedRealityApp reports the required size of a partial record" {
     // A partial trailing record must leave the buffer alone for the next fill.
     var wire: [512]u8 = undefined;
     const full = appendSealedRecord(&wire, &TEST_RECORD_KEY, &TEST_RECORD_IV, 0, 23, "hello");
@@ -1587,9 +1615,90 @@ test "tryDecryptBufferedRealityApp reports null on a partial record" {
     var rc = testDecryptConn(&reader, &TEST_RECORD_KEY, &TEST_RECORD_IV);
 
     var out: [64]u8 = undefined;
-    try std.testing.expectEqual(@as(?usize, null), try rc.tryDecryptBufferedRealityApp(&out));
+    try std.testing.expectEqual(RealityConn.BufferedRealityApp{ .incomplete = full }, try rc.tryDecryptBufferedRealityApp(&out));
     try std.testing.expectEqual(@as(u64, 0), rc.conn.read_seq);
     try std.testing.expectEqual(full - 1, reader.end - reader.seek);
+}
+
+fn testRawReadConn(reader: *Io.Reader) RealityConn {
+    var rc = testDecryptConn(reader, &TEST_RECORD_KEY, &TEST_RECORD_IV);
+    rc.xtls_raw_read = true;
+    rc.xtls_raw_drained = false;
+    rc.deadline_fired = .init(false);
+    rc.stream_reader.err = null;
+    rc.stream_writer.err = null;
+    return rc;
+}
+
+const RemainingReader = struct {
+    remaining: []const u8,
+    calls: usize = 0,
+    r: Io.Reader,
+
+    fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+        const self: *RemainingReader = @fieldParentPtr("r", r);
+        self.calls += 1;
+        if (self.remaining.len == 0) return error.EndOfStream;
+        const n = @min(self.remaining.len, @backingInt(limit));
+        try w.writeAll(self.remaining[0..n]);
+        self.remaining = self.remaining[n..];
+        return n;
+    }
+};
+
+test "readApp does not leak a partial Reality record as raw TCP at EOF" {
+    // Arrange: PaddingDirect already selected raw mode, but the buffered bytes are
+    // still a prefix of an encrypted Reality record rather than inner plaintext.
+    var wire: [512]u8 = undefined;
+    const full = appendSealedRecord(&wire, &TEST_RECORD_KEY, &TEST_RECORD_IV, 0, 23, "hello");
+    var reader: Io.Reader = .fixed(wire[0 .. full - 1]);
+    var rc = testRawReadConn(&reader);
+    var out: [64]u8 = undefined;
+
+    // Act / Assert: ciphertext must not be returned to the inner TLS client.
+    try std.testing.expectError(error.EndOfStream, rc.readApp(&out));
+    try std.testing.expectEqual(@as(u64, 0), rc.conn.read_seq);
+}
+
+test "readApp completes a Reality record split between reader fills" {
+    // Arrange
+    var wire: [512]u8 = undefined;
+    const full = appendSealedRecord(&wire, &TEST_RECORD_KEY, &TEST_RECORD_IV, 0, 23, "hello");
+    const split = 12;
+    var buf: [512]u8 = undefined;
+    @memcpy(buf[0..split], wire[0..split]);
+    var source: RemainingReader = .{
+        .remaining = wire[split..full],
+        .r = .{ .vtable = &.{ .stream = RemainingReader.stream }, .buffer = &buf, .seek = 0, .end = split },
+    };
+    var rc = testRawReadConn(&source.r);
+    var out: [64]u8 = undefined;
+
+    // Act
+    const n = try rc.readApp(&out);
+
+    // Assert
+    try std.testing.expectEqualStrings("hello", out[0..n]);
+    try std.testing.expectEqual(@as(usize, 1), source.calls);
+    try std.testing.expectEqual(@as(u64, 1), rc.conn.read_seq);
+}
+
+test "readApp never rechecks raw bytes as Reality records" {
+    // The second chunk looks like a truncated TLS record. Once raw mode is known,
+    // it must be returned as-is instead of triggering another blocking record fill.
+    const raw = "junk\x17\x03\x03\x00\x10";
+    var reader: Io.Reader = .fixed(raw);
+    var rc = testRawReadConn(&reader);
+
+    var first: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, first.len), try rc.readApp(&first));
+    try std.testing.expectEqualStrings("junk", &first);
+    try std.testing.expect(rc.xtls_raw_drained);
+
+    var second: [5]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, second.len), try rc.readApp(&second));
+    try std.testing.expectEqualStrings(raw[4..], &second);
+    try std.testing.expectEqual(@as(u64, 0), rc.conn.read_seq);
 }
 
 test "appendStripVlessHeader handles NeedMore then body" {

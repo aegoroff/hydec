@@ -1,7 +1,7 @@
 name: CI Build
 
 concurrency:
-  group: ci-build
+  group: ci-build-${{ forgejo.ref }}
   cancel-in-progress: true
 
 env:

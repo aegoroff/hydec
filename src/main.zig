@@ -174,4 +174,5 @@ test {
     _ = @import("netutil.zig");
     _ = @import("fetch.zig");
     _ = @import("alpn.zig");
+    _ = @import("tls_client.zig");
 }
