@@ -136,6 +136,7 @@ pub fn probeOne(
         },
         .trojan => blk: {
             if (proxy.transport == .grpc or proxy.transport == .other) return error.UnsupportedTransport;
+            if (proxy.security != .tls) return error.UnsupportedSecurity;
             const sni_owned = try proxy.getParamDecoded(gpa, "sni");
             defer if (sni_owned) |s| gpa.free(s);
             const sni = sni_owned orelse proxy.host;
@@ -876,6 +877,23 @@ test "probeOne rejects Trojan transports it cannot carry before dialing" {
 
         // Act / Assert: 192.0.2.1 is TEST-NET, so reaching the dial would hang or fail differently.
         try std.testing.expectError(error.UnsupportedTransport, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, &stage));
+        try std.testing.expectEqual(util.Stage.setup, stage);
+    }
+}
+
+test "probeOne rejects non-TLS Trojan security before dialing" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{
+        "trojan://pw@192.0.2.1:443?security=none#n",
+        "trojan://pw@192.0.2.1:443?security=reality#r",
+    }) |line| {
+        // Arrange
+        var proxy = try proxy_uri.parse(gpa, line);
+        defer proxy.deinit(gpa);
+        var stage: util.Stage = .setup;
+
+        // Act / Assert: 192.0.2.1 is TEST-NET, so reaching the dial would fail differently.
+        try std.testing.expectError(error.UnsupportedSecurity, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, &stage));
         try std.testing.expectEqual(util.Stage.setup, stage);
     }
 }
