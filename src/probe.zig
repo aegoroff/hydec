@@ -6,6 +6,7 @@ const ss = @import("ss.zig");
 const trojan = @import("trojan.zig");
 const alpn = @import("alpn.zig");
 const reality = @import("reality.zig");
+const netutil = @import("netutil.zig");
 const Io = std.Io;
 
 const Result = struct {
@@ -679,14 +680,14 @@ const HostQueue = struct {
     }
 };
 
-fn freeGroups(gpa: std.mem.Allocator, groups: *std.array_hash_map.String(std.ArrayList(WorkItem))) void {
-    for (groups.keys()) |key| {
-        gpa.free(key);
-    }
+/// Disjoint resolved-address sets (or one unresolved name); each list is probed
+/// sequentially, different lists in parallel.
+const GroupMap = std.array_hash_map.String(std.ArrayList(WorkItem));
+
+fn freeGroups(gpa: std.mem.Allocator, groups: *GroupMap) void {
+    for (groups.keys()) |key| gpa.free(key);
     for (groups.values()) |*list| {
-        for (list.items) |*item| {
-            item.proxy.deinit(gpa);
-        }
+        for (list.items) |*item| item.proxy.deinit(gpa);
         list.deinit(gpa);
     }
     groups.deinit(gpa);
@@ -699,34 +700,148 @@ fn logParseFail(gpa: std.mem.Allocator, index: usize, line: []const u8, err: any
     std.log.warn("parse fail: entry {d}{f}: {}", .{ index + 1, NameSuffix{ .name = name }, err });
 }
 
-fn dupeHostKey(gpa: std.mem.Allocator, host: []const u8) ![]u8 {
-    if (Io.net.IpAddress.parse(host, 0)) |address| {
-        var buf: [64]u8 = undefined;
-        var writer: Io.Writer = .fixed(&buf);
-        try address.format(&writer);
-        const formatted = writer.buffered();
-        // IpAddress.format includes the dummy port and, for IPv6, brackets.
-        const key = switch (address) {
-            .ip4 => formatted[0 .. formatted.len - 2],
-            .ip6 => formatted[1 .. formatted.len - 3],
-        };
-        return gpa.dupe(u8, key);
-    } else |_| {}
+fn dupeIpKey(gpa: std.mem.Allocator, address: Io.net.IpAddress) ![]u8 {
+    var buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buf);
+    try address.format(&writer);
+    const formatted = writer.buffered();
+    // IpAddress.format includes the port and, for IPv6, brackets.
+    const port_sep = std.mem.lastIndexOfScalar(u8, formatted, ':').?;
+    const key = switch (address) {
+        .ip4 => formatted[0..port_sep],
+        .ip6 => formatted[1 .. port_sep - 1],
+    };
+    return gpa.dupe(u8, key);
+}
 
-    const key = try gpa.alloc(u8, host.len);
-    for (key, host) |*dst, c| dst.* = std.ascii.toLower(c);
+fn dupeNameOwnerKey(gpa: std.mem.Allocator, host: []const u8) ![]u8 {
+    // A final dot is the DNS root label, not part of the host's identity. Prefix the
+    // owner key so even unusual numeric names cannot collide with an IP endpoint key.
+    const name = if (host.len > 1 and host[host.len - 1] == '.') host[0 .. host.len - 1] else host;
+    const key = try gpa.alloc(u8, "name:".len + name.len);
+    @memcpy(key[0.."name:".len], "name:");
+    for (key["name:".len..], name) |*dst, c| dst.* = std.ascii.toLower(c);
     return key;
 }
 
-/// Build host→proxies map. Same host (IP) shares one sequential queue.
+const MAX_RESOLVED_ADDRESSES = 32;
+const EndpointOwners = std.array_hash_map.String([]const u8);
+
+const SystemResolver = struct {
+    /// One budget for the whole grouping pass, so a dead resolver costs at most `-t`
+    /// before probing starts rather than a timeout per hostname.
+    deadline: i128,
+
+    fn lookup(self: @This(), io: Io, host: []const u8, port: u16, addresses: []Io.net.IpAddress) ![]Io.net.IpAddress {
+        // A truncated answer fails too: an omitted address could be the one shared
+        // with another hostname.
+        return netutil.resolveAllUntil(io, host, port, self.deadline, addresses);
+    }
+};
+
+fn resolveAddresses(
+    io: Io,
+    host: []const u8,
+    port: u16,
+    storage: *[MAX_RESOLVED_ADDRESSES]Io.net.IpAddress,
+    resolver: anytype,
+) []const Io.net.IpAddress {
+    if (Io.net.IpAddress.parse(host, port)) |address| {
+        storage[0] = address;
+        return storage[0..1];
+    } else |_| {}
+
+    // Resolution also happens in the probe, which reports DNS failures per entry.
+    // An empty result groups the entry by name instead of failing the run here.
+    return resolver.lookup(io, host, port, storage) catch storage[0..0];
+}
+
+fn freeEndpointOwners(gpa: std.mem.Allocator, owners: *EndpointOwners) void {
+    for (owners.keys()) |key| gpa.free(key);
+    owners.deinit(gpa);
+}
+
+fn getOrCreateGroup(
+    gpa: std.mem.Allocator,
+    groups: *GroupMap,
+    key: []const u8,
+) ![]const u8 {
+    const owned_key = try gpa.dupe(u8, key);
+    const gop = groups.getOrPut(gpa, owned_key) catch |err| {
+        gpa.free(owned_key);
+        return err;
+    };
+    if (gop.found_existing) {
+        gpa.free(owned_key);
+    } else {
+        gop.value_ptr.* = .empty;
+    }
+    return gop.key_ptr.*;
+}
+
+/// Merge two queues when a hostname bridges address sets that were disjoint before.
+fn mergeGroups(
+    gpa: std.mem.Allocator,
+    groups: *GroupMap,
+    owners: *EndpointOwners,
+    target_key: []const u8,
+    source_key: []const u8,
+) !void {
+    if (std.mem.eql(u8, target_key, source_key)) return;
+
+    const target = groups.getPtr(target_key).?;
+    const source = groups.get(source_key).?;
+    try target.ensureUnusedCapacity(gpa, source.items.len);
+    target.appendSliceAssumeCapacity(source.items);
+
+    const removed = groups.fetchOrderedRemove(source_key).?;
+    var removed_list = removed.value;
+    removed_list.deinit(gpa);
+    for (owners.values()) |*owner| {
+        if (std.mem.eql(u8, owner.*, source_key)) owner.* = target_key;
+    }
+    gpa.free(removed.key);
+}
+
+fn addEndpointOwner(gpa: std.mem.Allocator, owners: *EndpointOwners, endpoint_key: []const u8, group_key: []const u8) !void {
+    const owned_key = try gpa.dupe(u8, endpoint_key);
+    const gop = owners.getOrPut(gpa, owned_key) catch |err| {
+        gpa.free(owned_key);
+        return err;
+    };
+    if (gop.found_existing) {
+        gpa.free(owned_key);
+        std.debug.assert(std.mem.eql(u8, gop.value_ptr.*, group_key));
+    } else {
+        gop.value_ptr.* = group_key;
+    }
+}
+
+/// Build endpoint→proxies queues. Names sharing any resolved IP share one queue.
 fn collectGroups(
     gpa: std.mem.Allocator,
+    io: Io,
     lines: []const []const u8,
     stats: *Stats,
     verbose: bool,
-) !std.array_hash_map.String(std.ArrayList(WorkItem)) {
-    var groups: std.array_hash_map.String(std.ArrayList(WorkItem)) = .empty;
+    timeout_secs: u32,
+) !GroupMap {
+    const resolver: SystemResolver = .{ .deadline = netutil.deadlineNs(io, timeout_secs) };
+    return collectGroupsWithResolver(gpa, io, lines, stats, verbose, resolver);
+}
+
+fn collectGroupsWithResolver(
+    gpa: std.mem.Allocator,
+    io: Io,
+    lines: []const []const u8,
+    stats: *Stats,
+    verbose: bool,
+    resolver: anytype,
+) !GroupMap {
+    var groups: GroupMap = .empty;
     errdefer freeGroups(gpa, &groups);
+    var owners: EndpointOwners = .empty;
+    defer freeEndpointOwners(gpa, &owners);
 
     for (lines, 0..) |line, i| {
         const kind = proxy_uri.classify(line);
@@ -749,19 +864,53 @@ fn collectGroups(
         };
         errdefer proxy.deinit(gpa);
 
-        // Own normalized map keys: legacy SS hosts are freed in proxy.deinit.
-        var host_key: ?[]u8 = try dupeHostKey(gpa, proxy.host);
-        errdefer if (host_key) |k| gpa.free(k);
+        var address_storage: [MAX_RESOLVED_ADDRESSES]Io.net.IpAddress = undefined;
+        // No addresses: the probe resolves again and reports the DNS failure. Such a
+        // name gets a queue of its own; an address it might share with another entry
+        // is the price of not serializing every unresolved entry.
+        const addresses = resolveAddresses(io, proxy.host, proxy.port, &address_storage, resolver);
 
-        const gop = try groups.getOrPut(gpa, host_key.?);
-        if (gop.found_existing) {
-            gpa.free(host_key.?);
-            host_key = null;
-        } else {
-            host_key = null; // owned by map
-            gop.value_ptr.* = .empty;
+        var endpoint_keys: [MAX_RESOLVED_ADDRESSES][]u8 = undefined;
+        var endpoint_count: usize = 0;
+        defer for (endpoint_keys[0..endpoint_count]) |key| gpa.free(key);
+        for (addresses) |address| {
+            endpoint_keys[endpoint_count] = try dupeIpKey(gpa, address);
+            endpoint_count += 1;
         }
-        try gop.value_ptr.append(gpa, .{
+        const endpoints = endpoint_keys[0..endpoint_count];
+        const name_key: ?[]u8 = if (Io.net.IpAddress.parse(proxy.host, proxy.port)) |_| null else |_| try dupeNameOwnerKey(gpa, proxy.host);
+        defer if (name_key) |key| gpa.free(key);
+
+        var group_key: ?[]const u8 = null;
+        for (endpoints) |endpoint| {
+            if (owners.get(endpoint)) |existing| {
+                group_key = existing;
+                break;
+            }
+        }
+        if (group_key == null) {
+            if (name_key) |key| {
+                if (owners.get(key)) |existing| group_key = existing;
+            }
+        }
+        if (group_key == null) {
+            // IP literals always yield one address, so an empty set has a name key.
+            const first_key = if (endpoints.len > 0) endpoints[0] else name_key.?;
+            group_key = try getOrCreateGroup(gpa, &groups, first_key);
+        }
+
+        // A new name can connect two previously separate address sets. Their queues
+        // must become one before any workers start.
+        for (endpoints) |endpoint| {
+            if (owners.get(endpoint)) |existing| try mergeGroups(gpa, &groups, &owners, group_key.?, existing);
+        }
+        if (name_key) |key| {
+            if (owners.get(key)) |existing| try mergeGroups(gpa, &groups, &owners, group_key.?, existing);
+        }
+        for (endpoints) |endpoint| try addEndpointOwner(gpa, &owners, endpoint, group_key.?);
+        if (name_key) |key| try addEndpointOwner(gpa, &owners, key, group_key.?);
+
+        try groups.getPtr(group_key.?).?.append(gpa, .{
             .raw = line,
             .proxy = proxy,
         });
@@ -782,7 +931,7 @@ pub fn findBest(
     check_volume: bool,
     stats: *Stats,
 ) !?Result {
-    var groups = try collectGroups(gpa, lines, stats, verbose);
+    var groups = try collectGroups(gpa, io, lines, stats, verbose, timeout_secs);
     defer freeGroups(gpa, &groups);
 
     if (groups.count() == 0) return null;
@@ -799,8 +948,8 @@ pub fn findBest(
     };
     errdefer shared.deinitBests();
 
-    // Each worker takes the next host as soon as it is free, so one slow host holds
-    // up only its own thread, not a whole batch of others.
+    // Each worker takes the next address set as soon as it is free, so one slow
+    // endpoint holds up only its own thread, not a whole batch of others.
     var queue: HostQueue = .{ .lists = groups.values() };
     const threads = try gpa.alloc(std.Thread, @min(queue.lists.len, MAX_PARALLEL_HOSTS));
     defer gpa.free(threads);
@@ -1087,7 +1236,7 @@ test "collectGroups buckets by host" {
         "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3Jk@192.0.2.1:443#c",
     };
     var stats: Stats = .{};
-    var groups = try collectGroups(gpa, &lines, &stats, false);
+    var groups = try collectGroups(gpa, std.testing.io, &lines, &stats, false, 3);
     defer freeGroups(gpa, &groups);
 
     try std.testing.expectEqual(@as(usize, 2), groups.count());
@@ -1095,21 +1244,173 @@ test "collectGroups buckets by host" {
     try std.testing.expectEqual(@as(usize, 1), groups.get("198.51.100.1").?.items.len);
 }
 
-test "collectGroups normalizes DNS case and IP literals" {
+const FakeResolver = struct {
+    fn sameName(host: []const u8, name: []const u8) bool {
+        const without_root = if (host.len > 1 and host[host.len - 1] == '.') host[0 .. host.len - 1] else host;
+        return std.ascii.eqlIgnoreCase(without_root, name);
+    }
+
+    fn lookup(_: @This(), _: Io, host: []const u8, port: u16, addresses: []Io.net.IpAddress) ![]Io.net.IpAddress {
+        if (sameName(host, "example.com") or sameName(host, "one.example") or sameName(host, "after.example")) {
+            addresses[0] = try Io.net.IpAddress.parse(if (sameName(host, "example.com")) "192.0.2.10" else "192.0.2.1", port);
+            return addresses[0..1];
+        }
+        if (sameName(host, "two.example")) {
+            addresses[0] = try Io.net.IpAddress.parse("192.0.2.2", port);
+            return addresses[0..1];
+        }
+        if (sameName(host, "bridge.example")) {
+            addresses[0] = try Io.net.IpAddress.parse("192.0.2.2", port);
+            addresses[1] = try Io.net.IpAddress.parse("192.0.2.1", port);
+            return addresses[0..2];
+        }
+        if (sameName(host, "other.example")) {
+            addresses[0] = try Io.net.IpAddress.parse("192.0.2.3", port);
+            return addresses[0..1];
+        }
+        return error.UnknownHostName;
+    }
+};
+
+test "collectGroups resolves DNS aliases and root dots and normalizes IP literals" {
     const gpa = std.testing.allocator;
     const lines = [_][]const u8{
         "trojan://pw@EXAMPLE.COM:443#a",
-        "trojan://pw@example.com:443#b",
+        "trojan://pw@example.com.:443#b",
         "trojan://pw@[2001:db8:0:0:0:0:0:1]:443#c",
         "trojan://pw@[2001:db8::1]:443#d",
+        "trojan://pw@UNRESOLVED.EXAMPLE:443#e",
+        "trojan://pw@unresolved.example.:443#f",
     };
     var stats: Stats = .{};
-    var groups = try collectGroups(gpa, &lines, &stats, false);
+    var groups = try collectGroupsWithResolver(gpa, std.testing.io, &lines, &stats, false, FakeResolver{});
+    defer freeGroups(gpa, &groups);
+
+    try std.testing.expectEqual(@as(usize, 3), groups.count());
+    const resolved = groups.get("192.0.2.10").?.items;
+    try std.testing.expectEqual(@as(usize, 2), resolved.len);
+    try std.testing.expectEqualStrings("EXAMPLE.COM", resolved[0].proxy.host);
+    try std.testing.expectEqualStrings("example.com.", resolved[1].proxy.host);
+    try std.testing.expectEqual(@as(usize, 2), groups.get("2001:db8::1").?.items.len);
+    const unresolved = groups.get("name:unresolved.example").?.items;
+    try std.testing.expectEqual(@as(usize, 2), unresolved.len);
+    try std.testing.expectEqualStrings("UNRESOLVED.EXAMPLE", unresolved[0].proxy.host);
+    try std.testing.expectEqualStrings("unresolved.example.", unresolved[1].proxy.host);
+}
+
+test "collectGroups keeps one DNS name sequential when repeated lookups return disjoint answers" {
+    const Resolver = struct {
+        calls: *usize,
+
+        fn lookup(self: @This(), _: Io, _: []const u8, port: u16, addresses: []Io.net.IpAddress) ![]Io.net.IpAddress {
+            defer self.calls.* += 1;
+            const ip = if (self.calls.* % 2 == 0) "192.0.2.20" else "192.0.2.21";
+            addresses[0] = try Io.net.IpAddress.parse(ip, port);
+            return addresses[0..1];
+        }
+    };
+
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "trojan://pw@round.example:443#a",
+        "trojan://pw@ROUND.EXAMPLE.:443#b",
+    };
+    var calls: usize = 0;
+    var stats: Stats = .{};
+    var groups = try collectGroupsWithResolver(gpa, std.testing.io, &lines, &stats, false, Resolver{ .calls = &calls });
+    defer freeGroups(gpa, &groups);
+
+    try std.testing.expectEqual(@as(usize, 1), groups.count());
+    try std.testing.expectEqual(@as(usize, 2), groups.get("192.0.2.20").?.items.len);
+}
+
+test "collectGroups merges aliases, IP literals, and overlapping resolved address sets" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "trojan://pw@one.example:443#a",
+        "trojan://pw@two.example:443#b",
+        "trojan://pw@bridge.example:443#c",
+        "trojan://pw@other.example:443#d",
+        "trojan://pw@after.example:443#e",
+        "trojan://pw@192.0.2.1:443#literal",
+    };
+    var stats: Stats = .{};
+    var groups = try collectGroupsWithResolver(gpa, std.testing.io, &lines, &stats, false, FakeResolver{});
     defer freeGroups(gpa, &groups);
 
     try std.testing.expectEqual(@as(usize, 2), groups.count());
-    try std.testing.expectEqual(@as(usize, 2), groups.get("example.com").?.items.len);
-    try std.testing.expectEqual(@as(usize, 2), groups.get("2001:db8::1").?.items.len);
+    const merged = groups.get("192.0.2.2").?.items;
+    try std.testing.expectEqual(@as(usize, 5), merged.len);
+    try std.testing.expectEqualStrings("two.example", merged[0].proxy.host);
+    try std.testing.expectEqualStrings("one.example", merged[1].proxy.host);
+    try std.testing.expectEqualStrings("bridge.example", merged[2].proxy.host);
+    try std.testing.expectEqualStrings("after.example", merged[3].proxy.host);
+    try std.testing.expectEqualStrings("192.0.2.1", merged[4].proxy.host);
+    try std.testing.expectEqual(@as(usize, 1), groups.get("192.0.2.3").?.items.len);
+}
+
+test "collectGroups gives each distinct unresolved name its own parallel queue" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "trojan://pw@missing-a.example:443#a",
+        "trojan://pw@other.example:443#known",
+        "trojan://pw@missing-b.example:443#b",
+    };
+    var stats: Stats = .{};
+    var groups = try collectGroupsWithResolver(gpa, std.testing.io, &lines, &stats, false, FakeResolver{});
+    defer freeGroups(gpa, &groups);
+
+    try std.testing.expectEqual(@as(usize, 3), groups.count());
+    try std.testing.expectEqual(@as(usize, 1), groups.get("192.0.2.3").?.items.len);
+    try std.testing.expectEqualStrings("missing-a.example", groups.get("name:missing-a.example").?.items[0].proxy.host);
+    try std.testing.expectEqualStrings("missing-b.example", groups.get("name:missing-b.example").?.items[0].proxy.host);
+}
+
+test "collectGroups joins a name that resolves later to its unresolved queue" {
+    const Resolver = struct {
+        calls: *usize,
+
+        fn lookup(self: @This(), _: Io, _: []const u8, port: u16, addresses: []Io.net.IpAddress) ![]Io.net.IpAddress {
+            defer self.calls.* += 1;
+            if (self.calls.* == 0) return error.Timeout;
+            addresses[0] = try Io.net.IpAddress.parse("192.0.2.30", port);
+            return addresses[0..1];
+        }
+    };
+
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "trojan://pw@flaky.example:443#a",
+        "trojan://pw@flaky.example:8443#b",
+        "trojan://pw@192.0.2.30:443#literal",
+    };
+    var calls: usize = 0;
+    var stats: Stats = .{};
+    var groups = try collectGroupsWithResolver(gpa, std.testing.io, &lines, &stats, false, Resolver{ .calls = &calls });
+    defer freeGroups(gpa, &groups);
+
+    try std.testing.expectEqual(@as(usize, 1), groups.count());
+    try std.testing.expectEqual(@as(usize, 3), groups.get("name:flaky.example").?.items.len);
+}
+
+test "collectGroups puts names in their own queues once the DNS budget is spent" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "trojan://pw@late-a.example:443#a",
+        "trojan://pw@late-b.example:443#b",
+        "trojan://pw@192.0.2.40:443#literal",
+    };
+    var stats: Stats = .{};
+    // A spent budget fails before any lookup starts, so this needs no network.
+    var groups = try collectGroupsWithResolver(gpa, std.testing.io, &lines, &stats, false, SystemResolver{
+        .deadline = netutil.monoNow(std.testing.io) - 1,
+    });
+    defer freeGroups(gpa, &groups);
+
+    try std.testing.expectEqual(@as(usize, 3), groups.count());
+    try std.testing.expectEqual(@as(usize, 1), groups.get("name:late-a.example").?.items.len);
+    try std.testing.expectEqual(@as(usize, 1), groups.get("name:late-b.example").?.items.len);
+    try std.testing.expectEqual(@as(usize, 1), groups.get("192.0.2.40").?.items.len);
 }
 
 test "collectGroups owns keys for legacy SS hosts" {
@@ -1120,7 +1421,7 @@ test "collectGroups owns keys for legacy SS hosts" {
         "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3JkQDE5Mi4wLjIuMTo0NDM#legacy-b",
     };
     var stats: Stats = .{};
-    var groups = try collectGroups(gpa, &lines, &stats, false);
+    var groups = try collectGroups(gpa, std.testing.io, &lines, &stats, false, 3);
     defer freeGroups(gpa, &groups);
 
     try std.testing.expectEqual(@as(usize, 1), groups.count());

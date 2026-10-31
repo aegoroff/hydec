@@ -129,6 +129,80 @@ fn connectHostnameTimed(
     }
 }
 
+/// Resolve every address of `host` into `out`, giving up at `deadline`.
+/// `error.TooManyResolvedAddresses` when the answer does not fit in `out`.
+pub fn resolveAllUntil(
+    io: Io,
+    host: []const u8,
+    port: u16,
+    deadline: i128,
+    out: []Io.net.IpAddress,
+) ![]Io.net.IpAddress {
+    const hostname = try Io.net.HostName.init(host);
+    if (monoNow(io) >= deadline) return error.Timeout;
+
+    // Same reasons as `connectHostnameTimed`: only `concurrent` can be bounded by
+    // `deadline` and cancelled. The queue must also be drained while `lookup` runs:
+    // it blocks on a full queue whatever its documented capacity guarantee says.
+    var lookup_buffer: [32]Io.net.HostName.LookupResult = undefined;
+    var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
+    const lookup_args = .{ hostname, io, &lookup_queue, Io.net.HostName.LookupOptions{ .port = port } };
+    var lookup_future = io.concurrent(Io.net.HostName.lookup, lookup_args) catch
+        return error.SystemResources;
+    defer {
+        lookup_future.cancel(io) catch {};
+        while (lookup_queue.getOneUncancelable(io)) |_| {} else |_| {}
+    }
+
+    var count: usize = 0;
+    var truncated = false;
+    while (true) {
+        var results: [8]Io.net.HostName.LookupResult = undefined;
+        const n = lookup_queue.getUncancelable(io, &results, 0) catch |err| switch (err) {
+            error.Closed => {
+                try lookup_future.await(io);
+                if (truncated) return error.TooManyResolvedAddresses;
+                if (count == 0) return error.NoAddressReturned;
+                return out[0..count];
+            },
+        };
+
+        if (n == 0) {
+            const now = monoNow(io);
+            if (now >= deadline) return error.Timeout;
+            const nap = @min(DNS_POLL_INTERVAL_NS, @as(u64, @intCast(deadline - now)));
+            io.sleep(.fromNanoseconds(nap), .awake) catch {};
+            continue;
+        }
+
+        for (results[0..n]) |result| switch (result) {
+            .canonical_name => {},
+            .address => |address| {
+                if (count == out.len) {
+                    truncated = true;
+                } else {
+                    out[count] = address;
+                    count += 1;
+                }
+            },
+        };
+    }
+}
+
+test "resolveAllUntil gives up on a passed deadline before resolving" {
+    var out: [4]Io.net.IpAddress = undefined;
+    const io = std.testing.io;
+    try std.testing.expectError(error.Timeout, resolveAllUntil(io, "example.invalid", 443, monoNow(io) - 1, &out));
+}
+
+test "resolveAllUntil returns localhost addresses with the port" {
+    var out: [32]Io.net.IpAddress = undefined;
+    const io = std.testing.io;
+    const addresses = try resolveAllUntil(io, "localhost", 8443, deadlineNs(io, 5), &out);
+    try std.testing.expect(addresses.len > 0);
+    for (addresses) |address| try std.testing.expectEqual(@as(u16, 8443), address.getPort());
+}
+
 test "hostname dial fails fast when no unit of concurrency is available" {
     // `global_single_threaded` sets concurrent_limit = .nothing, so `io.concurrent`
     // reports ConcurrencyUnavailable. That path must not resolve inline: an inline
