@@ -179,20 +179,84 @@ pub fn buildGunHeaders(out: []u8, service_name: []const u8, authority: []const u
 /// literal `:status` name and raw value `200`. Every index is read as an RFC 7541
 /// §5.1 prefix integer, so representations whose index overflows the prefix stay in
 /// sync. Skips PADDED / PRIORITY framing.
-pub fn headersIndicateStatus200(payload: []const u8, flags: u8) bool {
+fn headerBlockFragment(payload: []const u8, flags: u8) ?[]const u8 {
     var p = payload;
     if ((flags & 0x08) != 0) { // PADDED
-        if (p.len < 1) return false;
+        if (p.len < 1) return null;
         const pad: usize = p[0];
         p = p[1..];
-        if (p.len < pad) return false;
+        if (p.len < pad) return null;
         p = p[0 .. p.len - pad];
     }
     if ((flags & 0x20) != 0) { // PRIORITY
-        if (p.len < 5) return false;
+        if (p.len < 5) return null;
         p = p[5..];
     }
+    return p;
+}
+
+pub fn headersIndicateStatus200(payload: []const u8, flags: u8) bool {
+    const p = headerBlockFragment(payload, flags) orelse return false;
     return hpackHasStatus200(p);
+}
+
+pub const CompletedHeaders = struct {
+    status_ok: bool,
+    end_stream: bool,
+};
+
+/// Reassembles one HEADERS block and its same-stream CONTINUATION frames.
+pub const HeaderBlock = struct {
+    storage: []u8,
+    len: usize = 0,
+    end_stream: bool = false,
+    pending: bool = false,
+
+    pub fn init(storage: []u8) HeaderBlock {
+        return .{ .storage = storage };
+    }
+
+    pub fn push(self: *HeaderBlock, payload: []const u8, flags: u8, continuation: bool) !?CompletedHeaders {
+        if (!continuation) {
+            if (self.pending) return error.InvalidHttp2Framing;
+            const end_stream = (flags & 0x01) != 0;
+            if ((flags & 0x04) != 0) return .{
+                .status_ok = headersIndicateStatus200(payload, flags),
+                .end_stream = end_stream,
+            };
+            const fragment = headerBlockFragment(payload, flags) orelse return error.InvalidHpack;
+            if (fragment.len > self.storage.len) return error.BufferTooSmall;
+            @memcpy(self.storage[0..fragment.len], fragment);
+            self.len = fragment.len;
+            self.end_stream = end_stream;
+            self.pending = true;
+            return null;
+        }
+
+        if (!self.pending) return error.InvalidHttp2Framing;
+        if (self.len + payload.len > self.storage.len) return error.BufferTooSmall;
+        @memcpy(self.storage[self.len..][0..payload.len], payload);
+        self.len += payload.len;
+        if ((flags & 0x04) == 0) return null;
+
+        const completed: CompletedHeaders = .{
+            .status_ok = headersIndicateStatus200(self.storage[0..self.len], 0),
+            .end_stream = self.end_stream,
+        };
+        self.pending = false;
+        self.len = 0;
+        return completed;
+    }
+};
+
+/// Strip HTTP/2 DATA padding before interpreting the payload as gRPC bytes.
+pub fn grpcDataPayload(payload: []const u8, flags: u8) error{InvalidGrpcFrame}![]const u8 {
+    if ((flags & 0x08) == 0) return payload;
+    if (payload.len < 1) return error.InvalidGrpcFrame;
+    const pad: usize = payload[0];
+    const body = payload[1..];
+    if (body.len < pad) return error.InvalidGrpcFrame;
+    return body[0 .. body.len - pad];
 }
 
 fn hpackHasStatus200(block: []const u8) bool {
@@ -529,6 +593,23 @@ test "headersIndicateStatus200 skips padding" {
     const noise = [_]u8{ 0x00, 0x88 };
     try std.testing.expect(!headersIndicateStatus200(&noise, 0));
     try std.testing.expect(headersIndicateStatus200(&[_]u8{0x88}, 0));
+}
+
+test "HeaderBlock reads status from a continuation" {
+    var storage: [64]u8 = undefined;
+    var block = HeaderBlock.init(&storage);
+    const first = [_]u8{ 0x00, 0x04, 'h', 'o', 's', 't', 0x01, 'x' };
+    try std.testing.expect((try block.push(&first, 0x01, false)) == null);
+    const completed = (try block.push(&.{0x88}, 0x04, true)).?;
+    try std.testing.expect(completed.status_ok);
+    try std.testing.expect(completed.end_stream);
+    try std.testing.expect(!block.pending);
+}
+
+test "grpcDataPayload strips padding" {
+    const padded = [_]u8{ 2, 'a', 'b', 'c', 0, 0 };
+    try std.testing.expectEqualStrings("abc", try grpcDataPayload(&padded, 0x08));
+    try std.testing.expectError(error.InvalidGrpcFrame, grpcDataPayload(padded[0..2], 0x08));
 }
 
 test "headersIndicateStatus200 accepts literal :status 200" {

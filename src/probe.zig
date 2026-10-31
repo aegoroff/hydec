@@ -684,6 +684,25 @@ fn logParseFail(gpa: std.mem.Allocator, index: usize, line: []const u8, err: any
     std.log.warn("parse fail: entry {d}{f}: {}", .{ index + 1, NameSuffix{ .name = name }, err });
 }
 
+fn dupeHostKey(gpa: std.mem.Allocator, host: []const u8) ![]u8 {
+    if (Io.net.IpAddress.parse(host, 0)) |address| {
+        var buf: [64]u8 = undefined;
+        var writer: Io.Writer = .fixed(&buf);
+        try address.format(&writer);
+        const formatted = writer.buffered();
+        // IpAddress.format includes the dummy port and, for IPv6, brackets.
+        const key = switch (address) {
+            .ip4 => formatted[0 .. formatted.len - 2],
+            .ip6 => formatted[1 .. formatted.len - 3],
+        };
+        return gpa.dupe(u8, key);
+    } else |_| {}
+
+    const key = try gpa.alloc(u8, host.len);
+    for (key, host) |*dst, c| dst.* = std.ascii.toLower(c);
+    return key;
+}
+
 /// Build host→proxies map. Same host (IP) shares one sequential queue.
 fn collectGroups(
     gpa: std.mem.Allocator,
@@ -715,8 +734,8 @@ fn collectGroups(
         };
         errdefer proxy.deinit(gpa);
 
-        // Own map keys: legacy SS hosts are freed in proxy.deinit.
-        var host_key: ?[]u8 = try gpa.dupe(u8, proxy.host);
+        // Own normalized map keys: legacy SS hosts are freed in proxy.deinit.
+        var host_key: ?[]u8 = try dupeHostKey(gpa, proxy.host);
         errdefer if (host_key) |k| gpa.free(k);
 
         const gop = try groups.getOrPut(gpa, host_key.?);
@@ -996,6 +1015,23 @@ test "collectGroups buckets by host" {
     try std.testing.expectEqual(@as(usize, 2), groups.count());
     try std.testing.expectEqual(@as(usize, 2), groups.get("192.0.2.1").?.items.len);
     try std.testing.expectEqual(@as(usize, 1), groups.get("198.51.100.1").?.items.len);
+}
+
+test "collectGroups normalizes DNS case and IP literals" {
+    const gpa = std.testing.allocator;
+    const lines = [_][]const u8{
+        "trojan://pw@EXAMPLE.COM:443#a",
+        "trojan://pw@example.com:443#b",
+        "trojan://pw@[2001:db8:0:0:0:0:0:1]:443#c",
+        "trojan://pw@[2001:db8::1]:443#d",
+    };
+    var stats: Stats = .{};
+    var groups = try collectGroups(gpa, &lines, &stats, false);
+    defer freeGroups(gpa, &groups);
+
+    try std.testing.expectEqual(@as(usize, 2), groups.count());
+    try std.testing.expectEqual(@as(usize, 2), groups.get("example.com").?.items.len);
+    try std.testing.expectEqual(@as(usize, 2), groups.get("2001:db8::1").?.items.len);
 }
 
 test "collectGroups owns keys for legacy SS hosts" {

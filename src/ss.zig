@@ -178,10 +178,14 @@ fn readOpenChunk(ctx: *AeadCtx, reader: *Io.Reader, out: []u8, scratch: []u8) !u
 /// the pipelined next one), and any leftover bytes are shifted down to offset 0 so
 /// the following call continues from them.
 fn takeResponse(http_buf: []u8, http_len: *usize, expect: util.ProbeReply) error{ ProbeResponseMismatch, VolumeRefused }!bool {
-    const total = util.httpResponseTotalLen(http_buf[0..http_len.*]) orelse return false;
-    try expect.check(http_buf[0..total]);
-    const remain = http_len.* - total;
-    if (remain > 0) std.mem.copyForwards(u8, http_buf[0..remain], http_buf[total..http_len.*]);
+    const lens = switch (util.httpResponseState(http_buf[0..http_len.*])) {
+        .incomplete, .close_delimited => return false,
+        .malformed => return error.ProbeResponseMismatch,
+        .complete => |lens| lens,
+    };
+    try expect.check(http_buf[0..lens.total]);
+    const remain = http_len.* - lens.total;
+    if (remain > 0) std.mem.copyForwards(u8, http_buf[0..remain], http_buf[lens.total..http_len.*]);
     http_len.* = remain;
     return true;
 }
@@ -199,7 +203,7 @@ fn readProbeResponse(
     while (!try takeResponse(http_buf, http_len, expect)) {
         const n = readOpenChunk(server_ctx, &sr.interface, http_buf[http_len.*..], chunk_buf) catch |err| {
             const e = netutil.classifyIoErr(err, null, sr.err, fired.load(.acquire));
-            // HTTP/1.0 close-delimited only — truncated CL/chunked must fail.
+            // Unframed responses complete at peer close; truncated CL/chunked must fail.
             if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len.*])) {
                 try expect.check(http_buf[0..http_len.*]);
                 http_len.* = 0;

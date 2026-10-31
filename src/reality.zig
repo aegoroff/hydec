@@ -901,8 +901,12 @@ fn appendStripVlessHeader(buf: []u8, len: *usize, chunk: []const u8, stripped: *
 /// Returns true once a complete response is buffered; it must match `expect`.
 fn grpcProbeHttpReady(buf: []u8, len: *usize, chunk: []const u8, stripped: *bool, expect: util.ProbeReply) !bool {
     try appendStripVlessHeader(buf, len, chunk, stripped);
-    if (util.httpResponseTotalLen(buf[0..len.*]) == null) return false;
-    try expect.check(buf[0..len.*]);
+    const lens = switch (util.httpResponseState(buf[0..len.*])) {
+        .incomplete, .close_delimited => return false,
+        .malformed => return error.ProbeResponseMismatch,
+        .complete => |lens| lens,
+    };
+    try expect.check(buf[0..lens.total]);
     return true;
 }
 
@@ -967,6 +971,8 @@ pub fn probeVless(
     // gRPC messages may span multiple HTTP/2 DATA frames — assemble before unwrap.
     var grpc_stream: [grpc_gun.MAX_GRPC_MESSAGE_LEN + 5]u8 = undefined;
     var grpc_stream_len: usize = 0;
+    var header_storage: [32768]u8 = undefined;
+    var header_block = grpc_gun.HeaderBlock.init(&header_storage);
     while (true) {
         const n = rc.readApp(app_buf[0..]) catch |err| {
             // Do not treat peer-close after warmup as success — that hides dest-fallback
@@ -986,6 +992,7 @@ pub fn probeVless(
 
             const payload = gather[off + 9 .. off + 9 + frame_len];
             const inflight = warmup_done and off < discard_data_before;
+            if (header_block.pending and ftyp != 0x09) return error.InvalidHttp2Framing;
 
             if (ftyp == 0x04 and (fflags & 0x01) == 0) {
                 // RFC 9113 6.5.3: *every* SETTINGS without ACK must be acknowledged,
@@ -1009,22 +1016,25 @@ pub fn probeVless(
                 var pong: [17]u8 = undefined;
                 const pong_len = try grpc_gun.buildPingAck(&pong, payload[0..8]);
                 try rc.writeApp(pong[0..pong_len]);
-            } else if (inflight and (ftyp == 0x00 or ftyp == 0x01)) {
-                // Warmup leftover DATA / trailers — ack framing only.
-            } else if (ftyp == 0x01 and request_sent) {
-                // Each HEADERS decides on its own: a later non-200 must not inherit the
-                // warmup's 200 and let the DATA after it through.
-                saw_headers_ok = grpc_gun.headersIndicateStatus200(payload, fflags);
-                if ((fflags & 0x01) != 0 and !saw_headers_ok) return error.GrpcStreamEnded;
-                // Empty 200 before any DATA is a failure; trailer END_STREAM after DATA is normal.
-                if ((fflags & 0x01) != 0 and saw_headers_ok and !saw_grpc_data) return error.GrpcEmptyResponse;
+            } else if (inflight and (ftyp == 0x00 or ftyp == 0x01 or ftyp == 0x09)) {
+                // Warmup leftover DATA / headers — ack framing only.
+            } else if ((ftyp == 0x01 or ftyp == 0x09) and request_sent) {
+                // Each complete header block decides on its own: a later non-200 must not
+                // inherit the warmup's 200 and let the DATA after it through.
+                if (try header_block.push(payload, fflags, ftyp == 0x09)) |headers| {
+                    saw_headers_ok = headers.status_ok;
+                    if (headers.end_stream and !saw_headers_ok) return error.GrpcStreamEnded;
+                    // Empty 200 before any DATA is a failure; trailer END_STREAM after DATA is normal.
+                    if (headers.end_stream and saw_headers_ok and !saw_grpc_data) return error.GrpcEmptyResponse;
+                }
             } else if (ftyp == 0x00 and request_sent) {
                 // The gun stream's one HEADERS must carry `:status 200` before any DATA:
                 // grpc-go (Xray) drops the stream on anything else, so the reply cannot count.
                 if (!saw_headers_ok) return error.GrpcBadStatus;
-                if (grpc_stream_len + payload.len > grpc_stream.len) return error.BufferTooSmall;
-                @memcpy(grpc_stream[grpc_stream_len..][0..payload.len], payload);
-                grpc_stream_len += payload.len;
+                const data = try grpc_gun.grpcDataPayload(payload, fflags);
+                if (grpc_stream_len + data.len > grpc_stream.len) return error.BufferTooSmall;
+                @memcpy(grpc_stream[grpc_stream_len..][0..data.len], data);
+                grpc_stream_len += data.len;
 
                 while (try grpc_gun.completeGrpcFrameLen(grpc_stream[0..grpc_stream_len])) |total| {
                     const msg = try grpc_gun.vlessFromGrpcData(grpc_stream[0..total]);
@@ -1329,11 +1339,26 @@ fn flushTlsApp(tls_client: *tls.Client, pipe: *VisionPipe, request: []const u8) 
 
 fn readProbeReply(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8, expect: util.ProbeReply) !usize {
     var http_len: usize = 0;
-    while (util.httpResponseTotalLen(http_buf[0..http_len]) == null) {
+    while (true) {
+        switch (util.httpResponseState(http_buf[0..http_len])) {
+            .complete => |lens| {
+                try expect.check(http_buf[0..lens.total]);
+                return lens.total;
+            },
+            .malformed => return error.ProbeResponseMismatch,
+            .incomplete, .close_delimited => {},
+        }
         if (http_len == http_buf.len) return error.BufferTooSmall;
         // Do not use readSliceShort on a large slice: with keep-alive it waits until
         // the whole buffer is full. Decrypt ≥1 byte, then take whatever cleartext is ready.
-        tls_client.reader.fill(1) catch |err| return unwrapPipeErr(pipe, err);
+        tls_client.reader.fill(1) catch |err| {
+            const e = unwrapPipeErr(pipe, err);
+            if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) {
+                try expect.check(http_buf[0..http_len]);
+                return http_len;
+            }
+            return e;
+        };
         const chunk = tls_client.reader.buffered();
         const n = @min(chunk.len, http_buf.len - http_len);
         if (n == 0) return error.EndOfStream;
@@ -1341,8 +1366,6 @@ fn readProbeReply(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8, ex
         tls_client.reader.toss(n);
         http_len += n;
     }
-    try expect.check(http_buf[0..http_len]);
-    return http_len;
 }
 
 /// True when `data` is one or more complete TLS 1.3 Application Data records

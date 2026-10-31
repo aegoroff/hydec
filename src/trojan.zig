@@ -114,7 +114,7 @@ fn tlsOptions(
 }
 
 /// Drain until `http_buf[0..http_len]` is a complete HTTP response, or peer close
-/// ends an HTTP/1.0 close-delimited body. Updates `http_len` in place.
+/// ends an unframed close-delimited body. Updates `http_len` in place.
 fn readHttpUntilReady(
     http_buf: []u8,
     http_len: *usize,
@@ -126,7 +126,12 @@ fn readHttpUntilReady(
     io: Io,
     fired: *const std.atomic.Value(bool),
 ) !void {
-    while (util.httpResponseTotalLen(http_buf[0..http_len.*]) == null) {
+    while (true) {
+        switch (util.httpResponseState(http_buf[0..http_len.*])) {
+            .complete => return,
+            .malformed => return error.ProbeResponseMismatch,
+            .incomplete, .close_delimited => {},
+        }
         const n = if (transport_ws)
             ws.readBinaryFrame(conn, io, frame_buf) catch |err| {
                 const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));

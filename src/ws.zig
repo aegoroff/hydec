@@ -46,10 +46,28 @@ fn headerValue(response: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn headerContainsToken(value: []const u8, token: []const u8) bool {
+fn valueContainsToken(value: []const u8, token: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, value, ", \t");
     while (it.next()) |part| {
         if (std.ascii.eqlIgnoreCase(part, token)) return true;
+    }
+    return false;
+}
+
+fn headerContainsToken(response: []const u8, name: []const u8, token: []const u8) bool {
+    var rest = response;
+    if (std.mem.find(u8, rest, "\r\n")) |nl| {
+        rest = rest[nl + 2 ..];
+    } else return false;
+
+    while (std.mem.find(u8, rest, "\r\n")) |nl| {
+        const line = rest[0..nl];
+        rest = rest[nl + 2 ..];
+        if (line.len == 0) break;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon], " \t");
+        if (std.ascii.eqlIgnoreCase(key, name) and
+            valueContainsToken(std.mem.trim(u8, line[colon + 1 ..], " \t"), token)) return true;
     }
     return false;
 }
@@ -64,8 +82,7 @@ fn validateUpgradeResponse(hdr: []const u8, key_b64: []const u8) !void {
     const upgrade = headerValue(hdr, "Upgrade") orelse return error.WebSocketUpgradeFailed;
     if (!std.ascii.eqlIgnoreCase(upgrade, "websocket")) return error.WebSocketUpgradeFailed;
 
-    const connection = headerValue(hdr, "Connection") orelse return error.WebSocketUpgradeFailed;
-    if (!headerContainsToken(connection, "Upgrade")) return error.WebSocketUpgradeFailed;
+    if (!headerContainsToken(hdr, "Connection", "Upgrade")) return error.WebSocketUpgradeFailed;
 
     const accept = headerValue(hdr, "Sec-WebSocket-Accept") orelse return error.WebSocketUpgradeFailed;
     var expect_buf: [28]u8 = undefined;
@@ -167,10 +184,13 @@ pub fn writeBinaryFrame(conn: Conn, io: Io, payload: []const u8) !void {
     try conn.flush();
 }
 
-/// Read the next complete binary data frame (FIN), answering ping and ignoring pong.
-/// Empty or text frames are rejected so Trojan-over-WS matches TCP's ≥1-byte bar.
+/// Read the next complete binary message, answering ping and ignoring pong.
+/// Empty messages are skipped so the caller still gets TCP-like ≥1-byte reads.
 pub fn readBinaryFrame(conn: Conn, io: Io, out: []u8) !usize {
     const reader = conn.reader;
+    var message_len: usize = 0;
+    var fragmented = false;
+    var control_buf: [125]u8 = undefined;
     while (true) {
         var hdr: [2]u8 = undefined;
         try reader.readSliceAll(&hdr);
@@ -200,26 +220,48 @@ pub fn readBinaryFrame(conn: Conn, io: Io, out: []u8) !usize {
         }
         var mask: [4]u8 = .{ 0, 0, 0, 0 };
         if (masked) try reader.readSliceAll(&mask);
-        if (len > out.len) {
+
+        const data_frame = opcode == 0x2 or (opcode == 0x0 and fragmented);
+        const control_frame = (opcode & 0x8) != 0;
+        const dest = if (data_frame)
+            out[message_len..]
+        else if (control_frame)
+            control_buf[0..]
+        else
+            out;
+        if (len > dest.len) {
             // Drain payload so the stream stays aligned if the caller retries.
             try reader.discardAll(len);
             return error.BufferTooSmall;
         }
-        try reader.readSliceAll(out[0..len]);
+        try reader.readSliceAll(dest[0..len]);
         if (masked) {
-            for (out[0..len], 0..) |*b, i| b.* ^= mask[i % 4];
+            for (dest[0..len], 0..) |*b, i| b.* ^= mask[i % 4];
         }
         switch (opcode) {
             0x8 => return error.WebSocketClosed,
             0x9 => {
-                try writeControlFrame(conn, io, 0xA, out[0..len]);
+                try writeControlFrame(conn, io, 0xA, dest[0..len]);
                 continue;
             },
             0xA => continue,
             0x2 => {
-                if (!fin) return error.WsFragmentUnsupported;
-                if (len == 0) return error.EmptyWsFrame;
-                return len;
+                if (fragmented) return error.UnexpectedWsOpcode;
+                if (fin) {
+                    if (len == 0) continue;
+                    return len;
+                }
+                fragmented = true;
+                message_len = len;
+            },
+            0x0 => {
+                if (!fragmented) return error.UnexpectedWsOpcode;
+                message_len += len;
+                if (fin) {
+                    fragmented = false;
+                    if (message_len == 0) continue;
+                    return message_len;
+                }
             },
             0x1 => return error.UnexpectedWsOpcode,
             else => return error.UnexpectedWsOpcode,
@@ -244,6 +286,15 @@ test "validateUpgradeResponse requires accept" {
         "\r\n";
     try validateUpgradeResponse(hdr, key);
 
+    const repeated_connection =
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: keep-alive\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "\r\n";
+    try validateUpgradeResponse(repeated_connection, key);
+
     const bad =
         "HTTP/1.1 101 Switching Protocols\r\n" ++
         "Upgrade: websocket\r\n" ++
@@ -265,6 +316,39 @@ test "consumeUpgradeResponse keeps post-header bytes" {
     var reader: Io.Reader = .fixed(wire);
     try consumeUpgradeResponse(&reader, key);
     try std.testing.expectEqualStrings("LEFTOVER", reader.buffered());
+}
+
+test "readBinaryFrame assembles fragments around a ping" {
+    const wire = [_]u8{
+        0x02, 0x02, 'a', 'b', // binary, FIN=0
+        0x89, 0x01, 'x', // ping
+        0x80, 0x02, 'c', 'd', // continuation, FIN=1
+        0x82, 0x01, 'Z',
+    };
+    var reader: Io.Reader = .fixed(&wire);
+    var out_buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&out_buf);
+    const conn: Conn = .{ .reader = &reader, .tls = &writer, .socket = &writer };
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var out: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), try readBinaryFrame(conn, io, &out));
+    try std.testing.expectEqualStrings("abcd", out[0..4]);
+    try std.testing.expectEqual(@as(usize, 1), try readBinaryFrame(conn, io, &out));
+    try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
+}
+
+test "readBinaryFrame skips empty binary messages" {
+    const wire = [_]u8{ 0x82, 0x00, 0x82, 0x01, 'Z' };
+    var reader: Io.Reader = .fixed(&wire);
+    var out_buf: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&out_buf);
+    const conn: Conn = .{ .reader = &reader, .tls = &writer, .socket = &writer };
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var out: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try readBinaryFrame(conn, io, &out));
+    try std.testing.expectEqual(@as(u8, 'Z'), out[0]);
 }
 
 test "readBinaryFrame BufferTooSmall drains payload" {

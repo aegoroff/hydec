@@ -162,6 +162,18 @@ pub const VOLUME_BYTES: usize = 40000;
 /// Room for one probe response, including the `VOLUME_BYTES` download and its headers.
 pub const PROBE_HTTP_BUF_LEN: usize = 48 * 1024;
 
+/// Sizes of one complete response: `total` on the wire, `body` the payload alone
+/// (chunk sizes summed, without chunked framing or trailers).
+pub const HttpLens = struct { total: usize, body: usize };
+
+pub const HttpResponseState = union(enum) {
+    incomplete,
+    malformed,
+    complete: HttpLens,
+    /// Offset of the body; the response becomes complete only when the peer closes.
+    close_delimited: usize,
+};
+
 /// What a reply must look like to count.
 pub const ProbeReply = union(enum) {
     /// Cloudflare `/cdn-cgi/trace` echoing this UA (see `looksLikeCloudflareTraceUag`).
@@ -249,60 +261,54 @@ pub const VOLUME_TARGET: Target = .{
 
 /// Response whose body is exactly `bytes` long (status checked by the caller).
 fn downloadComplete(resp: []const u8, bytes: usize) bool {
-    const lens = httpResponseLens(resp) orelse return false;
-    return lens.body == bytes;
+    return switch (httpResponseState(resp)) {
+        .complete => |lens| lens.body == bytes,
+        .close_delimited => |body_start| resp.len - body_start == bytes,
+        else => false,
+    };
 }
 
-/// True when headers are complete and the body is HTTP/1.0 close-delimited
-/// (no `Content-Length` / `Transfer-Encoding: chunked`). Peer close then ends the response.
+/// True when headers are complete and an unframed body can end at peer close.
 /// Truncated CL/chunked bodies must not be treated as ready on peer close alone.
 pub fn httpCloseDelimitedReady(buf: []const u8) bool {
-    const sep = std.mem.find(u8, buf, "\r\n\r\n") orelse return false;
-    const headers = buf[0..sep];
-    var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    const status = lines.next() orelse return false;
-    if (!std.mem.startsWith(u8, status, "HTTP/1.0")) return false;
-    while (lines.next()) |line| {
-        if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
-            const v = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
-            if (std.ascii.findIgnoreCase(v, "chunked") != null) return false;
-        } else if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
-            return false;
-        }
-    }
-    return true;
+    return switch (httpResponseState(buf)) {
+        .close_delimited => true,
+        else => false,
+    };
 }
 
 /// If `buf` holds a complete HTTP/1.x response, return its total size; otherwise `null`.
-/// Supports `Content-Length`, `Transfer-Encoding: chunked`, and HTTP/1.1 empty body
-/// when neither is present (RFC 7230 §3.3.3). HTTP/1.0 without framing stays
-/// incomplete until the peer closes (see warmup loops + `httpCloseDelimitedReady`).
 pub fn httpResponseTotalLen(buf: []const u8) ?usize {
-    const lens = httpResponseLens(buf) orelse return null;
-    return lens.total;
+    return switch (httpResponseState(buf)) {
+        .complete => |lens| lens.total,
+        else => null,
+    };
 }
 
-/// Sizes of one complete response: `total` on the wire, `body` the payload alone
-/// (chunk sizes summed, without chunked framing or trailers).
-const HttpLens = struct { total: usize, body: usize };
-
-fn httpResponseLens(buf: []const u8) ?HttpLens {
-    const sep = std.mem.find(u8, buf, "\r\n\r\n") orelse return null;
+/// Classify the HTTP/1.x response at the front of `buf`.
+pub fn httpResponseState(buf: []const u8) HttpResponseState {
+    const sep = std.mem.find(u8, buf, "\r\n\r\n") orelse return .incomplete;
     const headers = buf[0..sep];
     const body_start = sep + 4;
 
     var chunked = false;
     var content_len: ?usize = null;
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
-    const status = lines.next() orelse return null;
+    _ = lines.next() orelse return .malformed;
+    const status_code = ProbeReply.parseHttpStatus(buf) orelse return .malformed;
     while (lines.next()) |line| {
         if (std.ascii.startsWithIgnoreCase(line, "transfer-encoding:")) {
             const v = std.mem.trim(u8, line["transfer-encoding:".len..], " \t");
             if (std.ascii.findIgnoreCase(v, "chunked") != null) chunked = true;
         } else if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
             const v = std.mem.trim(u8, line["content-length:".len..], " \t");
-            content_len = std.fmt.parseInt(usize, v, 10) catch return null;
+            content_len = std.fmt.parseInt(usize, v, 10) catch return .malformed;
         }
+    }
+
+    // RFC 7230 §3.3.3: these statuses have no body regardless of framing.
+    if ((status_code >= 100 and status_code < 200) or status_code == 204 or status_code == 304) {
+        return .{ .complete = .{ .total = body_start, .body = 0 } };
     }
 
     if (chunked) return httpChunkedBodyEnd(buf, body_start);
@@ -310,39 +316,35 @@ fn httpResponseLens(buf: []const u8) ?HttpLens {
     if (content_len) |cl| {
         // `cl` comes straight off the wire, so compare it against the bytes left
         // rather than adding: `body_start + cl` overflows on a hostile length.
-        if (cl > buf.len - body_start) return null;
-        return .{ .total = body_start + cl, .body = cl };
+        if (cl > buf.len - body_start) return .incomplete;
+        return .{ .complete = .{ .total = body_start + cl, .body = cl } };
     }
 
-    // No Content-Length / chunked: HTTP/1.1+ means empty body. HTTP/1.0 is
-    // close-delimited — caller must accept via peer close after headers.
-    if (std.mem.startsWith(u8, status, "HTTP/1.0")) return null;
-    return .{ .total = body_start, .body = 0 };
+    return .{ .close_delimited = body_start };
 }
 
-/// Parse chunked body starting at `body_start`; return the offset past the final chunk
-/// and the summed chunk sizes, or null.
-fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?HttpLens {
+/// Parse chunked body starting at `body_start`.
+fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) HttpResponseState {
     var pos = body_start;
     var data: usize = 0;
     while (true) {
-        const line_end = std.mem.findPos(u8, buf, pos, "\r\n") orelse return null;
+        const line_end = std.mem.findPos(u8, buf, pos, "\r\n") orelse return .incomplete;
         const size_line = buf[pos..line_end];
         const size_tok = if (std.mem.findScalar(u8, size_line, ';')) |sc|
             size_line[0..sc]
         else
             size_line;
-        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_tok, " \t"), 16) catch return null;
+        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_tok, " \t"), 16) catch return .malformed;
         pos = line_end + 2;
         if (size == 0) {
             // No trailers: the terminating CRLF follows the last-chunk line directly.
             // Check this before scanning for trailers, otherwise a pipelined next
             // response's own "\r\n\r\n" is mistaken for the trailer terminator and the
             // reported length runs past the end of this response.
-            if (pos + 2 <= buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') return .{ .total = pos + 2, .body = data };
+            if (pos + 2 <= buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') return .{ .complete = .{ .total = pos + 2, .body = data } };
             // Optional trailers, then terminating CRLF.
-            if (std.mem.findPos(u8, buf, pos, "\r\n\r\n")) |end| return .{ .total = end + 4, .body = data };
-            return null;
+            if (std.mem.findPos(u8, buf, pos, "\r\n\r\n")) |end| return .{ .complete = .{ .total = end + 4, .body = data } };
+            return .incomplete;
         }
         // Same reason as `Content-Length` above: `size` is peer-controlled, so the
         // chunk (plus its trailing CRLF) is measured against the remaining bytes
@@ -350,8 +352,8 @@ fn httpChunkedBodyEnd(buf: []const u8, body_start: usize) ?HttpLens {
         // "\r\n" found inside `buf` — so `avail` never underflows, and passing the
         // check bounds `pos + size + 2` by `buf.len`.
         const avail = buf.len - pos;
-        if (avail < 2 or size > avail - 2) return null;
-        if (!std.mem.eql(u8, buf[pos + size ..][0..2], "\r\n")) return null;
+        if (avail < 2 or size > avail - 2) return .incomplete;
+        if (!std.mem.eql(u8, buf[pos + size ..][0..2], "\r\n")) return .malformed;
         pos += size + 2; // chunk data + CRLF
         data += size;
     }
@@ -367,7 +369,7 @@ pub fn looksLikeCloudflareTraceUag(buf: []const u8, uag: []const u8) bool {
     return std.mem.find(u8, buf, needle) != null;
 }
 
-/// True when the peer closed the tunnel (warmup may complete via close-delimited HTTP/1.0).
+/// True when the peer closed the tunnel (an unframed response may complete at close).
 pub fn isPeerClosed(err: anyerror) bool {
     return switch (err) {
         error.EndOfStream,
@@ -378,6 +380,7 @@ pub fn isPeerClosed(err: anyerror) bool {
         error.SocketUnconnected,
         error.NotOpenForReading,
         error.NotOpenForWriting,
+        error.WebSocketClosed,
         => true,
         else => false,
     };
@@ -399,6 +402,11 @@ test "writeSocksAddrDomain rejects domain longer than 255" {
     try std.testing.expectError(error.DomainTooLong, writeSocksAddrDomain(&buf, &long, 80));
 }
 
+test "isPeerClosed includes WebSocket Close" {
+    try std.testing.expect(isPeerClosed(error.WebSocketClosed));
+    try std.testing.expect(!isPeerClosed(error.Timeout));
+}
+
 test "looksLikeCloudflareTraceUag matches echoed UA" {
     const body = "fl=1\nvisit_scheme=http\nuag=hydec-steady\n";
     try std.testing.expect(looksLikeCloudflareTraceUag(body, PROBE_UA_STEADY));
@@ -416,6 +424,13 @@ test "ProbeReply.download needs a 200 with the exact body length" {
     // Body still arriving: not a match yet.
     try std.testing.expectError(error.ProbeResponseMismatch, reply.check("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nab"));
     try std.testing.expectError(error.ProbeResponseMismatch, reply.check("garbage"));
+}
+
+test "ProbeReply.download counts close-delimited bodies" {
+    const reply: ProbeReply = .{ .download = 3 };
+    try reply.check("HTTP/1.0 200 OK\r\nConnection: close\r\n\r\nabc");
+    try reply.check("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabc");
+    try std.testing.expectError(error.ProbeResponseMismatch, reply.check("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcd"));
 }
 
 test "ProbeReply.download counts chunked payload without framing" {
@@ -518,20 +533,21 @@ test "httpResponseTotalLen needs Content-Length body" {
     try std.testing.expectEqual(@as(usize, full.len), httpResponseTotalLen(full).?);
 }
 
-test "httpResponseTotalLen HTTP/1.1 empty body without framing" {
-    const empty = "HTTP/1.1 200 OK\r\n\r\n";
+test "httpResponseTotalLen accepts bodyless statuses without framing" {
+    const empty = "HTTP/1.1 204 No Content\r\n\r\n";
     try std.testing.expectEqual(@as(usize, empty.len), httpResponseTotalLen(empty).?);
-    // HTTP/1.0 without CL/chunked stays open until peer close.
+    const not_modified = "HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n\r\n";
+    try std.testing.expectEqual(@as(usize, not_modified.len), httpResponseTotalLen(not_modified).?);
+    // Ordinary responses without CL/chunked stay open until peer close.
     try std.testing.expect(httpResponseTotalLen("HTTP/1.0 200 OK\r\n\r\n") == null);
+    try std.testing.expect(httpResponseTotalLen("HTTP/1.1 200 OK\r\n\r\n") == null);
 }
 
-test "httpCloseDelimitedReady only HTTP/1.0 without framing" {
+test "httpCloseDelimitedReady accepts unframed HTTP/1.x responses" {
     try std.testing.expect(httpCloseDelimitedReady("HTTP/1.0 200 OK\r\n\r\nbody"));
-    try std.testing.expect(httpCloseDelimitedReady("HTTP/1.0 200 OK\r\nServer: x\r\n\r\n"));
+    try std.testing.expect(httpCloseDelimitedReady("HTTP/1.1 200 OK\r\nServer: x\r\n\r\n"));
     // Incomplete headers.
     try std.testing.expect(!httpCloseDelimitedReady("HTTP/1.0 200 OK\r\n"));
-    // HTTP/1.1 empty body is length-complete via httpResponseTotalLen, not close-delimited.
-    try std.testing.expect(!httpCloseDelimitedReady("HTTP/1.1 200 OK\r\n\r\n"));
     // Framed bodies must not treat peer-close as completion while still short.
     try std.testing.expect(!httpCloseDelimitedReady("HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nab"));
     try std.testing.expect(!httpCloseDelimitedReady(
@@ -556,6 +572,17 @@ test "httpResponseTotalLen chunked stops at its own terminator" {
     try std.testing.expectEqual(@as(usize, trailered.len), httpResponseTotalLen(trailered ++ second).?);
     // Half-written terminator is still incomplete.
     try std.testing.expect(httpResponseTotalLen("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n") == null);
+}
+
+test "httpResponseState distinguishes malformed framing from incomplete data" {
+    const bad_length = "HTTP/1.1 200 OK\r\nContent-Length: nonsense\r\n\r\n";
+    try std.testing.expect(std.meta.activeTag(httpResponseState(bad_length)) == .malformed);
+    const bad_chunk = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nnope\r\n";
+    try std.testing.expect(std.meta.activeTag(httpResponseState(bad_chunk)) == .malformed);
+    const bad_chunk_end = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcde\r\n";
+    try std.testing.expect(std.meta.activeTag(httpResponseState(bad_chunk_end)) == .malformed);
+    const partial = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nab";
+    try std.testing.expect(std.meta.activeTag(httpResponseState(partial)) == .incomplete);
 }
 
 test "httpResponseTotalLen survives peer-controlled lengths that would overflow" {
