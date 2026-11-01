@@ -184,7 +184,7 @@ pub const ProbeReply = union(enum) {
     /// `resp` is one complete final response, optionally preceded by informational
     /// responses (`httpResponseTotalLen`, or close-delimited).
     /// `VolumeRefused`: the download got a well-formed non-200 (Cloudflare rate limit
-    /// or block). The warmup trace already crossed the tunnel, so that is not the node.
+    /// or block). The caller may ignore it only after a successful warmup trace.
     pub fn check(self: ProbeReply, resp: []const u8) error{ ProbeResponseMismatch, VolumeRefused }!void {
         const final = finalHttpResponse(resp) orelse return error.ProbeResponseMismatch;
         const status = parseHttpStatus(final) orelse return error.ProbeResponseMismatch;

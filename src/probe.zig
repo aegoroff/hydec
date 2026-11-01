@@ -70,6 +70,8 @@ const WorkItem = struct {
     proxy: proxy_uri.Proxy,
     /// Owned addresses from grouping; empty means the probe must resolve again.
     addresses: []Io.net.IpAddress,
+    /// A spent shared DNS budget must not turn into a timeout per probe.
+    resolution_error: ?anyerror = null,
 };
 
 /// Cap concurrent host workers so a large subscription cannot exhaust OS threads.
@@ -288,9 +290,12 @@ pub fn probeLatency(
     timeout_secs: u32,
     bind: ?[]const u8,
     addresses: ?[]const Io.net.IpAddress,
+    resolution_error: ?anyerror,
     check_volume: bool,
     stage: *util.Stage,
 ) !Latency {
+    if (resolution_error) |err| return err;
+
     const Prober = struct {
         gpa: std.mem.Allocator,
         io: Io,
@@ -310,12 +315,19 @@ pub fn probeLatency(
     latency.retries = retries;
     if (check_volume) {
         _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, addresses, stage) catch |err| switch (err) {
-            // Cloudflare said no; the node carried the warmup, so do not fail it.
-            error.VolumeRefused => std.log.warn("volume check skipped for {s}:{d}: download refused", .{ proxy.host, proxy.port }),
+            error.VolumeRefused => {
+                if (!volumeRefusalIgnored(proxy)) return err;
+                std.log.warn("volume check skipped for {s}:{d}: download refused", .{ proxy.host, proxy.port });
+            },
             else => return volumeError(err, stage.*),
         };
     }
     return latency;
+}
+
+fn volumeRefusalIgnored(proxy: proxy_uri.Proxy) bool {
+    // VLESS TCP has no warmup request, so a refusal proves nothing about the download.
+    return proxy.kind != .vless or proxy.transport != .tcp;
 }
 
 /// The volume download runs once and is never retried: a DPI freeze past the first
@@ -653,7 +665,7 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
 
         // Three probes (one transient retry); ranking uses their median.
         var stage: util.Stage = .setup;
-        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, item.addresses, shared.check_volume, &stage) catch |err| {
+        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, item.addresses, item.resolution_error, shared.check_volume, &stage) catch |err| {
             if (shared.verbose) {
                 std.log.warn("FAIL: {f}: {f} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, FailReason{ .err = err, .stage = stage }, err });
             }
@@ -751,20 +763,29 @@ const SystemResolver = struct {
     }
 };
 
+const AddressResolution = struct {
+    addresses: []const Io.net.IpAddress,
+    resolution_error: ?anyerror = null,
+};
+
 fn resolveAddresses(
     io: Io,
     host: []const u8,
     port: u16,
     storage: *[MAX_RESOLVED_ADDRESSES]Io.net.IpAddress,
     resolver: anytype,
-) []const Io.net.IpAddress {
+) AddressResolution {
     if (Io.net.IpAddress.parse(host, port)) |address| {
         storage[0] = address;
-        return storage[0..1];
+        return .{ .addresses = storage[0..1] };
     } else |_| {}
 
-    // An empty result is retried in the probe, which reports DNS failures per entry.
-    return resolver.lookup(io, host, port, storage) catch storage[0..0];
+    const addresses = resolver.lookup(io, host, port, storage) catch |err| return .{
+        .addresses = storage[0..0],
+        // Other failures retain the old per-entry retry behavior.
+        .resolution_error = if (err == error.Timeout) err else null,
+    };
+    return .{ .addresses = addresses };
 }
 
 fn freeEndpointOwners(gpa: std.mem.Allocator, owners: *EndpointOwners) void {
@@ -876,7 +897,8 @@ fn collectGroupsWithResolver(
         errdefer proxy.deinit(gpa);
 
         var address_storage: [MAX_RESOLVED_ADDRESSES]Io.net.IpAddress = undefined;
-        const addresses = resolveAddresses(io, proxy.host, proxy.port, &address_storage, resolver);
+        const resolution = resolveAddresses(io, proxy.host, proxy.port, &address_storage, resolver);
+        const addresses = resolution.addresses;
         const owned_addresses = try gpa.dupe(Io.net.IpAddress, addresses);
         errdefer gpa.free(owned_addresses);
 
@@ -924,6 +946,7 @@ fn collectGroupsWithResolver(
             .raw = line,
             .proxy = proxy,
             .addresses = owned_addresses,
+            .resolution_error = resolution.resolution_error,
         });
     }
 
@@ -1455,7 +1478,9 @@ test "collectGroups shares one queue once the DNS budget is spent" {
     defer freeGroups(gpa, &groups);
 
     try std.testing.expectEqual(@as(usize, 2), groups.count());
-    try std.testing.expectEqual(@as(usize, 2), groups.get("unresolved").?.items.len);
+    const unresolved = groups.get("unresolved").?.items;
+    try std.testing.expectEqual(@as(usize, 2), unresolved.len);
+    for (unresolved) |item| try std.testing.expectEqual(@as(?anyerror, error.Timeout), item.resolution_error);
     try std.testing.expectEqual(@as(usize, 1), groups.get("192.0.2.40").?.items.len);
 }
 
@@ -1648,6 +1673,50 @@ test "volumeError names only post-connect stalls and keeps lookup timeouts" {
     try std.testing.expectEqual(error.ProbeResponseMismatch, volumeError(error.ProbeResponseMismatch, .reply));
     try std.testing.expectEqualStrings("volume/stalled", failHint(error.VolumeStalled));
     try std.testing.expectEqualStrings("slow/timeout", failHint(volumeError(error.Timeout, .connect)));
+}
+
+test "volume refusal is ignored only after a warmup" {
+    const vless_tcp: proxy_uri.Proxy = .{
+        .kind = .vless,
+        .raw = "",
+        .host = "",
+        .port = 443,
+        .userinfo = "",
+        .query = "",
+        .transport = .tcp,
+    };
+    try std.testing.expect(!volumeRefusalIgnored(vless_tcp));
+
+    var vless_grpc = vless_tcp;
+    vless_grpc.transport = .grpc;
+    try std.testing.expect(volumeRefusalIgnored(vless_grpc));
+
+    var trojan_proxy = vless_tcp;
+    trojan_proxy.kind = .trojan;
+    try std.testing.expect(volumeRefusalIgnored(trojan_proxy));
+}
+
+test "probeLatency returns a grouping DNS timeout before probing" {
+    const proxy: proxy_uri.Proxy = .{
+        .kind = .unsupported,
+        .raw = "",
+        .host = "would-resolve.example",
+        .port = 443,
+        .userinfo = "",
+        .query = "",
+    };
+    var stage: util.Stage = .setup;
+    try std.testing.expectError(error.Timeout, probeLatency(
+        std.testing.allocator,
+        std.testing.io,
+        proxy,
+        5,
+        null,
+        null,
+        error.Timeout,
+        true,
+        &stage,
+    ));
 }
 
 test "failHint names the ALPN and plugin failures" {
