@@ -151,7 +151,7 @@ fn runPing(gpa: std.mem.Allocator, io: Io, opts: cli.Options) !void {
     }
 
     var stage: util.Stage = .setup;
-    const latency = probe.probeLatency(gpa, io, proxy, opts.timeout_secs, opts.interface, opts.check_volume, &stage) catch |err| {
+    const latency = probe.probeLatency(gpa, io, proxy, opts.timeout_secs, opts.interface, null, opts.check_volume, &stage) catch |err| {
         std.log.warn("FAIL: {f}: {f} ({})", .{ probe.HostIdent{ .name = proxy.name, .host = proxy.host }, probe.FailReason{ .err = err, .stage = stage }, err });
         std.process.exit(1);
     };

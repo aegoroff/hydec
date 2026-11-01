@@ -735,6 +735,7 @@ fn connect(
     sid_hex: []const u8,
     timeout_secs: u32,
     bind: ?[]const u8,
+    addresses: ?[]const Io.net.IpAddress,
     stage: *util.Stage,
 ) !void {
     var server_pub: [32]u8 = undefined;
@@ -769,7 +770,7 @@ fn connect(
     const read_deadline_ns = dial_start + @as(i128, timeout_secs) * std.time.ns_per_s;
     stage.* = .connect;
     rc.* = .{
-        .stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind),
+        .stream = try netutil.connectHostPortWithAddresses(io, host, port, timeout_secs, bind, addresses),
         .io = io,
         .open = true,
         .read_deadline_ns = read_deadline_ns,
@@ -978,6 +979,7 @@ pub fn probeVless(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
+    addresses: ?[]const Io.net.IpAddress,
     stage: *util.Stage,
 ) !u64 {
     const sni_use = if (sni.len > 0) sni else host;
@@ -985,7 +987,7 @@ pub fn probeVless(
     // Full attempt: dial, REALITY handshake and the tunneled requests.
     const start = netutil.monoNow(io);
     var rc: RealityConn = undefined;
-    try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind, stage);
+    try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind, addresses, stage);
     defer rc.deinit();
     stage.* = .tunnel;
 
@@ -2387,7 +2389,7 @@ test "connect completes a full REALITY handshake" {
     {
         defer thread.join();
         var stage: util.Stage = .setup;
-        try connect(&rc, io, "127.0.0.1", server.socket.address.getPort(), "example.com", pbk, "", 2, null, &stage);
+        try connect(&rc, io, "127.0.0.1", server.socket.address.getPort(), "example.com", pbk, "", 2, null, null, &stage);
         connected = true;
         try std.testing.expect(rc.conn.app_phase);
         try std.testing.expectEqual(util.Stage.handshake, stage);

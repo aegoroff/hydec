@@ -16,6 +16,22 @@ pub fn connectHostPort(
     timeout_secs: u32,
     bind: ?[]const u8,
 ) !Io.net.Stream {
+    return connectHostPortWithAddresses(io, host, port, timeout_secs, bind, null);
+}
+
+/// Dial previously resolved addresses when available; an empty list means resolve again.
+pub fn connectHostPortWithAddresses(
+    io: Io,
+    host: []const u8,
+    port: u16,
+    timeout_secs: u32,
+    bind: ?[]const u8,
+    addresses: ?[]const Io.net.IpAddress,
+) !Io.net.Stream {
+    if (addresses) |resolved| {
+        if (resolved.len > 0) return connectAddressesUntil(io, resolved, deadlineNs(io, timeout_secs), bind);
+    }
+
     // Zig's Threaded Io panics on ConnectOptions.timeout ("TODO"), so IP dials
     // use a non-blocking connect + poll. Hostnames resolve via DNS then use the
     // same timed IP dial against a shared absolute deadline.
@@ -26,6 +42,83 @@ pub fn connectHostPort(
     } else |_| {}
 
     return connectHostnameTimed(io, host, port, timeout_secs, bind);
+}
+
+const ADDRESS_START_DELAY_NS: i128 = 250 * std.time.ns_per_ms;
+const MAX_RACED_ADDRESSES = 32;
+
+fn connectAddressesUntil(
+    io: Io,
+    addresses: []const Io.net.IpAddress,
+    deadline: i128,
+    bind: ?[]const u8,
+) !Io.net.Stream {
+    if (addresses.len > MAX_RACED_ADDRESSES) return error.TooManyResolvedAddresses;
+    const stream = if (builtin.target.os.tag == .windows) blk: {
+        var race: WindowsAddressRace = .{ .io = io };
+        break :blk try raceAddresses(&race, addresses, deadline);
+    } else blk: {
+        var race: PosixAddressRace = .{ .io = io, .bind = bind };
+        break :blk try raceAddresses(&race, addresses, deadline);
+    };
+    setTcpNoDelay(stream);
+    return stream;
+}
+
+/// Start another address every 250 ms without cancelling attempts already in flight.
+fn raceAddresses(race: anytype, addresses: []const Io.net.IpAddress, deadline: i128) !Io.net.Stream {
+    var active: [MAX_RACED_ADDRESSES]bool = @splat(false);
+    var active_count: usize = 0;
+    var started: usize = 0;
+    var next_start = race.now();
+    var last_err: anyerror = error.UnknownHostName;
+    defer for (active, 0..) |is_active, i| {
+        if (is_active) race.cancel(i);
+    };
+
+    while (true) {
+        const now = race.now();
+        if (now >= deadline) {
+            if (active_count > 0) return error.ConnectTimeout;
+            if (started < addresses.len) return error.Timeout;
+            return last_err;
+        }
+
+        if (started < addresses.len and (active_count == 0 or now >= next_start)) {
+            const index = started;
+            started += 1;
+            if (race.start(index, addresses[index])) |immediate| {
+                if (immediate) |stream| return stream;
+                active[index] = true;
+                active_count += 1;
+                next_start = @min(deadline, race.now() + ADDRESS_START_DELAY_NS);
+            } else |err| {
+                last_err = err;
+                next_start = race.now();
+            }
+            continue;
+        }
+
+        if (active_count == 0) {
+            if (started == addresses.len) return last_err;
+            continue;
+        }
+        const wait_until = if (started < addresses.len) next_start else deadline;
+        const wait_now = race.now();
+        if (wait_now >= wait_until) continue;
+        const timeout_ms: i32 = @intCast(@min(@divTrunc(wait_until - wait_now, std.time.ns_per_ms), std.math.maxInt(i32)));
+        if (try race.wait(active[0..started], timeout_ms)) |index| {
+            active[index] = false;
+            active_count -= 1;
+            if (race.finish(index)) |stream| {
+                return stream;
+            } else |err| {
+                race.cancel(index);
+                last_err = err;
+                next_start = race.now();
+            }
+        }
+    }
 }
 
 /// How long the resolver poll loop naps between non-blocking queue reads.
@@ -99,26 +192,28 @@ fn connectHostnameTimed(
 
         if (n == 0) {
             const now = monoNow(io);
-            if (now >= deadline) return error.Timeout;
+            if (now >= deadline) return if (saw_address) last_err else error.Timeout;
             const nap = @min(DNS_POLL_INTERVAL_NS, @as(u64, @intCast(deadline - now)));
             io.sleep(.fromNanoseconds(nap), .awake) catch {};
             continue;
         }
 
+        var addresses: [8]Io.net.IpAddress = undefined;
+        var address_count: usize = 0;
         for (results[0..n]) |dns_result| switch (dns_result) {
             .canonical_name => {},
             .address => |address| {
-                saw_address = true;
-                if (monoNow(io) >= deadline) return error.Timeout;
-                if (connectIpUntil(io, address, deadline, bind)) |stream| {
-                    setTcpNoDelay(stream);
-                    return stream;
-                } else |err| {
-                    last_err = err;
-                    if (err == error.ConnectTimeout) return error.ConnectTimeout;
-                }
+                addresses[address_count] = address;
+                address_count += 1;
             },
         };
+        if (address_count == 0) continue;
+        saw_address = true;
+        if (connectAddressesUntil(io, addresses[0..address_count], deadline, bind)) |stream| {
+            return stream;
+        } else |err| {
+            last_err = err;
+        }
     }
 }
 
@@ -194,6 +289,102 @@ test "resolveAllUntil returns localhost addresses with the port" {
     const addresses = try resolveAllUntil(io, "localhost", 8443, deadlineNs(io, 5), &out);
     try std.testing.expect(addresses.len > 0);
     for (addresses) |address| try std.testing.expectEqual(@as(u16, 8443), address.getPort());
+}
+
+test "address race keeps the first connect alive after starting the next" {
+    const FakeRace = struct {
+        now_ns: i128 = 0,
+        started: usize = 0,
+        cancelled: [MAX_RACED_ADDRESSES]bool = @splat(false),
+
+        fn now(self: *@This()) i128 {
+            return self.now_ns;
+        }
+
+        fn start(self: *@This(), _: usize, _: Io.net.IpAddress) !?Io.net.Stream {
+            self.started += 1;
+            return null;
+        }
+
+        fn wait(self: *@This(), active: []const bool, timeout_ms: i32) !?usize {
+            const first_done = 350 * std.time.ns_per_ms;
+            const wait_ns = @as(i128, timeout_ms) * std.time.ns_per_ms;
+            if (active[0] and self.now_ns < first_done) {
+                self.now_ns += @min(wait_ns, first_done - self.now_ns);
+                return if (self.now_ns == first_done) 0 else null;
+            }
+            self.now_ns += wait_ns;
+            return null;
+        }
+
+        fn finish(_: *@This(), index: usize) !Io.net.Stream {
+            try std.testing.expectEqual(@as(usize, 0), index);
+            return undefined;
+        }
+
+        fn cancel(self: *@This(), index: usize) void {
+            self.cancelled[index] = true;
+        }
+    };
+
+    var race: FakeRace = .{};
+    const addresses = [_]Io.net.IpAddress{
+        .{ .ip4 = .loopback(1) },
+        .{ .ip4 = .loopback(2) },
+    };
+    _ = try raceAddresses(&race, &addresses, 5 * std.time.ns_per_s);
+
+    try std.testing.expectEqual(@as(usize, 2), race.started);
+    try std.testing.expectEqual(@as(i128, 350 * std.time.ns_per_ms), race.now_ns);
+    try std.testing.expect(!race.cancelled[0]);
+    try std.testing.expect(race.cancelled[1]);
+}
+
+test "address race returns the last refusal when no attempts remain" {
+    const FakeRace = struct {
+        now_ns: i128 = 0,
+        started: usize = 0,
+
+        fn now(self: *@This()) i128 {
+            return self.now_ns;
+        }
+
+        fn start(self: *@This(), _: usize, _: Io.net.IpAddress) !?Io.net.Stream {
+            self.started += 1;
+            return error.ConnectionRefused;
+        }
+
+        fn wait(self: *@This(), _: []const bool, timeout_ms: i32) !?usize {
+            self.now_ns += @as(i128, timeout_ms) * std.time.ns_per_ms;
+            return null;
+        }
+
+        fn finish(_: *@This(), _: usize) !Io.net.Stream {
+            unreachable;
+        }
+
+        fn cancel(_: *@This(), _: usize) void {}
+    };
+
+    var race: FakeRace = .{};
+    const addresses = [_]Io.net.IpAddress{
+        .{ .ip4 = .loopback(1) },
+        .{ .ip4 = .loopback(2) },
+    };
+    try std.testing.expectError(error.ConnectionRefused, raceAddresses(&race, &addresses, 5 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(usize, 2), race.started);
+    try std.testing.expectEqual(@as(i128, 0), race.now_ns);
+}
+
+test "hostname dial uses supplied addresses without resolving again" {
+    const io = std.testing.io;
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const addresses = [_]Io.net.IpAddress{.{ .ip4 = .loopback(server.socket.address.getPort()) }};
+
+    const stream = try connectHostPortWithAddresses(io, "not a hostname", 1, 2, null, &addresses);
+    stream.close(io);
 }
 
 test "hostname dial fails fast when no unit of concurrency is available" {
@@ -365,6 +556,106 @@ fn checkWindowsConnectStatus(status: std.os.windows.NTSTATUS) !void {
         else => return std.os.windows.unexpectedStatus(status),
     }
 }
+
+const WindowsConnectStorage = extern struct {
+    Reserved0: [3]usize = @splat(0),
+    Address: Io.Threaded.PosixAddress,
+};
+
+const WindowsAttempt = struct {
+    socket: Io.net.Socket,
+    storage: WindowsConnectStorage,
+    iosb: std.os.windows.IO_STATUS_BLOCK,
+    pending: bool,
+};
+
+extern "ntdll" fn NtWaitForMultipleObjects(
+    count: std.os.windows.ULONG,
+    handles: [*]const std.os.windows.HANDLE,
+    wait_type: std.os.windows.ULONG,
+    alertable: std.os.windows.BOOLEAN,
+    timeout: ?*const std.os.windows.LARGE_INTEGER,
+) callconv(.winapi) std.os.windows.NTSTATUS;
+
+const WindowsAddressRace = struct {
+    io: Io,
+    attempts: [MAX_RACED_ADDRESSES]WindowsAttempt = undefined,
+
+    fn now(self: *@This()) i128 {
+        return monoNow(self.io);
+    }
+
+    fn start(self: *@This(), index: usize, address: Io.net.IpAddress) !?Io.net.Stream {
+        const windows = std.os.windows;
+        const local_address: Io.net.IpAddress = switch (address) {
+            .ip4 => .{ .ip4 = .unspecified(0) },
+            .ip6 => .{ .ip6 = .unspecified(0) },
+        };
+        const socket = try local_address.bind(self.io, .{ .mode = .stream });
+        errdefer socket.close(self.io);
+        self.attempts[index] = .{
+            .socket = socket,
+            .storage = .{ .Address = undefined },
+            .iosb = undefined,
+            .pending = false,
+        };
+        const attempt = &self.attempts[index];
+        const addr_len = Io.Threaded.addressToPosix(&address, &attempt.storage.Address);
+        const input = @as([]const u8, @ptrCast(&attempt.storage))[0 .. @offsetOf(WindowsConnectStorage, "Address") + addr_len];
+        const status = windows.ntdll.NtDeviceIoControlFile(
+            socket.handle,
+            null,
+            null,
+            null,
+            &attempt.iosb,
+            windows.IOCTL.AFD.CONNECT,
+            input.ptr,
+            @intCast(input.len),
+            null,
+            0,
+        );
+        if (status != .PENDING) {
+            try checkWindowsConnectStatus(status);
+            return .{ .socket = socket };
+        }
+        attempt.pending = true;
+        return null;
+    }
+
+    fn wait(self: *@This(), active: []const bool, timeout_ms: i32) !?usize {
+        const windows = std.os.windows;
+        var handles: [MAX_RACED_ADDRESSES]windows.HANDLE = undefined;
+        var indices: [MAX_RACED_ADDRESSES]usize = undefined;
+        var count: usize = 0;
+        for (active, 0..) |is_active, i| {
+            if (!is_active) continue;
+            handles[count] = self.attempts[i].socket.handle;
+            indices[count] = i;
+            count += 1;
+        }
+        const timeout_100ns = @divTrunc(@as(i128, timeout_ms) * std.time.ns_per_ms, 100);
+        const timeout: windows.LARGE_INTEGER = -@as(i64, @intCast(timeout_100ns));
+        const status = NtWaitForMultipleObjects(@intCast(count), handles[0..count].ptr, 1, .FALSE, &timeout);
+        const status_index = @backingInt(status);
+        if (status_index < count) return indices[status_index];
+        if (status == .TIMEOUT) return null;
+        return windows.unexpectedStatus(status);
+    }
+
+    fn finish(self: *@This(), index: usize) !Io.net.Stream {
+        const attempt = &self.attempts[index];
+        attempt.pending = false;
+        try checkWindowsConnectStatus(attempt.iosb.u.Status);
+        return .{ .socket = attempt.socket };
+    }
+
+    fn cancel(self: *@This(), index: usize) void {
+        const attempt = &self.attempts[index];
+        if (attempt.pending) cancelWindowsConnect(attempt.socket.handle, &attempt.iosb);
+        attempt.pending = false;
+        attempt.socket.close(self.io);
+    }
+};
 
 test "Windows connect completion status preserves socket errors" {
     try checkWindowsConnectStatus(.SUCCESS);
@@ -541,6 +832,74 @@ fn waitConnectedUntil(io: Io, sock: posix.socket_t, deadline: i128) !void {
         }
     }
 }
+
+const PosixAttempt = struct {
+    sock: posix.socket_t,
+    address: Io.net.IpAddress,
+    revents: i16 = 0,
+};
+
+const PosixAddressRace = struct {
+    io: Io,
+    bind: ?[]const u8,
+    attempts: [MAX_RACED_ADDRESSES]PosixAttempt = undefined,
+
+    fn now(self: *@This()) i128 {
+        return monoNow(self.io);
+    }
+
+    fn start(self: *@This(), index: usize, address: Io.net.IpAddress) !?Io.net.Stream {
+        const family: posix.sa_family_t = switch (address) {
+            .ip4 => posix.AF.INET,
+            .ip6 => posix.AF.INET6,
+        };
+        const flags: u32 = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+        const sock = try openSocket(family, flags);
+        errdefer _ = posix.system.close(sock);
+        try applyBind(sock, self.bind);
+        try startConnect(sock, address);
+        self.attempts[index] = .{ .sock = sock, .address = address };
+        return null;
+    }
+
+    fn wait(self: *@This(), active: []const bool, timeout_ms: i32) !?usize {
+        var fds: [MAX_RACED_ADDRESSES]posix.pollfd = undefined;
+        for (active, 0..) |is_active, i| {
+            fds[i] = .{
+                .fd = if (is_active) self.attempts[i].sock else -1,
+                .events = posix.POLL.OUT,
+                .revents = 0,
+            };
+        }
+        if (try posix.poll(fds[0..active.len], timeout_ms) == 0) return null;
+        for (active, 0..) |is_active, i| {
+            if (!is_active) continue;
+            self.attempts[i].revents = fds[i].revents;
+            if (classifyPoll(fds[i].revents, posix.POLL.OUT) != .pending) return i;
+        }
+        return null;
+    }
+
+    fn finish(self: *@This(), index: usize) !Io.net.Stream {
+        const attempt = &self.attempts[index];
+        switch (classifyPoll(attempt.revents, posix.POLL.OUT)) {
+            .pending => unreachable,
+            .ready => {
+                try checkSocketError(attempt.sock);
+                try clearNonblock(attempt.sock);
+                return .{ .socket = .{ .handle = attempt.sock, .address = attempt.address } };
+            },
+            .hangup, .failed => {
+                try checkSocketError(attempt.sock);
+                return error.ConnectionResetByPeer;
+            },
+        }
+    }
+
+    fn cancel(self: *@This(), index: usize) void {
+        _ = posix.system.close(self.attempts[index].sock);
+    }
+};
 
 /// What one `poll` wake-up says about a socket, before SO_ERROR is read.
 ///

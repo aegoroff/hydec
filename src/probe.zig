@@ -68,6 +68,8 @@ pub const Stats = struct {
 const WorkItem = struct {
     raw: []const u8,
     proxy: proxy_uri.Proxy,
+    /// Owned addresses from grouping; empty means the probe must resolve again.
+    addresses: []Io.net.IpAddress,
 };
 
 /// Cap concurrent host workers so a large subscription cannot exhaust OS threads.
@@ -115,6 +117,7 @@ pub fn probeOne(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
+    addresses: ?[]const Io.net.IpAddress,
     stage: *util.Stage,
 ) !u64 {
     stage.* = .setup;
@@ -133,7 +136,7 @@ pub fn probeOne(
             }
             const method = proxy.method orelse return error.InvalidProxyUri;
             const password = proxy.password orelse return error.InvalidProxyUri;
-            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind, stage);
+            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind, addresses, stage);
         },
         .trojan => blk: {
             if (proxy.transport == .grpc or proxy.transport == .other) return error.UnsupportedTransport;
@@ -162,7 +165,7 @@ pub fn probeOne(
                 .ws_host = host_hdr,
                 .alpn = alpn_list,
                 .allow_insecure = allow_insecure,
-            }, target, timeout_secs, bind, stage);
+            }, target, timeout_secs, bind, addresses, stage);
         },
         .vless => blk: {
             if (proxy.security != .reality) return error.UnsupportedSecurity;
@@ -213,6 +216,7 @@ pub fn probeOne(
                 target,
                 timeout_secs,
                 bind,
+                addresses,
                 stage,
             );
         },
@@ -283,6 +287,7 @@ pub fn probeLatency(
     proxy: proxy_uri.Proxy,
     timeout_secs: u32,
     bind: ?[]const u8,
+    addresses: ?[]const Io.net.IpAddress,
     check_volume: bool,
     stage: *util.Stage,
 ) !Latency {
@@ -292,21 +297,22 @@ pub fn probeLatency(
         proxy: proxy_uri.Proxy,
         timeout_secs: u32,
         bind: ?[]const u8,
+        addresses: ?[]const Io.net.IpAddress,
         stage: *util.Stage,
 
         fn probe(self: @This()) !u64 {
-            return probeOne(self.gpa, self.io, self.proxy, util.LATENCY_TARGET, self.timeout_secs, self.bind, self.stage);
+            return probeOne(self.gpa, self.io, self.proxy, util.LATENCY_TARGET, self.timeout_secs, self.bind, self.addresses, self.stage);
         }
     };
     var samples: [PROBE_ATTEMPTS]u64 = undefined;
-    const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind, .stage = stage }, &samples);
+    const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind, .addresses = addresses, .stage = stage }, &samples);
     var latency = Latency.fromSamples(&samples);
     latency.retries = retries;
     if (check_volume) {
-        _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, stage) catch |err| switch (err) {
+        _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, addresses, stage) catch |err| switch (err) {
             // Cloudflare said no; the node carried the warmup, so do not fail it.
             error.VolumeRefused => std.log.warn("volume check skipped for {s}:{d}: download refused", .{ proxy.host, proxy.port }),
-            else => return volumeError(err),
+            else => return volumeError(err, stage.*),
         };
     }
     return latency;
@@ -315,10 +321,13 @@ pub fn probeLatency(
 /// The volume download runs once and is never retried: a DPI freeze past the first
 /// ~16–20 KB repeats on every attempt, and a retry would only double its cost.
 /// A read timeout there is that freeze, so it gets its own name; other errors pass through.
-/// A connect timeout stays a connect failure: no download has started yet.
-fn volumeError(err: anyerror) anyerror {
+/// Lookup and connect timeouts stay connect failures: no download has started yet.
+fn volumeError(err: anyerror, stage: util.Stage) anyerror {
     return switch (err) {
-        error.Timeout, error.ConnectionTimedOut => error.VolumeStalled,
+        error.Timeout, error.ConnectionTimedOut => switch (stage) {
+            .setup, .connect => err,
+            .handshake, .tunnel, .reply => error.VolumeStalled,
+        },
         else => err,
     };
 }
@@ -644,7 +653,7 @@ fn probeGroup(shared: *Shared, items: []WorkItem) void {
 
         // Three probes (one transient retry); ranking uses their median.
         var stage: util.Stage = .setup;
-        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, shared.check_volume, &stage) catch |err| {
+        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, item.addresses, shared.check_volume, &stage) catch |err| {
             if (shared.verbose) {
                 std.log.warn("FAIL: {f}: {f} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, FailReason{ .err = err, .stage = stage }, err });
             }
@@ -680,14 +689,17 @@ const HostQueue = struct {
     }
 };
 
-/// Disjoint resolved-address sets (or one unresolved name); each list is probed
-/// sequentially, different lists in parallel.
+/// Disjoint resolved-address sets, plus one shared unresolved queue; each list is
+/// probed sequentially, different lists in parallel.
 const GroupMap = std.array_hash_map.String(std.ArrayList(WorkItem));
 
 fn freeGroups(gpa: std.mem.Allocator, groups: *GroupMap) void {
     for (groups.keys()) |key| gpa.free(key);
     for (groups.values()) |*list| {
-        for (list.items) |*item| item.proxy.deinit(gpa);
+        for (list.items) |*item| {
+            item.proxy.deinit(gpa);
+            gpa.free(item.addresses);
+        }
         list.deinit(gpa);
     }
     groups.deinit(gpa);
@@ -751,8 +763,7 @@ fn resolveAddresses(
         return storage[0..1];
     } else |_| {}
 
-    // Resolution also happens in the probe, which reports DNS failures per entry.
-    // An empty result groups the entry by name instead of failing the run here.
+    // An empty result is retried in the probe, which reports DNS failures per entry.
     return resolver.lookup(io, host, port, storage) catch storage[0..0];
 }
 
@@ -865,10 +876,9 @@ fn collectGroupsWithResolver(
         errdefer proxy.deinit(gpa);
 
         var address_storage: [MAX_RESOLVED_ADDRESSES]Io.net.IpAddress = undefined;
-        // No addresses: the probe resolves again and reports the DNS failure. Such a
-        // name gets a queue of its own; an address it might share with another entry
-        // is the price of not serializing every unresolved entry.
         const addresses = resolveAddresses(io, proxy.host, proxy.port, &address_storage, resolver);
+        const owned_addresses = try gpa.dupe(Io.net.IpAddress, addresses);
+        errdefer gpa.free(owned_addresses);
 
         var endpoint_keys: [MAX_RESOLVED_ADDRESSES][]u8 = undefined;
         var endpoint_count: usize = 0;
@@ -894,8 +904,8 @@ fn collectGroupsWithResolver(
             }
         }
         if (group_key == null) {
-            // IP literals always yield one address, so an empty set has a name key.
-            const first_key = if (endpoints.len > 0) endpoints[0] else name_key.?;
+            // Failed lookups share one queue: they may still name an already queued machine.
+            const first_key = if (endpoints.len > 0) endpoints[0] else "unresolved";
             group_key = try getOrCreateGroup(gpa, &groups, first_key);
         }
 
@@ -913,6 +923,7 @@ fn collectGroupsWithResolver(
         try groups.getPtr(group_key.?).?.append(gpa, .{
             .raw = line,
             .proxy = proxy,
+            .addresses = owned_addresses,
         });
     }
 
@@ -963,26 +974,58 @@ pub fn findBest(
         }
     }
 
+    return finishBest(&shared, strategy);
+}
+
+fn finishBest(shared: *Shared, strategy: Strategy) !?Result {
+    if (shared.best_oom) {
+        shared.deinitBests();
+        return error.OutOfMemory;
+    }
+
     var ranks: std.EnumArray(PrefClass, ?Rank) = .initFill(null);
     for (std.enums.values(PrefClass)) |class| {
         if (shared.best.get(class)) |r| ranks.set(class, r.rank);
     }
-    const chosen = selectBestRanked(strategy, ranks);
-
-    if (chosen == null) {
+    const chosen = selectBestRanked(strategy, ranks) orelse {
         shared.deinitBests();
-        if (shared.best_oom) return error.OutOfMemory;
         return null;
-    }
+    };
 
     // Take ownership of the winner; free the other class bests.
-    const winner = shared.best.get(chosen.?).?;
-    shared.best.set(chosen.?, null);
+    const winner = shared.best.get(chosen).?;
+    shared.best.set(chosen, null);
     for (std.enums.values(PrefClass)) |class| {
-        if (shared.best.getPtr(class).*) |*r| r.deinit(gpa);
+        if (shared.best.getPtr(class).*) |*r| r.deinit(shared.gpa);
         shared.best.set(class, null);
     }
     return winner;
+}
+
+test "finishBest reports recording OOM even when a slower winner exists" {
+    const gpa = std.testing.allocator;
+    var stats: Stats = .{};
+    var shared: Shared = .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .verbose = false,
+        .prefer_stable = false,
+        .check_volume = false,
+        .timeout_secs = 5,
+        .bind = null,
+        .best_oom = true,
+        .stats = &stats,
+    };
+    defer shared.deinitBests();
+    shared.best.set(.shadowsocks, .{
+        .latency_ms = 100,
+        .rank = .{ .retried = false, .ms = 100 },
+        .raw = "ss://winner",
+        .host = try gpa.dupe(u8, "192.0.2.1"),
+    });
+
+    try std.testing.expectError(error.OutOfMemory, finishBest(&shared, .fastest));
+    for (std.enums.values(PrefClass)) |class| try std.testing.expect(shared.best.get(class) == null);
 }
 
 test "OK/FAIL log formatters render both named and unnamed proxies" {
@@ -1025,7 +1068,7 @@ test "probeOne rejects Trojan transports it cannot carry before dialing" {
         var stage: util.Stage = .setup;
 
         // Act / Assert: 192.0.2.1 is TEST-NET, so reaching the dial would hang or fail differently.
-        try std.testing.expectError(error.UnsupportedTransport, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, &stage));
+        try std.testing.expectError(error.UnsupportedTransport, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, null, &stage));
         try std.testing.expectEqual(util.Stage.setup, stage);
     }
 }
@@ -1042,7 +1085,7 @@ test "probeOne rejects non-TLS Trojan security before dialing" {
         var stage: util.Stage = .setup;
 
         // Act / Assert: 192.0.2.1 is TEST-NET, so reaching the dial would fail differently.
-        try std.testing.expectError(error.UnsupportedSecurity, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, &stage));
+        try std.testing.expectError(error.UnsupportedSecurity, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, null, &stage));
         try std.testing.expectEqual(util.Stage.setup, stage);
     }
 }
@@ -1081,7 +1124,7 @@ test "probeOne rejects SS plugins before opening a socket" {
         var proxy = try proxy_uri.parse(gpa, line);
         defer proxy.deinit(gpa);
         var stage: util.Stage = .setup;
-        try std.testing.expectError(error.UnsupportedPlugin, probeOne(gpa, io, proxy, util.LATENCY_TARGET, 1, null, &stage));
+        try std.testing.expectError(error.UnsupportedPlugin, probeOne(gpa, io, proxy, util.LATENCY_TARGET, 1, null, null, &stage));
         try std.testing.expectEqual(util.Stage.setup, stage);
     }
 
@@ -1291,11 +1334,13 @@ test "collectGroups resolves DNS aliases and root dots and normalizes IP literal
     try std.testing.expectEqual(@as(usize, 2), resolved.len);
     try std.testing.expectEqualStrings("EXAMPLE.COM", resolved[0].proxy.host);
     try std.testing.expectEqualStrings("example.com.", resolved[1].proxy.host);
+    try std.testing.expectEqualSlices(Io.net.IpAddress, &.{try Io.net.IpAddress.parse("192.0.2.10", 443)}, resolved[0].addresses);
     try std.testing.expectEqual(@as(usize, 2), groups.get("2001:db8::1").?.items.len);
-    const unresolved = groups.get("name:unresolved.example").?.items;
+    const unresolved = groups.get("unresolved").?.items;
     try std.testing.expectEqual(@as(usize, 2), unresolved.len);
     try std.testing.expectEqualStrings("UNRESOLVED.EXAMPLE", unresolved[0].proxy.host);
     try std.testing.expectEqualStrings("unresolved.example.", unresolved[1].proxy.host);
+    try std.testing.expectEqual(@as(usize, 0), unresolved[0].addresses.len);
 }
 
 test "collectGroups keeps one DNS name sequential when repeated lookups return disjoint answers" {
@@ -1349,7 +1394,7 @@ test "collectGroups merges aliases, IP literals, and overlapping resolved addres
     try std.testing.expectEqual(@as(usize, 1), groups.get("192.0.2.3").?.items.len);
 }
 
-test "collectGroups gives each distinct unresolved name its own parallel queue" {
+test "collectGroups puts distinct unresolved names in one sequential queue" {
     const gpa = std.testing.allocator;
     const lines = [_][]const u8{
         "trojan://pw@missing-a.example:443#a",
@@ -1360,10 +1405,12 @@ test "collectGroups gives each distinct unresolved name its own parallel queue" 
     var groups = try collectGroupsWithResolver(gpa, std.testing.io, &lines, &stats, false, FakeResolver{});
     defer freeGroups(gpa, &groups);
 
-    try std.testing.expectEqual(@as(usize, 3), groups.count());
+    try std.testing.expectEqual(@as(usize, 2), groups.count());
     try std.testing.expectEqual(@as(usize, 1), groups.get("192.0.2.3").?.items.len);
-    try std.testing.expectEqualStrings("missing-a.example", groups.get("name:missing-a.example").?.items[0].proxy.host);
-    try std.testing.expectEqualStrings("missing-b.example", groups.get("name:missing-b.example").?.items[0].proxy.host);
+    const unresolved = groups.get("unresolved").?.items;
+    try std.testing.expectEqual(@as(usize, 2), unresolved.len);
+    try std.testing.expectEqualStrings("missing-a.example", unresolved[0].proxy.host);
+    try std.testing.expectEqualStrings("missing-b.example", unresolved[1].proxy.host);
 }
 
 test "collectGroups joins a name that resolves later to its unresolved queue" {
@@ -1390,10 +1437,10 @@ test "collectGroups joins a name that resolves later to its unresolved queue" {
     defer freeGroups(gpa, &groups);
 
     try std.testing.expectEqual(@as(usize, 1), groups.count());
-    try std.testing.expectEqual(@as(usize, 3), groups.get("name:flaky.example").?.items.len);
+    try std.testing.expectEqual(@as(usize, 3), groups.get("unresolved").?.items.len);
 }
 
-test "collectGroups puts names in their own queues once the DNS budget is spent" {
+test "collectGroups shares one queue once the DNS budget is spent" {
     const gpa = std.testing.allocator;
     const lines = [_][]const u8{
         "trojan://pw@late-a.example:443#a",
@@ -1407,9 +1454,8 @@ test "collectGroups puts names in their own queues once the DNS budget is spent"
     });
     defer freeGroups(gpa, &groups);
 
-    try std.testing.expectEqual(@as(usize, 3), groups.count());
-    try std.testing.expectEqual(@as(usize, 1), groups.get("name:late-a.example").?.items.len);
-    try std.testing.expectEqual(@as(usize, 1), groups.get("name:late-b.example").?.items.len);
+    try std.testing.expectEqual(@as(usize, 2), groups.count());
+    try std.testing.expectEqual(@as(usize, 2), groups.get("unresolved").?.items.len);
     try std.testing.expectEqual(@as(usize, 1), groups.get("192.0.2.40").?.items.len);
 }
 
@@ -1592,13 +1638,16 @@ test "failHint covers every Io.net.IpAddress.BindError member" {
     }
 }
 
-test "volumeError names only read stalls and keeps other errors" {
-    try std.testing.expectEqual(error.VolumeStalled, volumeError(error.Timeout));
-    try std.testing.expectEqual(error.VolumeStalled, volumeError(error.ConnectionTimedOut));
-    try std.testing.expectEqual(error.ConnectTimeout, volumeError(error.ConnectTimeout));
-    try std.testing.expectEqual(error.ProbeResponseMismatch, volumeError(error.ProbeResponseMismatch));
+test "volumeError names only post-connect stalls and keeps lookup timeouts" {
+    try std.testing.expectEqual(error.Timeout, volumeError(error.Timeout, .setup));
+    try std.testing.expectEqual(error.Timeout, volumeError(error.Timeout, .connect));
+    try std.testing.expectEqual(error.ConnectionTimedOut, volumeError(error.ConnectionTimedOut, .connect));
+    try std.testing.expectEqual(error.VolumeStalled, volumeError(error.Timeout, .handshake));
+    try std.testing.expectEqual(error.VolumeStalled, volumeError(error.ConnectionTimedOut, .reply));
+    try std.testing.expectEqual(error.ConnectTimeout, volumeError(error.ConnectTimeout, .connect));
+    try std.testing.expectEqual(error.ProbeResponseMismatch, volumeError(error.ProbeResponseMismatch, .reply));
     try std.testing.expectEqualStrings("volume/stalled", failHint(error.VolumeStalled));
-    try std.testing.expectEqualStrings("slow/timeout", failHint(volumeError(error.ConnectTimeout)));
+    try std.testing.expectEqualStrings("slow/timeout", failHint(volumeError(error.Timeout, .connect)));
 }
 
 test "failHint names the ALPN and plugin failures" {

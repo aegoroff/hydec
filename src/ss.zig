@@ -211,6 +211,7 @@ pub fn probe(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
+    addresses: ?[]const Io.net.IpAddress,
     stage: *util.Stage,
 ) !u64 {
     const method = Method.fromName(method_name) orelse return error.UnsupportedSsMethod;
@@ -221,7 +222,7 @@ pub fn probe(
 
     const start = netutil.monoNow(io);
     stage.* = .connect;
-    const stream = try netutil.connectHostPort(io, host, port, timeout_secs, bind);
+    const stream = try netutil.connectHostPortWithAddresses(io, host, port, timeout_secs, bind, addresses);
     defer stream.close(io);
     stage.* = .handshake;
 
@@ -644,7 +645,7 @@ test "probe reports the stage it failed at" {
 
     // Act
     var stage: util.Stage = .setup;
-    const result = probe(std.testing.allocator, io, "127.0.0.1", port, "aes-128-gcm", "pw", util.LATENCY_TARGET, 2, null, &stage);
+    const result = probe(std.testing.allocator, io, "127.0.0.1", port, "aes-128-gcm", "pw", util.LATENCY_TARGET, 2, null, null, &stage);
     peer.join();
 
     // Assert: TCP came up, the first flight went unanswered.
