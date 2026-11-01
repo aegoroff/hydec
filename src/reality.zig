@@ -2248,3 +2248,149 @@ test "decodePublicKey length" {
     try decodePublicKey(pbk, &out);
     try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(0)), &out);
 }
+
+const HandshakeTestPeer = struct {
+    server: *Io.net.Server,
+    reality_secret: [32]u8,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        self.runInner() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn runInner(self: *@This()) !void {
+        const io = std.testing.io;
+        const stream = try self.server.accept(io);
+        defer stream.close(io);
+        var rbuf: [2048]u8 = undefined;
+        var wbuf: [2048]u8 = undefined;
+        var reader = stream.reader(io, &rbuf);
+        var writer = stream.writer(io, &wbuf);
+        var record_conn: RecordConn = .{ .reader = &reader.interface, .writer = &writer.interface };
+
+        var record_header: [5]u8 = undefined;
+        try reader.interface.readSliceAll(&record_header);
+        if (record_header[0] != 22) return error.TlsUnexpectedMessage;
+        const hello_len = std.mem.readInt(u16, record_header[3..5], .big);
+        var hello: [2048]u8 = undefined;
+        if (hello_len > hello.len) return error.BufferTooSmall;
+        try reader.interface.readSliceAll(hello[0..hello_len]);
+
+        const key_share_prefix = [_]u8{ 0, 51, 0, 38, 0, 36, 0, 29, 0, 32 };
+        const share_pos = std.mem.find(u8, hello[0..hello_len], &key_share_prefix) orelse return error.MissingKeyShare;
+        var client_share: [32]u8 = undefined;
+        @memcpy(&client_share, hello[share_pos + key_share_prefix.len ..][0..32]);
+        var client_random: [32]u8 = undefined;
+        @memcpy(&client_random, hello[6..38]);
+
+        var reality_secret = try X25519.scalarmult(self.reality_secret, client_share);
+        const reality_prk = HkdfSha256.extract(client_random[0..20], &reality_secret);
+        var auth_key: [32]u8 = undefined;
+        HkdfSha256.expand(&auth_key, "REALITY", reality_prk);
+
+        const tls_kp = X25519.KeyPair.generateDeterministic(@splat(0x32));
+        var sh_body: [128]u8 = undefined;
+        const sh_body_len = try appendServerHelloMinimal(&sh_body, &tls_kp.public_key, null);
+        var sh_msg: [132]u8 = undefined;
+        sh_msg[0] = 2;
+        std.mem.writeInt(u24, sh_msg[1..4], @intCast(sh_body_len), .big);
+        @memcpy(sh_msg[4..][0..sh_body_len], sh_body[0..sh_body_len]);
+        const sh_msg_len = 4 + sh_body_len;
+        try record_conn.writeClear(22, sh_msg[0..sh_msg_len]);
+
+        var transcript = Sha256.init(.{});
+        transcript.update(hello[0..hello_len]);
+        transcript.update(sh_msg[0..sh_msg_len]);
+        var hello_hash: [32]u8 = undefined;
+        var hello_hasher = transcript;
+        hello_hasher.final(&hello_hash);
+
+        const shared = try X25519.scalarmult(tls_kp.secret_key, client_share);
+        const zeroes: [32]u8 = @splat(0);
+        const early = HkdfSha256.extract(&[_]u8{0}, &zeroes);
+        const empty_hash = tls.emptyHash(Sha256);
+        const derived = hkdfExpandLabel(32, &early, "derived", &empty_hash);
+        const hs_secret = HkdfSha256.extract(&derived, &shared);
+        const client_hs = hkdfExpandLabel(32, &hs_secret, "c hs traffic", &hello_hash);
+        const server_hs = hkdfExpandLabel(32, &hs_secret, "s hs traffic", &hello_hash);
+        const client_fin_key = hkdfExpandLabel(32, &client_hs, "finished", "");
+        const server_fin_key = hkdfExpandLabel(32, &server_hs, "finished", "");
+        const client_key = hkdfExpandLabel(16, &client_hs, "key", "");
+        const client_iv = hkdfExpandLabel(12, &client_hs, "iv", "");
+        const server_key = hkdfExpandLabel(16, &server_hs, "key", "");
+        const server_iv = hkdfExpandLabel(12, &server_hs, "iv", "");
+
+        var leaf: [TEST_REALITY_LEAF_HEX.len / 2]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&leaf, TEST_REALITY_LEAF_HEX);
+        const parsed_leaf = try parseEd25519Leaf(&leaf);
+        var signature: [HmacSha512.mac_length]u8 = undefined;
+        HmacSha512.create(&signature, parsed_leaf.pub_key, &auth_key);
+        @memcpy(leaf[leaf.len - signature.len ..], &signature);
+        var cert_body: [256]u8 = undefined;
+        const cert_body_len = testCertMsg(&cert_body, &leaf).len;
+        var cert_msg: [260]u8 = undefined;
+        cert_msg[0] = 11;
+        std.mem.writeInt(u24, cert_msg[1..4], @intCast(cert_body_len), .big);
+        @memcpy(cert_msg[4..][0..cert_body_len], cert_body[0..cert_body_len]);
+        const cert_msg_len = 4 + cert_body_len;
+        transcript.update(cert_msg[0..cert_msg_len]);
+
+        var pre_fin_hash: [32]u8 = undefined;
+        var pre_fin_hasher = transcript;
+        pre_fin_hasher.final(&pre_fin_hash);
+        const server_verify = tls.hmac(HmacSha256, &pre_fin_hash, server_fin_key);
+        var fin_msg: [36]u8 = undefined;
+        fin_msg[0] = 20;
+        std.mem.writeInt(u24, fin_msg[1..4], 32, .big);
+        @memcpy(fin_msg[4..], &server_verify);
+        transcript.update(&fin_msg);
+
+        var flight: [512]u8 = undefined;
+        @memcpy(flight[0..cert_msg_len], cert_msg[0..cert_msg_len]);
+        @memcpy(flight[cert_msg_len..][0..fin_msg.len], &fin_msg);
+        const flight_len = cert_msg_len + fin_msg.len;
+        var sealed: [1024]u8 = undefined;
+        const sealed_len = appendSealedRecord(&sealed, &server_key, &server_iv, 0, 22, flight[0..flight_len]);
+        try writer.interface.writeAll(sealed[0..sealed_len]);
+        try writer.interface.flush();
+
+        record_conn.hs_server_key = client_key;
+        record_conn.hs_server_iv = client_iv;
+        var client_fin: [64]u8 = undefined;
+        const client_rec = try record_conn.readRecord(&client_fin, true);
+        if (client_rec.typ != 22 or client_rec.len != 36) return error.TlsUnexpectedMessage;
+        if (client_fin[0] != 20 or std.mem.readInt(u24, client_fin[1..4], .big) != 32) return error.TlsUnexpectedMessage;
+        var hs_hash: [32]u8 = undefined;
+        var hs_hasher = transcript;
+        hs_hasher.final(&hs_hash);
+        const expected_client_verify = tls.hmac(HmacSha256, &hs_hash, client_fin_key);
+        if (!std.mem.eql(u8, client_fin[4..36], &expected_client_verify)) return error.TlsFinishedVerifyFailed;
+    }
+};
+
+test "connect completes a full REALITY handshake" {
+    const io = std.testing.io;
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const reality_kp = X25519.KeyPair.generateDeterministic(@splat(0x24));
+    var peer: HandshakeTestPeer = .{ .server = &server, .reality_secret = reality_kp.secret_key };
+    const thread = try std.Thread.spawn(.{}, HandshakeTestPeer.run, .{&peer});
+
+    var pbk_buf: [44]u8 = undefined;
+    const pbk = std.base64.url_safe_no_pad.Encoder.encode(&pbk_buf, &reality_kp.public_key);
+    var rc: RealityConn = undefined;
+    var connected = false;
+    defer if (connected) rc.deinit();
+    {
+        defer thread.join();
+        var stage: util.Stage = .setup;
+        try connect(&rc, io, "127.0.0.1", server.socket.address.getPort(), "example.com", pbk, "", 2, null, &stage);
+        connected = true;
+        try std.testing.expect(rc.conn.app_phase);
+        try std.testing.expectEqual(util.Stage.handshake, stage);
+    }
+    if (peer.err) |err| return err;
+}

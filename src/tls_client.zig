@@ -1337,6 +1337,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
         .handshake => {
             var ct_i: usize = 0;
             while (true) {
+                if (cleartext.len - ct_i < 4) return failRead(c, error.TlsBadLength);
                 const handshake_type: tls.HandshakeType = @fromBackingInt(@intCast(cleartext[ct_i]));
                 ct_i += 1;
                 const handshake_len = mem.readInt(u24, cleartext[ct_i..][0..3], .big);
@@ -1809,6 +1810,39 @@ test "empty inner plaintext" {
             .client_iv = undefined,
         } } },
     ));
+}
+
+test "post-handshake header shorter than four bytes" {
+    const AEAD = crypto.aead.chacha_poly.ChaCha20Poly1305;
+    const key: [AEAD.key_length]u8 = @splat(0);
+    const iv: [AEAD.nonce_length]u8 = @splat(0);
+    const cipher: tls.ApplicationCipher = .{ .CHACHA20_POLY1305_SHA256 = .{ .tls_1_3 = .{
+        .server_key = key,
+        .server_iv = iv,
+        .client_secret = undefined,
+        .server_secret = undefined,
+        .client_key = undefined,
+        .client_iv = undefined,
+    } } };
+
+    for (0..4) |header_len| {
+        var plaintext: [4]u8 = @splat(0);
+        plaintext[0] = 4; // NewSessionTicket, when at least one header byte is present.
+        plaintext[header_len] = 22; // Inner handshake content type.
+        const clear = plaintext[0 .. header_len + 1];
+        var ciphertext: [4]u8 = undefined;
+        var tag: [AEAD.tag_length]u8 = undefined;
+        const content_len: u16 = @intCast(clear.len + AEAD.tag_length);
+        const record_header = [_]u8{ 0x17, 0x03, 0x03 } ++ mem.toBytes(big(content_len));
+        AEAD.encrypt(ciphertext[0..clear.len], &tag, clear, &record_header, iv, key);
+        var wire: [5 + 4 + AEAD.tag_length]u8 = undefined;
+        @memcpy(wire[0..5], &record_header);
+        @memcpy(wire[5..][0..clear.len], ciphertext[0..clear.len]);
+        @memcpy(wire[5 + clear.len ..][0..AEAD.tag_length], &tag);
+        const wire_len = 5 + clear.len + AEAD.tag_length;
+
+        try std.testing.expectEqual(error.TlsBadLength, testReadError(wire[0..wire_len], .tls_1_3, cipher));
+    }
 }
 
 test "record shorter than tag" {
