@@ -71,7 +71,7 @@ RUN printf '%s\n' \
       'export PATH="/mise/shims:/usr/local/bin:$PATH"' \
       > /etc/profile.d/mise.sh
 
-RUN mise use -g zig@0.17.0 just@1.46.0 \
+RUN mise use -g zig@0.17.1 just@1.46.0 \
     && zig version \
     && just --version \
     && node --version \
