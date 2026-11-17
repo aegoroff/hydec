@@ -197,11 +197,12 @@ fn headerBlockFragment(payload: []const u8, flags: u8) ?[]const u8 {
 
 pub fn headersIndicateStatus200(payload: []const u8, flags: u8) bool {
     const p = headerBlockFragment(payload, flags) orelse return false;
-    return hpackHasStatus200(p);
+    return hpackStatusMatches(p, .http) orelse false;
 }
 
 pub const CompletedHeaders = struct {
-    status_ok: bool,
+    http_status_ok: ?bool,
+    grpc_ok: bool,
     end_stream: bool,
 };
 
@@ -220,11 +221,8 @@ pub const HeaderBlock = struct {
         if (!continuation) {
             if (self.pending) return error.InvalidHttp2Framing;
             const end_stream = (flags & 0x01) != 0;
-            if ((flags & 0x04) != 0) return .{
-                .status_ok = headersIndicateStatus200(payload, flags),
-                .end_stream = end_stream,
-            };
             const fragment = headerBlockFragment(payload, flags) orelse return error.InvalidHpack;
+            if ((flags & 0x04) != 0) return completedHeaders(fragment, end_stream);
             if (fragment.len > self.storage.len) return error.BufferTooSmall;
             @memcpy(self.storage[0..fragment.len], fragment);
             self.len = fragment.len;
@@ -239,10 +237,7 @@ pub const HeaderBlock = struct {
         self.len += payload.len;
         if ((flags & 0x04) == 0) return null;
 
-        const completed: CompletedHeaders = .{
-            .status_ok = headersIndicateStatus200(self.storage[0..self.len], 0),
-            .end_stream = self.end_stream,
-        };
+        const completed = completedHeaders(self.storage[0..self.len], self.end_stream);
         self.pending = false;
         self.len = 0;
         return completed;
@@ -259,7 +254,17 @@ pub fn grpcDataPayload(payload: []const u8, flags: u8) error{InvalidGrpcFrame}![
     return body[0 .. body.len - pad];
 }
 
-fn hpackHasStatus200(block: []const u8) bool {
+fn completedHeaders(block: []const u8, end_stream: bool) CompletedHeaders {
+    return .{
+        .http_status_ok = hpackStatusMatches(block, .http),
+        .grpc_ok = end_stream and (hpackStatusMatches(block, .grpc) orelse false),
+        .end_stream = end_stream,
+    };
+}
+
+const StatusField = enum { http, grpc };
+
+fn hpackStatusMatches(block: []const u8, field: StatusField) ?bool {
     var p = block;
     while (p.len > 0) {
         const b = p[0];
@@ -269,7 +274,7 @@ fn hpackHasStatus200(block: []const u8) bool {
             // over one byte — otherwise the continuation is misread as a new field.
             const idx = hpackReadInt(&p, 7) catch return false;
             if (idx == 0) return false; // §6.1 forbids index 0
-            if (idx == 8) return true; // static :status 200
+            if (field == .http and idx >= 8 and idx <= 14) return idx == 8;
             continue;
         }
         if ((b & 0xe0) == 0x20) {
@@ -284,21 +289,16 @@ fn hpackHasStatus200(block: []const u8) bool {
         // indexed (§6.2.3). 4 bits already overflow at static index 15
         // (`accept-charset`), so the extended form is ordinary traffic.
         const verdict = if ((b & 0xc0) == 0x40)
-            hpackLiteralStatus200(&p, 6)
+            hpackLiteralStatus(&p, 6, field)
         else
-            hpackLiteralStatus200(&p, 4);
+            hpackLiteralStatus(&p, 4, field);
         if (verdict) |v| return v;
     }
-    return false;
+    return null;
 }
 
-/// Scan one §6.2 literal header field for `:status: 200`. Four outcomes in three
-/// channels: `true` when the field is `:status: 200`; `false` both when it is
-/// `:status` with some other value and when the field is malformed, since the caller
-/// answers a fail-closed predicate and cannot act on the difference; `null` when the
-/// field names something else and scanning should continue. Advances `p` past the
-/// whole field in every case, so the caller's loop always makes progress.
-fn hpackLiteralStatus200(p: *[]const u8, comptime prefix_bits: u3) ?bool {
+/// Null skips an unrelated field. A recognized status or malformed field ends the scan.
+fn hpackLiteralStatus(p: *[]const u8, comptime prefix_bits: u3, field: StatusField) ?bool {
     const name_idx = hpackReadInt(p, prefix_bits) catch return false;
     // A §6.2 representation takes only the *name* from the static entry; the value is
     // the literal that follows. Static 8..14 are all `:status` (200, 204, 206, 304,
@@ -307,14 +307,20 @@ fn hpackLiteralStatus200(p: *[]const u8, comptime prefix_bits: u3) ?bool {
     // whatever it returns, leaving `p` on the value. Above 61 is the dynamic table,
     // which we do not keep, so those fields stay unresolved.
     const is_status = if (name_idx == 0)
-        hpackStringEql(p, ":status")
+        switch (field) {
+            .http => hpackStringEql(p, ":status"),
+            .grpc => hpackStringEql(p, "grpc-status"),
+        }
     else
-        name_idx >= 8 and name_idx <= 14;
+        field == .http and name_idx >= 8 and name_idx <= 14;
     if (!is_status) {
         if (!hpackSkipString(p)) return false;
         return null;
     }
-    return hpackStringEql(p, "200");
+    return switch (field) {
+        .http => hpackStringEql(p, "200"),
+        .grpc => hpackStringEql(p, "0"),
+    };
 }
 
 /// RFC 7541 §5.1 integer with an N-bit prefix. Advances `p` past the integer.
@@ -381,13 +387,18 @@ fn hpackStringEql(p: *[]const u8, comptime want: []const u8) bool {
 const HpackHuffCode = struct { code: u32, len: u4 };
 
 /// Subset of RFC 7541 Appendix B covering the literals matched by `hpackStringEql`
-/// (`":status"`, `"200"`). Extend if the function is reused with other strings.
+/// (`":status"`, `"200"`, `"grpc-status"`, `"0"`).
 fn hpackHuffCodeFor(c: u8) ?HpackHuffCode {
     return switch (c) {
+        '-' => .{ .code = 0b010110, .len = 6 },
         '0' => .{ .code = 0b00000, .len = 5 },
         '2' => .{ .code = 0b00010, .len = 5 },
         ':' => .{ .code = 0b1011100, .len = 7 },
         'a' => .{ .code = 0b00011, .len = 5 },
+        'c' => .{ .code = 0b00100, .len = 5 },
+        'g' => .{ .code = 0b100110, .len = 6 },
+        'p' => .{ .code = 0b101011, .len = 6 },
+        'r' => .{ .code = 0b101100, .len = 6 },
         's' => .{ .code = 0b01000, .len = 5 },
         't' => .{ .code = 0b01001, .len = 5 },
         'u' => .{ .code = 0b101101, .len = 6 },
@@ -601,7 +612,7 @@ test "HeaderBlock reads status from a continuation" {
     const first = [_]u8{ 0x00, 0x04, 'h', 'o', 's', 't', 0x01, 'x' };
     try std.testing.expect((try block.push(&first, 0x01, false)) == null);
     const completed = (try block.push(&.{0x88}, 0x04, true)).?;
-    try std.testing.expect(completed.status_ok);
+    try std.testing.expectEqual(@as(?bool, true), completed.http_status_ok);
     try std.testing.expect(completed.end_stream);
     try std.testing.expect(!block.pending);
 }

@@ -8,6 +8,7 @@ const grpc_gun = @import("grpc_gun.zig");
 const Io = std.Io;
 
 const X25519 = std.crypto.dh.X25519;
+const Ed25519 = std.crypto.sign.Ed25519;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -101,7 +102,7 @@ fn sealSessionId(
 /// leaf is the dest site the server fell back to after rejecting our auth, and that
 /// site must never be sent the VLESS request with its UUID.
 /// `cert_msg` is the TLS 1.3 Certificate message body; only the leaf is checked.
-fn verifyRealityCert(cert_msg: []const u8, auth_key: *const [32]u8) error{RealityAuthFailed}!void {
+fn verifyRealityCert(cert_msg: []const u8, auth_key: *const [32]u8) error{RealityAuthFailed}!Ed25519.PublicKey {
     // certificate_request_context<0..255>, certificate_list<0..2^24-1>, then the
     // first CertificateEntry's cert_data<1..2^24-1>.
     if (cert_msg.len < 1) return error.RealityAuthFailed;
@@ -114,7 +115,28 @@ fn verifyRealityCert(cert_msg: []const u8, auth_key: *const [32]u8) error{Realit
     const leaf = parseEd25519Leaf(cert_msg[i..][0..leaf_len]) catch return error.RealityAuthFailed;
     var expected: [HmacSha512.mac_length]u8 = undefined;
     HmacSha512.create(&expected, leaf.pub_key, auth_key);
-    if (!std.mem.eql(u8, leaf.signature, &expected)) return error.RealityAuthFailed;
+    if (!std.crypto.timing_safe.eql([HmacSha512.mac_length]u8, leaf.signature[0..HmacSha512.mac_length].*, expected))
+        return error.RealityAuthFailed;
+    return Ed25519.PublicKey.fromBytes(leaf.pub_key[0..Ed25519.PublicKey.encoded_length].*) catch error.RealityAuthFailed;
+}
+
+const SERVER_CERT_VERIFY_PREFIX = @as([64]u8, @splat(0x20)) ++ "TLS 1.3, server CertificateVerify\x00";
+
+fn certificateVerifyInput(transcript: Sha256) [SERVER_CERT_VERIFY_PREFIX.len + Sha256.digest_length]u8 {
+    var input: [SERVER_CERT_VERIFY_PREFIX.len + Sha256.digest_length]u8 = undefined;
+    @memcpy(input[0..SERVER_CERT_VERIFY_PREFIX.len], SERVER_CERT_VERIFY_PREFIX);
+    var hash = transcript;
+    hash.final(input[SERVER_CERT_VERIFY_PREFIX.len..]);
+    return input;
+}
+
+fn verifyRealityCertificateSignature(body: []const u8, key: Ed25519.PublicKey, transcript: Sha256) error{TlsCertificateVerifyFailed}!void {
+    const sig_len = Ed25519.Signature.encoded_length;
+    if (body.len != 4 + sig_len or
+        std.mem.readInt(u16, body[0..2], .big) != @backingInt(tls.SignatureScheme.ed25519) or
+        std.mem.readInt(u16, body[2..4], .big) != sig_len) return error.TlsCertificateVerifyFailed;
+    const signature = Ed25519.Signature.fromBytes(body[4..][0..sig_len].*);
+    signature.verifyStrict(&certificateVerifyInput(transcript), key) catch return error.TlsCertificateVerifyFailed;
 }
 
 /// Public key and raw signature of an ed25519 X.509 leaf.
@@ -300,6 +322,7 @@ const RecordConn = struct {
                 return .{ .typ = inner_type, .len = msg_len };
             }
             if (content_type == 21) return error.TlsAlert;
+            if (handshake_keys) return error.TlsUnexpectedMessage;
             if (length > out.len) return error.BufferTooSmall;
             @memcpy(out[0..length], payload[0..length]);
             return .{ .typ = content_type, .len = length };
@@ -842,7 +865,8 @@ fn connect(
     // Transcript is updated per handshake message so Finished verify_data can be checked
     // against Hash(messages before Finished).
     var saw_finished = false;
-    var cert_verified = false;
+    var expected_message: tls.HandshakeType = .encrypted_extensions;
+    var leaf_key: Ed25519.PublicKey = undefined;
     var hs_pending: [32768]u8 = undefined;
     var hs_pending_len: usize = 0;
     while (!saw_finished) {
@@ -852,43 +876,51 @@ fn connect(
             else => |e| return e,
         };
         if (rec.typ == 21) return error.TlsAlert;
-        if (rec.typ != 22) continue;
+        if (rec.typ != 22) return error.TlsUnexpectedMessage;
         if (hs_pending_len + rec.len > hs_pending.len) return error.BufferTooSmall;
         @memcpy(hs_pending[hs_pending_len..][0..rec.len], buf[0..rec.len]);
         hs_pending_len += rec.len;
 
         var off: usize = 0;
         while (off + 4 <= hs_pending_len) {
-            const ht = hs_pending[off];
+            const ht: tls.HandshakeType = @fromBackingInt(hs_pending[off]);
             const hl = std.mem.readInt(u24, hs_pending[off + 1 ..][0..3], .big);
             // Bound claimed length so a hostile/corrupt peer cannot fill the pending buffer forever.
             if (hl > 16384) return error.TlsDecodeError;
             if (off + 4 + hl > hs_pending_len) break;
             const msg = hs_pending[off .. off + 4 + hl];
-            if (ht == 20) {
-                if (!cert_verified) return error.RealityAuthFailed;
-                if (hl != 32) return error.TlsDecodeError;
-                var pre_fin_hash: [32]u8 = undefined;
-                {
+            if (ht != expected_message) return error.TlsUnexpectedMessage;
+            switch (ht) {
+                .encrypted_extensions => {
+                    if (hl < 2 or std.mem.readInt(u16, msg[4..6], .big) != hl - 2) return error.TlsDecodeError;
+                    expected_message = .certificate;
+                },
+                .certificate => {
+                    leaf_key = try verifyRealityCert(msg[4..], &auth_key);
+                    expected_message = .certificate_verify;
+                },
+                .certificate_verify => {
+                    try verifyRealityCertificateSignature(msg[4..], leaf_key, rc.transcript);
+                    expected_message = .finished;
+                },
+                .finished => {
+                    if (hl != Sha256.digest_length) return error.TlsDecodeError;
+                    var pre_fin_hash: [Sha256.digest_length]u8 = undefined;
                     var tc = rc.transcript;
                     tc.final(&pre_fin_hash);
-                }
-                const expected = tls.hmac(HmacSha256, &pre_fin_hash, server_fin_key);
-                if (!std.mem.eql(u8, msg[4..], &expected)) return error.TlsFinishedVerifyFailed;
-                rc.transcript.update(msg);
-                saw_finished = true;
-                off += 4 + hl;
-                // Client Finished covers messages through Server Finished only — do not
-                // hash any further handshake bytes that may follow in this buffer.
-                break;
-            } else {
-                if (ht == 11) {
-                    try verifyRealityCert(msg[4..], &auth_key);
-                    cert_verified = true;
-                }
-                rc.transcript.update(msg);
+                    const expected = tls.hmac(HmacSha256, &pre_fin_hash, server_fin_key);
+                    if (!std.crypto.timing_safe.eql([Sha256.digest_length]u8, msg[4..][0..Sha256.digest_length].*, expected))
+                        return error.TlsFinishedVerifyFailed;
+                    saw_finished = true;
+                },
+                else => unreachable,
             }
+            rc.transcript.update(msg);
             off += 4 + hl;
+            if (saw_finished) {
+                if (off != hs_pending_len) return error.TlsUnexpectedMessage;
+                break;
+            }
         }
         if (off > 0) {
             const hs_remain = hs_pending_len - off;
@@ -934,13 +966,7 @@ fn appendStripVlessHeader(buf: []u8, len: *usize, chunk: []const u8, stripped: *
 /// Returns true once a complete response is buffered; it must match `expect`.
 fn grpcProbeHttpReady(buf: []u8, len: *usize, chunk: []const u8, stripped: *bool, expect: util.ProbeReply) !bool {
     try appendStripVlessHeader(buf, len, chunk, stripped);
-    const lens = switch (util.httpResponseState(buf[0..len.*])) {
-        .incomplete, .close_delimited => return false,
-        .malformed => return error.ProbeResponseMismatch,
-        .complete => |lens| lens,
-    };
-    try expect.check(buf[0..lens.total]);
-    return true;
+    return util.takeProbeResponse(buf, len, expect, false);
 }
 
 fn appendGrpcRead(gather: []u8, gather_len: *usize, chunk: []const u8) !void {
@@ -1028,7 +1054,6 @@ fn runGrpcProbe(
     var settings_seen = false;
     var request_sent = false;
     var saw_headers_ok = false;
-    var saw_grpc_data = false;
     var stripped_vless = false;
     var warmup_done = false;
     // Byte offset in `gather`: DATA/HEADERS with frame start < this are warmup leftovers
@@ -1043,11 +1068,7 @@ fn runGrpcProbe(
     var header_storage: [32768]u8 = undefined;
     var header_block = grpc_gun.HeaderBlock.init(&header_storage);
     while (true) {
-        const n = conn.readApp(app_buf[0..]) catch |err| {
-            // Do not treat peer-close after warmup as success — that hides dest-fallback
-            // and one-shot false positives.
-            return err;
-        };
+        const n = try conn.readApp(app_buf[0..]);
         try appendGrpcRead(&gather, &gather_len, app_buf[0..n]);
 
         var off: usize = 0;
@@ -1075,8 +1096,6 @@ fn runGrpcProbe(
                     settings_seen = true;
                     fl += try grpc_gun.buildStreamOpen(flight[fl..], service_name, authority, request);
                     request_sent = true;
-                    saw_headers_ok = false;
-                    saw_grpc_data = false;
                 }
                 try conn.writeApp(flight[0..fl]);
                 // The stream open carries the VLESS request and the warmup.
@@ -1087,14 +1106,19 @@ fn runGrpcProbe(
                 try conn.writeApp(pong[0..pong_len]);
             } else if (inflight and (ftyp == 0x00 or ftyp == 0x01 or ftyp == 0x09)) {
                 // Warmup leftover DATA / headers — ack framing only.
+                if (ftyp != 0x09 and (fflags & 0x01) != 0) return error.GrpcStreamEnded;
             } else if ((ftyp == 0x01 or ftyp == 0x09) and request_sent) {
-                // Each complete header block decides on its own: a later non-200 must not
-                // inherit the warmup's 200 and let the DATA after it through.
                 if (try header_block.push(payload, fflags, ftyp == 0x09)) |headers| {
-                    saw_headers_ok = headers.status_ok;
-                    if (headers.end_stream and !saw_headers_ok) return error.GrpcStreamEnded;
-                    // Empty 200 before any DATA is a failure; trailer END_STREAM after DATA is normal.
-                    if (headers.end_stream and saw_headers_ok and !saw_grpc_data) return error.GrpcEmptyResponse;
+                    if (saw_headers_ok) {
+                        if (!headers.end_stream) return error.InvalidHttp2Framing;
+                        if (!headers.grpc_ok or headers.http_status_ok != null) return error.GrpcBadStatus;
+                        if (warmup_done and grpc_stream_len == 0 and
+                            try util.takeProbeResponse(&http_buf, &http_len, target.steady_reply, true))
+                            return netutil.elapsedMs(start, io);
+                        return error.GrpcStreamEnded;
+                    }
+                    saw_headers_ok = headers.http_status_ok orelse false;
+                    if (headers.end_stream) return if (saw_headers_ok) error.GrpcEmptyResponse else error.GrpcStreamEnded;
                 }
             } else if (ftyp == 0x00 and request_sent) {
                 // The gun stream's one HEADERS must carry `:status 200` before any DATA:
@@ -1104,18 +1128,18 @@ fn runGrpcProbe(
                 if (grpc_stream_len + data.len > grpc_stream.len) return error.BufferTooSmall;
                 @memcpy(grpc_stream[grpc_stream_len..][0..data.len], data);
                 grpc_stream_len += data.len;
+                const end_stream = (fflags & 0x01) != 0;
 
                 while (try grpc_gun.completeGrpcFrameLen(grpc_stream[0..grpc_stream_len])) |total| {
                     const msg = try grpc_gun.vlessFromGrpcData(grpc_stream[0..total]);
-                    saw_grpc_data = true;
                     var finished_warmup = false;
                     if (!warmup_done) {
                         if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, .{ .trace = util.PROBE_UA_WARMUP })) {
+                            if (end_stream) return error.GrpcStreamEnded;
                             warmup_done = true;
                             finished_warmup = true;
                             // Fresh buffer for the keep-alive request; VLESS header already stripped.
                             http_len = 0;
-                            saw_grpc_data = false;
                             var hunk: [256]u8 = undefined;
                             const hunk_len = try grpc_gun.wrapHunk(&hunk, target.steady);
                             var grpc_msg: [320]u8 = undefined;
@@ -1136,6 +1160,12 @@ fn runGrpcProbe(
                         break;
                     }
                     shiftDown(&grpc_stream, &grpc_stream_len, total);
+                }
+                if (end_stream) {
+                    if (warmup_done and grpc_stream_len == 0 and
+                        try util.takeProbeResponse(&http_buf, &http_len, target.steady_reply, true))
+                        return netutil.elapsedMs(start, io);
+                    return error.GrpcStreamEnded;
                 }
             } else if (ftyp == 0x03) {
                 if (frame_len >= 4) {
@@ -1898,10 +1928,13 @@ const test_grpc_headers_200 = [_]u8{ 0, 0, 1, 0x01, 0x04, 0, 0, 0, 1, 0x88 };
 
 /// One gun DATA frame carrying a Cloudflare trace response for `uag`, optionally
 /// prefixed with the empty VLESS response header (only the first response carries it).
-fn testGunData(out: []u8, comptime uag: []const u8, vless_hdr: bool) !usize {
+fn testGunData(out: []u8, comptime uag: []const u8, vless_hdr: bool, content_length: bool, end_stream: bool) !usize {
     const body = std.fmt.comptimePrint("fl=1\nvisit_scheme=http\nuag={s}\n", .{uag});
     var resp_buf: [256]u8 = undefined;
-    const resp = try std.fmt.bufPrint(&resp_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    const resp = if (content_length)
+        try std.fmt.bufPrint(&resp_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body })
+    else
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" ++ body;
     var msg: [512]u8 = undefined;
     var mlen: usize = 0;
     if (vless_hdr) {
@@ -1915,7 +1948,7 @@ fn testGunData(out: []u8, comptime uag: []const u8, vless_hdr: bool) !usize {
     const hlen = try grpc_gun.wrapHunk(&hunk, msg[0..mlen]);
     var grpc: [700]u8 = undefined;
     const glen = try grpc_gun.wrapGrpc(&grpc, hunk[0..hlen]);
-    return grpc_gun.buildDataFrame(out, 1, grpc[0..glen], false);
+    return grpc_gun.buildDataFrame(out, 1, grpc[0..glen], end_stream);
 }
 
 test "runGrpcProbe ignores pipelined steady bytes until the steady write" {
@@ -1925,14 +1958,14 @@ test "runGrpcProbe ignores pipelined steady bytes until the steady write" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var warm: [256]u8 = undefined;
-    const warm_len = try testGunData(&warm, util.PROBE_UA_WARMUP, true);
+    const warm_len = try testGunData(&warm, util.PROBE_UA_WARMUP, true, true, false);
     var steady: [256]u8 = undefined;
-    const steady_len = try testGunData(&steady, util.PROBE_UA_STEADY, false);
+    const steady_len = try testGunData(&steady, util.PROBE_UA_STEADY, false, true, false);
     var pipelined: [512]u8 = undefined;
     @memcpy(pipelined[0..warm_len], warm[0..warm_len]);
     @memcpy(pipelined[warm_len..][0..steady_len], steady[0..steady_len]);
     var genuine: [256]u8 = undefined;
-    const genuine_len = try testGunData(&genuine, util.PROBE_UA_STEADY, false);
+    const genuine_len = try testGunData(&genuine, util.PROBE_UA_STEADY, false, true, false);
 
     const reads = [_][]const u8{
         &test_grpc_settings,
@@ -1960,9 +1993,9 @@ test "runGrpcProbe fails closed when only pipelined steady bytes remain" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var warm: [256]u8 = undefined;
-    const warm_len = try testGunData(&warm, util.PROBE_UA_WARMUP, true);
+    const warm_len = try testGunData(&warm, util.PROBE_UA_WARMUP, true, true, false);
     var steady: [256]u8 = undefined;
-    const steady_len = try testGunData(&steady, util.PROBE_UA_STEADY, false);
+    const steady_len = try testGunData(&steady, util.PROBE_UA_STEADY, false, true, false);
     var pipelined: [512]u8 = undefined;
     @memcpy(pipelined[0..warm_len], warm[0..warm_len]);
     @memcpy(pipelined[warm_len..][0..steady_len], steady[0..steady_len]);
@@ -1983,6 +2016,43 @@ test "runGrpcProbe fails closed when only pipelined steady bytes remain" {
         runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage),
     );
     try std.testing.expectEqual(@as(usize, 2), conn.writes.items.len);
+}
+
+test "runGrpcProbe validates a close-delimited steady response at HTTP/2 END_STREAM" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var warm: [256]u8 = undefined;
+    const warm_len = try testGunData(&warm, util.PROBE_UA_WARMUP, true, true, false);
+    const trailers_prefix = [_]u8{ 0, 0, 15, 0x01, 0x05, 0, 0, 0, 1 };
+    const ok_trailers = trailers_prefix ++ "\x00\x0bgrpc-status\x01" ++ "0";
+    const failed_trailers = trailers_prefix ++ "\x00\x0bgrpc-status\x01" ++ "1";
+    const cases = [_]struct { end_data: bool, trailers: ?[]const u8, err: ?anyerror }{
+        .{ .end_data = true, .trailers = null, .err = null },
+        .{ .end_data = false, .trailers = ok_trailers, .err = null },
+        .{ .end_data = false, .trailers = failed_trailers, .err = error.GrpcBadStatus },
+        .{ .end_data = false, .trailers = null, .err = error.EndOfStream },
+    };
+    for (cases) |case| {
+        var steady: [256]u8 = undefined;
+        const steady_len = try testGunData(&steady, util.PROBE_UA_STEADY, false, false, case.end_data);
+        const reads = [_][]const u8{
+            &test_grpc_settings,
+            &test_grpc_headers_200,
+            warm[0..warm_len],
+            steady[0..steady_len],
+            case.trailers orelse &.{},
+        };
+        var conn: ScriptedGrpcConn = .{ .reads = reads[0..if (case.trailers == null) 4 else 5], .gpa = gpa };
+        defer conn.deinit();
+        var stage: util.Stage = .setup;
+
+        const result = runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage);
+        if (case.err) |err| {
+            try std.testing.expectError(err, result);
+        } else {
+            _ = try result;
+        }
+    }
 }
 
 test "VisionPipe drains a frame completed by a full read after incomplete data" {
@@ -2339,7 +2409,7 @@ test "verifyRealityCert accepts the HMAC-signed REALITY leaf" {
     var buf: [256]u8 = undefined;
 
     // Act / Assert
-    try verifyRealityCert(testCertMsg(&buf, &leaf), &TEST_AUTH_KEY);
+    _ = try verifyRealityCert(testCertMsg(&buf, &leaf), &TEST_AUTH_KEY);
 }
 
 test "verifyRealityCert rejects a dest-site leaf and malformed messages" {
@@ -2379,8 +2449,23 @@ test "verifyRealityCert fails closed on every truncated or corrupted leaf" {
     for (0..leaf.len) |at| {
         var bad = leaf;
         bad[at] ^= 0xff;
-        verifyRealityCert(testCertMsg(&buf, &bad), &TEST_AUTH_KEY) catch {};
+        _ = verifyRealityCert(testCertMsg(&buf, &bad), &TEST_AUTH_KEY) catch continue;
     }
+}
+
+test "verifyRealityCertificateSignature checks the TLS transcript" {
+    const seed: [Ed25519.KeyPair.seed_length]u8 = @splat(0x42);
+    const key = try Ed25519.KeyPair.generateDeterministic(seed);
+    var transcript = Sha256.init(.{});
+    transcript.update("handshake transcript");
+    var msg: [4 + Ed25519.Signature.encoded_length]u8 = undefined;
+    std.mem.writeInt(u16, msg[0..2], @backingInt(tls.SignatureScheme.ed25519), .big);
+    std.mem.writeInt(u16, msg[2..4], Ed25519.Signature.encoded_length, .big);
+    msg[4..].* = (try key.sign(&certificateVerifyInput(transcript), null)).toBytes();
+
+    try verifyRealityCertificateSignature(&msg, key.public_key, transcript);
+    transcript.update("different handshake bytes");
+    try std.testing.expectError(error.TlsCertificateVerifyFailed, verifyRealityCertificateSignature(&msg, key.public_key, transcript));
 }
 
 test "decodePublicKey length" {
@@ -2464,6 +2549,9 @@ const HandshakeTestPeer = struct {
         const server_key = hkdfExpandLabel(16, &server_hs, "key", "");
         const server_iv = hkdfExpandLabel(12, &server_hs, "iv", "");
 
+        const encrypted_extensions = [_]u8{ @backingInt(tls.HandshakeType.encrypted_extensions), 0, 0, 2, 0, 0 };
+        transcript.update(&encrypted_extensions);
+
         var leaf: [TEST_REALITY_LEAF_HEX.len / 2]u8 = undefined;
         _ = try std.fmt.hexToBytes(&leaf, TEST_REALITY_LEAF_HEX);
         const parsed_leaf = try parseEd25519Leaf(&leaf);
@@ -2479,6 +2567,18 @@ const HandshakeTestPeer = struct {
         const cert_msg_len = 4 + cert_body_len;
         transcript.update(cert_msg[0..cert_msg_len]);
 
+        var seed: [Ed25519.KeyPair.seed_length]u8 = undefined;
+        for (&seed, 0..) |*byte, i| byte.* = @intCast(i);
+        const leaf_key = try Ed25519.KeyPair.generateDeterministic(seed);
+        const verify_len = 4 + Ed25519.Signature.encoded_length;
+        var verify_msg: [4 + verify_len]u8 = undefined;
+        verify_msg[0] = @backingInt(tls.HandshakeType.certificate_verify);
+        std.mem.writeInt(u24, verify_msg[1..4], verify_len, .big);
+        std.mem.writeInt(u16, verify_msg[4..6], @backingInt(tls.SignatureScheme.ed25519), .big);
+        std.mem.writeInt(u16, verify_msg[6..8], Ed25519.Signature.encoded_length, .big);
+        verify_msg[8..].* = (try leaf_key.sign(&certificateVerifyInput(transcript), null)).toBytes();
+        transcript.update(&verify_msg);
+
         var pre_fin_hash: [32]u8 = undefined;
         var pre_fin_hasher = transcript;
         pre_fin_hasher.final(&pre_fin_hash);
@@ -2489,12 +2589,14 @@ const HandshakeTestPeer = struct {
         @memcpy(fin_msg[4..], &server_verify);
         transcript.update(&fin_msg);
 
-        var flight: [512]u8 = undefined;
-        @memcpy(flight[0..cert_msg_len], cert_msg[0..cert_msg_len]);
-        @memcpy(flight[cert_msg_len..][0..fin_msg.len], &fin_msg);
-        const flight_len = cert_msg_len + fin_msg.len;
+        var flight_buf: [512]u8 = undefined;
+        var flight: Io.Writer = .fixed(&flight_buf);
+        try flight.writeAll(&encrypted_extensions);
+        try flight.writeAll(cert_msg[0..cert_msg_len]);
+        try flight.writeAll(&verify_msg);
+        try flight.writeAll(&fin_msg);
         var sealed: [1024]u8 = undefined;
-        const sealed_len = appendSealedRecord(&sealed, &server_key, &server_iv, 0, 22, flight[0..flight_len]);
+        const sealed_len = appendSealedRecord(&sealed, &server_key, &server_iv, 0, 22, flight.buffered());
         try writer.interface.writeAll(sealed[0..sealed_len]);
         try writer.interface.flush();
 
