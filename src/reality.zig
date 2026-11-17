@@ -1006,6 +1006,22 @@ pub fn probeVless(
     const plen = try grpc_gun.buildClientPrefaceSettings(&preface);
     try rc.writeApp(preface[0..plen]);
 
+    return runGrpcProbe(&rc, io, start, target, vless_buf[0..vless_len], service_name, authority, stage);
+}
+
+/// Drive the gRPC gun frame loop over `conn` (`readApp` / `writeApp`). Split from
+/// `probeVless` so the warmup/steady discard guard can be tested against a scripted
+/// byte source without a live REALITY peer.
+fn runGrpcProbe(
+    conn: anytype,
+    io: Io,
+    start: i128,
+    target: util.Target,
+    request: []const u8,
+    service_name: []const u8,
+    authority: []const u8,
+    stage: *util.Stage,
+) !u64 {
     var app_buf: [GRPC_MAX_FRAME_PAYLOAD_LEN]u8 = undefined;
     var gather: [GRPC_GATHER_BUF_LEN]u8 = undefined;
     var gather_len: usize = 0;
@@ -1027,7 +1043,7 @@ pub fn probeVless(
     var header_storage: [32768]u8 = undefined;
     var header_block = grpc_gun.HeaderBlock.init(&header_storage);
     while (true) {
-        const n = rc.readApp(app_buf[0..]) catch |err| {
+        const n = conn.readApp(app_buf[0..]) catch |err| {
             // Do not treat peer-close after warmup as success — that hides dest-fallback
             // and one-shot false positives.
             return err;
@@ -1057,18 +1073,18 @@ pub fn probeVless(
                 fl += try grpc_gun.buildSettingsAck(flight[fl..]);
                 if (!settings_seen) {
                     settings_seen = true;
-                    fl += try grpc_gun.buildStreamOpen(flight[fl..], service_name, authority, vless_buf[0..vless_len]);
+                    fl += try grpc_gun.buildStreamOpen(flight[fl..], service_name, authority, request);
                     request_sent = true;
                     saw_headers_ok = false;
                     saw_grpc_data = false;
                 }
-                try rc.writeApp(flight[0..fl]);
+                try conn.writeApp(flight[0..fl]);
                 // The stream open carries the VLESS request and the warmup.
                 if (request_sent) stage.* = .reply;
             } else if (ftyp == 0x06 and (fflags & 0x01) == 0 and frame_len == 8) {
                 var pong: [17]u8 = undefined;
                 const pong_len = try grpc_gun.buildPingAck(&pong, payload[0..8]);
-                try rc.writeApp(pong[0..pong_len]);
+                try conn.writeApp(pong[0..pong_len]);
             } else if (inflight and (ftyp == 0x00 or ftyp == 0x01 or ftyp == 0x09)) {
                 // Warmup leftover DATA / headers — ack framing only.
             } else if ((ftyp == 0x01 or ftyp == 0x09) and request_sent) {
@@ -1106,7 +1122,7 @@ pub fn probeVless(
                             const glen = try grpc_gun.wrapGrpc(&grpc_msg, hunk[0..hunk_len]);
                             var data_frame: [384]u8 = undefined;
                             const dlen = try grpc_gun.buildDataFrame(&data_frame, 1, grpc_msg[0..glen], false);
-                            try rc.writeApp(data_frame[0..dlen]);
+                            try conn.writeApp(data_frame[0..dlen]);
                             // Bytes already in `gather` cannot be a reply to the steady write.
                             discard_data_before = gather_len;
                         }
@@ -1843,6 +1859,130 @@ test "gRPC stream validation accepts valid connection frames" {
     // WINDOW_UPDATE is valid at connection and stream scope; extensions are ignored.
     for ([_]u32{ 0, 1, 3 }) |stream_id| try validateGrpcFrameStream(0x08, stream_id);
     try validateGrpcFrameStream(0xff, 3);
+}
+
+/// A `conn` for `runGrpcProbe` that replays scripted `readApp` chunks and records
+/// every `writeApp`, so the warmup/steady discard guard can be tested without a peer.
+const ScriptedGrpcConn = struct {
+    reads: []const []const u8,
+    read_i: usize = 0,
+    writes: std.ArrayList([]const u8) = .empty,
+    gpa: std.mem.Allocator,
+    tail_err: anyerror = error.EndOfStream,
+
+    fn deinit(self: *@This()) void {
+        for (self.writes.items) |w| self.gpa.free(w);
+        self.writes.deinit(self.gpa);
+    }
+
+    fn readApp(self: *@This(), out: []u8) !usize {
+        if (self.read_i >= self.reads.len) return self.tail_err;
+        const chunk = self.reads[self.read_i];
+        self.read_i += 1;
+        const n = @min(chunk.len, out.len);
+        @memcpy(out[0..n], chunk[0..n]);
+        return n;
+    }
+
+    fn writeApp(self: *@This(), data: []const u8) !void {
+        const copy = try self.gpa.dupe(u8, data);
+        errdefer self.gpa.free(copy);
+        try self.writes.append(self.gpa, copy);
+    }
+};
+
+// Empty server SETTINGS (no ACK) and a HEADERS block carrying only `:status 200`
+// (static index 8) with END_HEADERS, on stream 1.
+const test_grpc_settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
+const test_grpc_headers_200 = [_]u8{ 0, 0, 1, 0x01, 0x04, 0, 0, 0, 1, 0x88 };
+
+/// One gun DATA frame carrying a Cloudflare trace response for `uag`, optionally
+/// prefixed with the empty VLESS response header (only the first response carries it).
+fn testGunData(out: []u8, comptime uag: []const u8, vless_hdr: bool) !usize {
+    const body = std.fmt.comptimePrint("fl=1\nvisit_scheme=http\nuag={s}\n", .{uag});
+    var resp_buf: [256]u8 = undefined;
+    const resp = try std.fmt.bufPrint(&resp_buf, "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    var msg: [512]u8 = undefined;
+    var mlen: usize = 0;
+    if (vless_hdr) {
+        msg[0] = 0;
+        msg[1] = 0;
+        mlen = 2;
+    }
+    @memcpy(msg[mlen..][0..resp.len], resp);
+    mlen += resp.len;
+    var hunk: [600]u8 = undefined;
+    const hlen = try grpc_gun.wrapHunk(&hunk, msg[0..mlen]);
+    var grpc: [700]u8 = undefined;
+    const glen = try grpc_gun.wrapGrpc(&grpc, hunk[0..hlen]);
+    return grpc_gun.buildDataFrame(out, 1, grpc[0..glen], false);
+}
+
+test "runGrpcProbe ignores pipelined steady bytes until the steady write" {
+    // Arrange: warmup plus a steady-looking response pipelined in the SAME read, so
+    // both sit in `gather` before the steady request is written; a genuine steady
+    // response follows in a later read.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var warm: [256]u8 = undefined;
+    const warm_len = try testGunData(&warm, util.PROBE_UA_WARMUP, true);
+    var steady: [256]u8 = undefined;
+    const steady_len = try testGunData(&steady, util.PROBE_UA_STEADY, false);
+    var pipelined: [512]u8 = undefined;
+    @memcpy(pipelined[0..warm_len], warm[0..warm_len]);
+    @memcpy(pipelined[warm_len..][0..steady_len], steady[0..steady_len]);
+    var genuine: [256]u8 = undefined;
+    const genuine_len = try testGunData(&genuine, util.PROBE_UA_STEADY, false);
+
+    const reads = [_][]const u8{
+        &test_grpc_settings,
+        &test_grpc_headers_200,
+        pipelined[0 .. warm_len + steady_len],
+        genuine[0..genuine_len],
+    };
+    var conn: ScriptedGrpcConn = .{ .reads = &reads, .gpa = gpa };
+    defer conn.deinit();
+    var stage: util.Stage = .setup;
+
+    // Act
+    _ = try runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage);
+
+    // Assert: it read the genuine steady reply (did not short-circuit on the
+    // pipelined bytes) and wrote stream-open then the steady request.
+    try std.testing.expectEqual(@as(usize, 4), conn.read_i);
+    try std.testing.expectEqual(@as(usize, 2), conn.writes.items.len);
+    try std.testing.expectEqual(util.Stage.reply, stage);
+}
+
+test "runGrpcProbe fails closed when only pipelined steady bytes remain" {
+    // Arrange: warmup plus a steady-looking response pipelined in one read, and no
+    // genuine steady reply afterwards — the peer resets instead.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var warm: [256]u8 = undefined;
+    const warm_len = try testGunData(&warm, util.PROBE_UA_WARMUP, true);
+    var steady: [256]u8 = undefined;
+    const steady_len = try testGunData(&steady, util.PROBE_UA_STEADY, false);
+    var pipelined: [512]u8 = undefined;
+    @memcpy(pipelined[0..warm_len], warm[0..warm_len]);
+    @memcpy(pipelined[warm_len..][0..steady_len], steady[0..steady_len]);
+
+    const reads = [_][]const u8{
+        &test_grpc_settings,
+        &test_grpc_headers_200,
+        pipelined[0 .. warm_len + steady_len],
+    };
+    var conn: ScriptedGrpcConn = .{ .reads = &reads, .gpa = gpa, .tail_err = error.ConnectionResetByPeer };
+    defer conn.deinit();
+    var stage: util.Stage = .setup;
+
+    // Act / Assert: the pipelined steady bytes were buffered before the steady write,
+    // so they are discarded; with no genuine reply the probe fails, not a false OK.
+    try std.testing.expectError(
+        error.ConnectionResetByPeer,
+        runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage),
+    );
+    try std.testing.expectEqual(@as(usize, 2), conn.writes.items.len);
 }
 
 test "VisionPipe drains a frame completed by a full read after incomplete data" {
