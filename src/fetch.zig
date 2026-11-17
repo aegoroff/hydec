@@ -148,55 +148,73 @@ fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
             return err;
         };
 
-        if (response.head.status.class() == .redirect) {
-            const next = takeHttpsRedirect(gpa, uri, &response, &redirects_left) catch |err| {
+        // Copy Location before anything drains the body: the head buffer may be reused.
+        const loc_copy: ?[]u8 = if (response.head.location) |l| try gpa.dupe(u8, l) else null;
+        defer if (loc_copy) |c| gpa.free(c);
+
+        const hop = decideHop(gpa, uri, response.head.status, loc_copy, &redirects_left) catch |err| {
+            req.deinit();
+            return err;
+        };
+
+        switch (hop) {
+            .follow => |next| {
+                // Drain the redirect body so the next hop starts on a clean connection.
+                const reader = response.reader(&.{});
+                _ = reader.discardRemaining() catch |err| switch (err) {
+                    error.ReadFailed => {
+                        gpa.free(next);
+                        req.deinit();
+                        return response.bodyErr().?;
+                    },
+                };
                 req.deinit();
-                return err;
-            };
-            req.deinit();
-            if (owned_url) |u| gpa.free(u);
-            owned_url = next;
-            current_url = next;
-            continue;
+                if (owned_url) |u| gpa.free(u);
+                owned_url = next;
+                current_url = next;
+                continue;
+            },
+            .body => {
+                defer req.deinit();
+
+                var transfer_buffer: [8 * 1024]u8 = undefined;
+                var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+                var decompress: http.Decompress = undefined;
+                var body_reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
+
+                return try body_reader.allocRemaining(gpa, .limited(4 * 1024 * 1024));
+            },
         }
-
-        if (response.head.status != .ok) {
-            req.deinit();
-            return error.HttpStatusNotOk;
-        }
-
-        defer req.deinit();
-
-        var transfer_buffer: [8 * 1024]u8 = undefined;
-        var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-        var decompress: http.Decompress = undefined;
-        var body_reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
-
-        return try body_reader.allocRemaining(gpa, .limited(4 * 1024 * 1024));
     }
 }
 
-/// Follow one redirect only when the resolved target is HTTPS. Returns an owned absolute URL.
-fn takeHttpsRedirect(
+/// What to do with one response hop.
+const Hop = union(enum) {
+    /// A 200: read the body.
+    body,
+    /// A redirect: follow this owned absolute HTTPS URL.
+    follow: []u8,
+};
+
+/// Pure per-hop decision: read a 200 body, follow a budget- and HTTPS-checked
+/// redirect, or fail. No socket I/O — `location` is the copied Location header
+/// (or null) and must outlive the call. The caller drains the body and owns the
+/// returned URL.
+fn decideHop(
     gpa: std.mem.Allocator,
     base: std.Uri,
-    response: *http.Client.Response,
+    status: std.http.Status,
+    location: ?[]const u8,
     redirects_left: *u16,
-) ![]u8 {
-    if (redirects_left.* == 0) return error.TooManyHttpRedirects;
-    redirects_left.* -= 1;
-
-    const location = response.head.location orelse return error.HttpRedirectLocationMissing;
-    const loc_copy = try gpa.dupe(u8, location);
-    defer gpa.free(loc_copy);
-
-    // Discard body before resolve — Location pointers into the head buffer are invalidated.
-    const reader = response.reader(&.{});
-    _ = reader.discardRemaining() catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
-    };
-
-    return resolveHttpsRedirect(gpa, base, loc_copy);
+) !Hop {
+    if (status.class() == .redirect) {
+        if (redirects_left.* == 0) return error.TooManyHttpRedirects;
+        redirects_left.* -= 1;
+        const loc = location orelse return error.HttpRedirectLocationMissing;
+        return .{ .follow = try resolveHttpsRedirect(gpa, base, loc) };
+    }
+    if (status != .ok) return error.HttpStatusNotOk;
+    return .body;
 }
 
 /// Resolve `location` against `base`; only an HTTPS result is kept. Returns an owned
@@ -261,6 +279,59 @@ test "resolveHttpsRedirect keeps HTTPS targets and rejects plaintext hops" {
         defer gpa.free(got);
         try std.testing.expectEqualStrings(case[1], got);
     }
+}
+
+test "decideHop reads a 200 body without spending redirect budget" {
+    const gpa = std.testing.allocator;
+    const base = try std.Uri.parse("https://sub.example/s/abc");
+    var left: u16 = 5;
+    const hop = try decideHop(gpa, base, .ok, null, &left);
+    try std.testing.expect(hop == .body);
+    try std.testing.expectEqual(@as(u16, 5), left);
+}
+
+test "decideHop rejects a non-OK non-redirect status" {
+    const gpa = std.testing.allocator;
+    const base = try std.Uri.parse("https://sub.example/s/abc");
+    var left: u16 = 5;
+    try std.testing.expectError(error.HttpStatusNotOk, decideHop(gpa, base, .not_found, null, &left));
+    try std.testing.expectEqual(@as(u16, 5), left);
+}
+
+test "decideHop follows an HTTPS redirect and spends one budget" {
+    const gpa = std.testing.allocator;
+    const base = try std.Uri.parse("https://sub.example/s/abc?x=1");
+    var left: u16 = 5;
+    const hop = try decideHop(gpa, base, .found, "/s/def", &left);
+    const next = switch (hop) {
+        .follow => |n| n,
+        .body => return error.TestUnexpectedResult,
+    };
+    defer gpa.free(next);
+    try std.testing.expectEqualStrings("https://sub.example/s/def", next);
+    try std.testing.expectEqual(@as(u16, 4), left);
+}
+
+test "decideHop rejects a plaintext redirect target" {
+    const gpa = std.testing.allocator;
+    const base = try std.Uri.parse("https://sub.example/s/abc");
+    var left: u16 = 5;
+    try std.testing.expectError(error.InsecureSubscriptionUrl, decideHop(gpa, base, .found, "http://evil.example/s", &left));
+}
+
+test "decideHop rejects a redirect without a Location" {
+    const gpa = std.testing.allocator;
+    const base = try std.Uri.parse("https://sub.example/s/abc");
+    var left: u16 = 5;
+    try std.testing.expectError(error.HttpRedirectLocationMissing, decideHop(gpa, base, .found, null, &left));
+}
+
+test "decideHop enforces the redirect budget" {
+    const gpa = std.testing.allocator;
+    const base = try std.Uri.parse("https://sub.example/s/abc");
+    var left: u16 = 0;
+    try std.testing.expectError(error.TooManyHttpRedirects, decideHop(gpa, base, .found, "/s/def", &left));
+    try std.testing.expectEqual(@as(u16, 0), left);
 }
 
 test "ensureHttpsScheme rejects http redirect targets" {
