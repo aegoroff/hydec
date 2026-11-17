@@ -84,7 +84,7 @@ const Shared = struct {
     prefer_stable: bool,
     check_volume: bool,
     timeout_secs: u32,
-    /// Optional interface/source-IP spec forwarded to `connectHostPort` (`null` = default).
+    /// Optional interface/source-IP spec forwarded to `connectHostPortWithAddresses` (`null` = default).
     bind: ?[]const u8,
     mutex: Io.Mutex = .init,
     /// Fastest successful probe per preference class.
@@ -280,7 +280,9 @@ fn collectSamples(prober: anytype, samples: []u64) !usize {
 }
 
 /// Run `PROBE_ATTEMPTS` full probes (one retry on a transient error).
-/// With `check_volume`, then one untimed `util.VOLUME_TARGET` download (see `checkVolume`).
+/// With `check_volume`, then one unretried `util.VOLUME_TARGET` download under the full
+/// timeout; its duration is not counted toward latency (a post-connect timeout becomes
+/// `VolumeStalled`, see `volumeError`).
 /// On success returns the median latency and the sample spread; on failure `stage`
 /// holds how far the failing attempt got.
 pub fn probeLatency(

@@ -8,7 +8,7 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 
 | Item | Value |
 |------|-------|
-| Language | Zig **0.17.0** (see `mise.toml`) |
+| Language | Zig **0.17.1** (see `mise.toml`) |
 | CLI parsing | [zig-cli](https://github.com/zig-utils/zig-cli) |
 | License | MIT |
 | Default version | `0.1.0-dev` (`-Dversion=...` / `build_options.version`) |
@@ -27,7 +27,7 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 1. Fetch subscription URL (**HTTPS only**; plaintext schemes → `InsecureSubscriptionUrl`). Redirects are followed only while the resolved target stays HTTPS; `http://` hops are rejected. Scheme is normalized to lowercase for `std.http.Client`.
 2. Base64-decode body; iterate URI lines.
 3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**. Every entry is probed: a failure (even a connect timeout) never skips the host's remaining entries.
-4. Each candidate: **3 probes**; one transient failure (timeout / reset / EOF, `isTransient`) is retried once, any other error fails it immediately; keep **median** latency per preference class. With `--check-volume`, a candidate that passed gets one more untimed, unretried attempt: tunnel to `util.VOLUME_DOMAIN` (`speed.cloudflare.com`), trace warmup, then a `VOLUME_BYTES` (40000) download that must arrive whole (`util.VOLUME_TARGET`); a timeout after the connection is established (`Timeout` / `ConnectionTimedOut`) is `VolumeStalled`, while a connect timeout stays `ConnectTimeout`; a well-formed non-200 download reply is `VolumeRefused`, logged and ignored only after a successful warmup (Cloudflare refused, not the node); it fails VLESS TCP, which has no warmup. Latency = full attempt from dial to the steady reply (handshake, WS upgrade, test requests — warmup + steady, or one request after the inner TLS for vision); Trojan's CA bundle load is excluded, but still counts against `-t`.
+4. Each candidate: **3 probes**; one transient failure (timeout / reset / EOF, `isTransient`) is retried once, any other error fails it immediately; keep **median** latency per preference class. With `--check-volume`, a candidate that passed gets one more unretried attempt (under the full `-t` timeout, not counted toward latency): tunnel to `util.VOLUME_DOMAIN` (`speed.cloudflare.com`), trace warmup, then a `VOLUME_BYTES` (40000) download that must arrive whole (`util.VOLUME_TARGET`); a timeout after the connection is established (`Timeout` / `ConnectionTimedOut`) is `VolumeStalled`, while a connect timeout stays `ConnectTimeout`; a well-formed non-200 download reply is `VolumeRefused`, logged and ignored only after a successful warmup (Cloudflare refused, not the node); it fails VLESS TCP, which has no warmup. Latency = full attempt from dial to the steady reply (handshake, WS upgrade, test requests — warmup + steady, or one request after the inner TLS for vision); Trojan's CA bundle load is excluded, but still counts against `-t`.
 5. Rank with `selectBestClass` according to `--strategy` (`hydec` default, `fastest`, `strict`). `hydec`: prefer VLESS² (gRPC) / Trojan → VLESS³ (TCP) → SS, where VLESS² and Trojan are one tier represented by the faster of the two (VLESS² on a tie). Demote the VLESS²/Trojan tier→VLESS³ when it is **>2×** slower; tier→SS when **≥3×** (then keep VLESS³ unless it is **>3×** slower than SS); with no VLESS²/Trojan, demote VLESS³→SS when **>2×** slower. Each demotion also needs an absolute gap of **>15 ms** (`MIN_DEMOTE_GAP_MS`). `fastest`: lowest latency (tie → higher class). `strict`: never demote. `--prefer-stable` (orthogonal to the strategy) ranks by `Rank`: the worst sample instead of the median, and a candidate that needed a retry loses to every clean one; `selectBestRanked` lets classes whose best was retried compete only when no class has a clean best.
 6. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
 
@@ -67,7 +67,7 @@ Optional bind spec for **probe** sockets only (subscription fetch unchanged):
 
 ## Build and run
 
-Use **mise** for Zig 0.17.0, or install it manually.
+Use **mise** for Zig 0.17.1, or install it manually.
 
 ```bash
 zig build
@@ -100,7 +100,7 @@ Binary: `zig-out/bin/hydec` (or `--prefix-exe-dir`).
 - **Match existing style.** Follow patterns in `src/*.zig` for naming, errors, and allocators.
 - **Use std library first.** Avoid new dependencies without discussion.
 - **I/O.** Zig 0.17 `std.Io` (`init.io`, `std.Io.File`, `std.Io.Clock`, `std.Io.Writer`, `Io.Mutex`). Do not revert to pre-0.16 APIs; on 0.17 avoid std decls marked `Deprecated`.
-- **Networking.** Prefer `netutil` helpers for connect/timeouts/bind. IP connects use non-blocking + `poll` (Zig `IpAddress.connect` timeout is still TODO on Linux). Thread optional `-I` bind through `connectHostPort` → `connectIpUntil` / `applyBind`. Blocking `std.crypto.tls` needs `DeadlineShutdown`, not only poll.
+- **Networking.** Prefer `netutil` helpers for connect/timeouts/bind. IP connects use non-blocking + `poll` (Zig `IpAddress.connect` timeout is still TODO on Linux). Thread optional `-I` bind through `connectHostPortWithAddresses` → `connectIpUntil` / `applyBind`. Blocking `std.crypto.tls` needs `DeadlineShutdown`, not only poll.
 - **Concurrency.** Parallelism is **by host** in `probe.zig` (`std.Thread` + `Io.Mutex`). Do not probe the same IP concurrently.
 - **Comments.** Only for non-obvious logic.
 - **Tests.** `test` blocks in the same file as the code. Run `zig build test` before finishing.

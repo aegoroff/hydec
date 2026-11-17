@@ -4,22 +4,13 @@ const Io = std.Io;
 const posix = std.posix;
 const util = @import("util.zig");
 
+/// Dial previously resolved addresses when available; an empty list means resolve again.
+///
 /// Optional bind spec for outbound probe sockets (see `applyBind`).
 /// `null` → kernel chooses the source (unchanged behavior). An empty spec is
 /// rejected as `error.EmptyInterfaceName`. Otherwise either an IP literal
 /// (`bind()` to source IP) or, on Linux, an interface name (`SO_BINDTODEVICE`;
 /// needs CAP_NET_RAW).
-pub fn connectHostPort(
-    io: Io,
-    host: []const u8,
-    port: u16,
-    timeout_secs: u32,
-    bind: ?[]const u8,
-) !Io.net.Stream {
-    return connectHostPortWithAddresses(io, host, port, timeout_secs, bind, null);
-}
-
-/// Dial previously resolved addresses when available; an empty list means resolve again.
 pub fn connectHostPortWithAddresses(
     io: Io,
     host: []const u8,
@@ -395,7 +386,7 @@ test "hostname dial fails fast when no unit of concurrency is available" {
     const io = std.Io.Threaded.global_single_threaded.io();
     try std.testing.expectError(
         error.SystemResources,
-        connectHostPort(io, "localhost", 1, 3, null),
+        connectHostPortWithAddresses(io, "localhost", 1, 3, null, null),
     );
 }
 
@@ -1189,7 +1180,7 @@ test "DeadlineShutdown unblocks a blocking read on a silent peer" {
         release.store(true, .release);
         peer.join();
     }
-    const stream = try connectHostPort(io, "127.0.0.1", server.socket.address.getPort(), 2, null);
+    const stream = try connectHostPortWithAddresses(io, "127.0.0.1", server.socket.address.getPort(), 2, null, null);
     defer stream.close(io);
     var rbuf: [16]u8 = undefined;
     var r = stream.reader(io, &rbuf);
