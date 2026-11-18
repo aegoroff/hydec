@@ -224,7 +224,8 @@ fn parseSs(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     const rest0 = stripFragment(afterScheme(line));
     const query = if (std.mem.findScalar(u8, rest0, '?')) |q| rest0[q + 1 ..] else "";
     // SIP002: base64(method:password)@host:port
-    if (std.mem.findScalar(u8, rest0, '@')) |at| {
+    // Last '@', as in parseUserAtHost: an unencoded '@' in a plaintext password stays userinfo.
+    if (std.mem.findScalarLast(u8, rest0, '@')) |at| {
         const encoded_user = rest0[0..at];
         // SIP002 allows a bare path between the port and the query:
         // `ss://<b64>@host:port/?plugin=...`.
@@ -444,6 +445,16 @@ test "parse ss sip002 plaintext userinfo" {
         try std.testing.expectEqualStrings(password, p.password.?);
         try std.testing.expectEqual(@as(u16, 8388), p.port);
     }
+}
+
+test "parse ss sip002 keeps an unencoded at-sign inside userinfo" {
+    const gpa = std.testing.allocator;
+    var p = try parse(gpa, "ss://aes-256-gcm:p@ss@192.0.2.10:8388#tag");
+    defer p.deinit(gpa);
+    try std.testing.expectEqualStrings("aes-256-gcm", p.method.?);
+    try std.testing.expectEqualStrings("p@ss", p.password.?);
+    try std.testing.expectEqualStrings("192.0.2.10", p.host);
+    try std.testing.expectEqual(@as(u16, 8388), p.port);
 }
 
 test "parse ss legacy owns host" {
