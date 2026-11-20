@@ -74,12 +74,14 @@ Each candidate is probed **3 times**; one timeout or dropped connection is retri
 | Strategy | Behavior |
 |----------|----------|
 | `hydec` (default) | Protocol preference with 2× / 3× demotion (below) |
-| `fastest` | Lowest latency; on a tie prefer VLESS² → Trojan → VLESS³ → SS |
+| `fastest` | Compare nodes across all protocol classes using the 10% median window |
 | `strict` | Never demote: first successful class in VLESS² → Trojan → VLESS³ → SS |
+
+By default, candidates with median latency at most **10%** above the lowest eligible median are compared by the arithmetic mean of their three successful probes. Ties go to the lower median, then to VLESS² → Trojan → VLESS³ → SS. The window covers all classes with `fastest`, the winning tier with `hydec`, or the winning class with `strict`.
 
 `hydec` winner selection:
 
-1. Prefer the faster of **VLESS²** (REALITY gRPC) and **Trojan** (VLESS² on a tie); below, "VLESS² / Trojan" means that one
+1. Start with the **VLESS²** (REALITY gRPC) / **Trojan** tier. Use its lowest median for the demotion rules below.
 2. Prefer **VLESS³** (REALITY TCP vision) over VLESS² / Trojan when it is **>2×** slower
 3. Prefer **Shadowsocks** over VLESS² / Trojan when it is **≥3×** slower. If SS is eligible and VLESS³ exists, keep VLESS³ unless it is **>3×** slower than SS (even if VLESS² / Trojan was not demoted to VLESS³)
 4. With VLESS³ but no VLESS² / Trojan: prefer VLESS³ unless it is **>2×** slower than SS
@@ -89,7 +91,9 @@ Every demotion in 2–4 also requires the slower class to be more than **15 ms**
 
 #### `--prefer-stable`
 
-The strategy is unchanged; only the number it compares is. Within a class, candidates are ranked by their **worst** probe, so a node at 40 / 42 / 300 ms loses to one at 45 / 46 / 47 ms. A candidate that needed the transient retry ranks behind every one that did not, and a class whose best needed a retry takes part in the strategy only when no class has a clean candidate. The `Best:` line still shows the median. With `-v`, retried probes are marked: `OK: 42ms (min 40, max 300, retry 1) …`.
+The strategy compares each class by its **worst** probe, so a node at 40 / 42 / 300 ms loses to one at 45 / 46 / 47 ms within the same class. Candidates that passed without a retry rank first. A class whose best needed a retry takes part only when every class needed a retry.
+
+The mean breaks ties among candidates with the same retry status and worst probe. The 10% window starts at the lowest eligible median that keeps the strategy's initial winner inside the window. The `Best:` line shows the median, and `-v` marks retried probes (for example, `OK: 42ms (min 40, max 300, retry 1) …`).
 
 #### `--check-volume`
 

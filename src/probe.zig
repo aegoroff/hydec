@@ -12,8 +12,6 @@ const Io = std.Io;
 const Result = struct {
     /// Median latency, for the `Best:` line.
     latency_ms: u64,
-    /// What `considerBest` / `selectBestClass` compare (see `Rank.of`).
-    rank: Rank,
     raw: []const u8,
     /// Owned copy of the host; free with `deinit`.
     host: []u8,
@@ -71,6 +69,7 @@ const WorkItem = struct {
     /// Owned addresses from grouping. An empty slice without an error needs fresh DNS.
     addresses: []Io.net.IpAddress,
     resolution_error: ?anyerror = null,
+    latency: ?Latency = null,
 };
 
 /// Cap concurrent host workers so a large subscription cannot exhaust OS threads.
@@ -80,16 +79,11 @@ const Shared = struct {
     gpa: std.mem.Allocator,
     io: Io,
     verbose: bool,
-    prefer_stable: bool,
     check_volume: bool,
     timeout_secs: u32,
     /// Optional interface/source-IP spec forwarded to `connectHostPortWithAddresses` (`null` = default).
     bind: ?[]const u8,
     mutex: Io.Mutex = .init,
-    /// Fastest successful probe per preference class.
-    best: std.EnumArray(PrefClass, ?Result) = .initFill(null),
-    /// Set when a successful probe could not be recorded as best (host dupe OOM).
-    best_oom: bool = false,
     stats: *Stats,
 
     fn lock(self: *Shared) void {
@@ -98,13 +92,6 @@ const Shared = struct {
 
     fn unlock(self: *Shared) void {
         self.mutex.unlock(self.io);
-    }
-
-    fn deinitBests(self: *Shared) void {
-        for (std.enums.values(PrefClass)) |class| {
-            if (self.best.getPtr(class).*) |*r| r.deinit(self.gpa);
-            self.best.set(class, null);
-        }
     }
 };
 
@@ -229,10 +216,10 @@ pub fn probeOne(
 /// How many failed attempts per candidate may be retried, and only when `isTransient`.
 pub const TRANSIENT_RETRIES: usize = 1;
 
-/// Summary of one candidate's samples. `median_ms` ranks by default; `--prefer-stable`
-/// ranks by `retries`, then `max_ms` (see `Rank.of`).
+/// Summary of one candidate's successful latency probes.
 pub const Latency = struct {
     median_ms: u64,
+    mean_ms: f64,
     min_ms: u64,
     max_ms: u64,
     /// Transient failures retried while collecting the samples.
@@ -243,8 +230,11 @@ pub const Latency = struct {
     pub fn fromSamples(samples: []u64) Latency {
         std.debug.assert(samples.len > 0);
         std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+        var sum: u128 = 0;
+        for (samples) |sample| sum += sample;
         return .{
             .median_ms = samples[samples.len / 2],
+            .mean_ms = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(samples.len)),
             .min_ms = samples[0],
             .max_ms = samples[samples.len - 1],
         };
@@ -496,37 +486,6 @@ fn selectStrictClass(
     return null;
 }
 
-fn considerBest(shared: *Shared, class: PrefClass, latency: Latency, raw: []const u8, host: []const u8) void {
-    const rank = Rank.of(latency, shared.prefer_stable);
-    // Dupe outside the lock so host workers do not serialize on allocation.
-    const host_copy = shared.gpa.dupe(u8, host) catch {
-        shared.lock();
-        defer shared.unlock();
-        shared.best_oom = true;
-        return;
-    };
-
-    shared.lock();
-    const slot = shared.best.getPtr(class);
-    if (slot.*) |cur| {
-        if (!rank.lessThan(cur.rank)) {
-            shared.unlock();
-            shared.gpa.free(host_copy);
-            return;
-        }
-    }
-    // Own a copy: proxy.deinit may free legacy-SS hosts before the caller reads Result.
-    const prev_host: ?[]u8 = if (slot.*) |old| old.host else null;
-    slot.* = .{
-        .latency_ms = latency.median_ms,
-        .rank = rank,
-        .raw = raw,
-        .host = host_copy,
-    };
-    shared.unlock();
-    if (prev_host) |h| shared.gpa.free(h);
-}
-
 /// `", retry N"` when a transient failure was retried, otherwise nothing.
 pub const RetrySuffix = struct {
     retries: usize,
@@ -666,7 +625,6 @@ fn probeGroup(shared: *Shared, items: []WorkItem, phase: enum { grouped, dns_fal
             }
         }
 
-        // Three probes (one transient retry); ranking uses their median.
         var stage: util.Stage = .setup;
         const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, item.addresses, item.resolution_error, shared.check_volume, &stage) catch |err| {
             if (shared.verbose) {
@@ -685,8 +643,7 @@ fn probeGroup(shared: *Shared, items: []WorkItem, phase: enum { grouped, dns_fal
             std.log.info("OK: {d}ms (min {d}, max {d}{f}) {s}{f}", .{ latency.median_ms, latency.min_ms, latency.max_ms, RetrySuffix{ .retries = latency.retries }, proxy.host, NameSuffix{ .name = proxy.name } });
         }
 
-        const class = PrefClass.fromProxy(proxy) orelse continue;
-        considerBest(shared, class, latency, item.raw, proxy.host);
+        item.latency = latency;
     }
 }
 
@@ -1073,13 +1030,11 @@ pub fn findBest(
         .gpa = gpa,
         .io = io,
         .verbose = verbose,
-        .prefer_stable = prefer_stable,
         .check_volume = check_volume,
         .timeout_secs = timeout_secs,
         .bind = bind,
         .stats = stats,
     };
-    errdefer shared.deinitBests();
 
     // Each worker takes the next address set as soon as it is free, so one slow
     // endpoint holds up only its own thread, not a whole batch of others.
@@ -1098,58 +1053,238 @@ pub fn findBest(
 
     // A fresh lookup can land on any IP, so wait for all grouped probes to finish.
     queue.workDeferred(&shared);
-    return finishBest(&shared, strategy);
+    const winner = selectWinner(queue.lists, strategy, prefer_stable) orelse return null;
+    return .{
+        .latency_ms = winner.latency.?.median_ms,
+        .raw = winner.raw,
+        .host = try gpa.dupe(u8, winner.proxy.host),
+    };
 }
 
-fn finishBest(shared: *Shared, strategy: Strategy) !?Result {
-    if (shared.best_oom) {
-        shared.deinitBests();
-        return error.OutOfMemory;
-    }
-
+fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, prefer_stable: bool) ?*const WorkItem {
     var ranks: std.EnumArray(PrefClass, ?Rank) = .initFill(null);
-    for (std.enums.values(PrefClass)) |class| {
-        if (shared.best.get(class)) |r| ranks.set(class, r.rank);
+    var best: std.EnumArray(PrefClass, ?*const WorkItem) = .initFill(null);
+    for (lists) |list| {
+        for (list.items) |*item| {
+            const latency = item.latency orelse continue;
+            const class = PrefClass.fromProxy(item.proxy) orelse continue;
+            const rank = Rank.of(latency, prefer_stable);
+            if (ranks.get(class)) |current| {
+                if (current.lessThan(rank)) continue;
+                if (std.meta.eql(rank, current) and latency.median_ms >= best.get(class).?.latency.?.median_ms) continue;
+            }
+            ranks.set(class, rank);
+            best.set(class, item);
+        }
     }
-    const chosen = selectBestRanked(strategy, ranks) orelse {
-        shared.deinitBests();
-        return null;
-    };
 
-    // Take ownership of the winner; free the other class bests.
-    const winner = shared.best.get(chosen).?;
-    shared.best.set(chosen, null);
+    const chosen = selectBestRanked(strategy, ranks) orelse return null;
+    var winner = best.get(chosen).?;
+    var winner_class = chosen;
+    const stable_rank: ?Rank = if (prefer_stable) ranks.get(chosen).? else null;
+    const top_tier = strategy == .hydec and (chosen == .vless2 or chosen == .trojan);
+
+    var eligible: std.EnumArray(PrefClass, bool) = .initFill(false);
     for (std.enums.values(PrefClass)) |class| {
-        if (shared.best.getPtr(class).*) |*r| r.deinit(shared.gpa);
-        shared.best.set(class, null);
+        const rank = ranks.get(class) orelse continue;
+        if (stable_rank) |required| {
+            if (!std.meta.eql(rank, required)) continue;
+        }
+        if (strategy != .fastest and class != chosen and
+            !(top_tier and (class == .vless2 or class == .trojan))) continue;
+        eligible.set(class, true);
+    }
+
+    const chosen_median = winner.latency.?.median_ms;
+    var median = chosen_median;
+    if (prefer_stable) {
+        // Keep the strategy's winner inside the window when ranking by worst sample.
+        for (lists) |list| {
+            for (list.items) |*item| {
+                const latency = item.latency orelse continue;
+                const candidate_ms = latency.median_ms;
+                if (candidate_ms >= median or chosen_median > candidate_ms +| candidate_ms / 10) continue;
+                _ = meanCandidateClass(item.proxy, latency, eligible, stable_rank) orelse continue;
+                median = candidate_ms;
+            }
+        }
+    }
+    const limit = median +| median / 10;
+    for (lists) |list| {
+        for (list.items) |*item| {
+            const latency = item.latency orelse continue;
+            if (latency.median_ms < median or latency.median_ms > limit) continue;
+            const class = meanCandidateClass(item.proxy, latency, eligible, stable_rank) orelse continue;
+
+            const current = winner.latency.?;
+            if (latency.mean_ms > current.mean_ms) continue;
+            if (latency.mean_ms == current.mean_ms) {
+                if (latency.median_ms > current.median_ms) continue;
+                if (latency.median_ms == current.median_ms and @backingInt(class) <= @backingInt(winner_class)) continue;
+            }
+            winner = item;
+            winner_class = class;
+        }
     }
     return winner;
 }
 
-test "finishBest reports recording OOM even when a slower winner exists" {
-    const gpa = std.testing.allocator;
-    var stats: Stats = .{};
-    var shared: Shared = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .verbose = false,
-        .prefer_stable = false,
-        .check_volume = false,
-        .timeout_secs = 5,
-        .bind = null,
-        .best_oom = true,
-        .stats = &stats,
-    };
-    defer shared.deinitBests();
-    shared.best.set(.shadowsocks, .{
-        .latency_ms = 100,
-        .rank = .{ .retried = false, .ms = 100 },
-        .raw = "ss://winner",
-        .host = try gpa.dupe(u8, "192.0.2.1"),
-    });
+fn meanCandidateClass(
+    proxy: proxy_uri.Proxy,
+    latency: Latency,
+    eligible: std.EnumArray(PrefClass, bool),
+    stable_rank: ?Rank,
+) ?PrefClass {
+    const class = PrefClass.fromProxy(proxy) orelse return null;
+    if (!eligible.get(class)) return null;
+    if (stable_rank) |required| {
+        if (!std.meta.eql(Rank.of(latency, true), required)) return null;
+    }
+    return class;
+}
 
-    try std.testing.expectError(error.OutOfMemory, finishBest(&shared, .fastest));
-    for (std.enums.values(PrefClass)) |class| try std.testing.expect(shared.best.get(class) == null);
+test "selectWinner uses the lowest median as the inclusive 10% boundary" {
+    const proxy: proxy_uri.Proxy = .{
+        .kind = .trojan,
+        .raw = "",
+        .host = "192.0.2.1",
+        .port = 443,
+        .userinfo = "",
+        .query = "",
+    };
+    var fast = [_]u64{ 100, 100, 300 };
+    var close = [_]u64{ 100, 110, 110 };
+    var outside = [_]u64{ 2, 121, 121 };
+    var items = [_]WorkItem{
+        .{ .raw = "fast", .proxy = proxy, .addresses = &.{}, .latency = .fromSamples(&fast) },
+        .{ .raw = "close", .proxy = proxy, .addresses = &.{}, .latency = .fromSamples(&close) },
+        .{ .raw = "outside", .proxy = proxy, .addresses = &.{}, .latency = .fromSamples(&outside) },
+    };
+    var lists = [_]std.ArrayList(WorkItem){.initBuffer(&items)};
+    lists[0].items.len = items.len;
+
+    try std.testing.expectEqualStrings("close", selectWinner(&lists, .hydec, false).?.raw);
+    std.mem.swap(WorkItem, &items[0], &items[2]);
+    try std.testing.expectEqualStrings("close", selectWinner(&lists, .hydec, false).?.raw);
+}
+
+test "selectWinner respects strategy classes and prefer-stable ranking" {
+    const proxy: proxy_uri.Proxy = .{
+        .kind = .trojan,
+        .raw = "",
+        .host = "192.0.2.1",
+        .port = 443,
+        .userinfo = "",
+        .query = "",
+    };
+    var vless = proxy;
+    vless.kind = .vless;
+    vless.transport = .grpc;
+    var shadowsocks = proxy;
+    shadowsocks.kind = .shadowsocks;
+    var vless_samples = [_]u64{ 100, 100, 300 };
+    var trojan_samples = [_]u64{ 100, 110, 110 };
+    var ss_samples = [_]u64{ 2, 105, 105 };
+    var items = [_]WorkItem{
+        .{ .raw = "vless", .proxy = vless, .addresses = &.{}, .latency = .fromSamples(&vless_samples) },
+        .{ .raw = "trojan", .proxy = proxy, .addresses = &.{}, .latency = .fromSamples(&trojan_samples) },
+        .{ .raw = "ss", .proxy = shadowsocks, .addresses = &.{}, .latency = .fromSamples(&ss_samples) },
+    };
+    var lists = [_]std.ArrayList(WorkItem){.initBuffer(&items)};
+    lists[0].items.len = items.len;
+
+    try std.testing.expectEqualStrings("vless", selectWinner(&lists, .strict, false).?.raw);
+    try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .hydec, false).?.raw);
+    try std.testing.expectEqualStrings("ss", selectWinner(&lists, .fastest, false).?.raw);
+    items[2].latency.?.retries = 1;
+    try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .fastest, true).?.raw);
+}
+
+test "selectWinner with prefer-stable uses mean only for close medians at equal rank" {
+    const proxy: proxy_uri.Proxy = .{
+        .kind = .trojan,
+        .raw = "",
+        .host = "192.0.2.1",
+        .port = 443,
+        .userinfo = "",
+        .query = "",
+    };
+    var fast = [_]u64{ 95, 100, 150 };
+    var steady = [_]u64{ 60, 105, 150 };
+    var outside = [_]u64{ 2, 111, 150 };
+    var slower_worst = [_]u64{ 2, 100, 151 };
+    var items = [_]WorkItem{
+        .{ .raw = "fast", .proxy = proxy, .addresses = &.{}, .latency = .fromSamples(&fast) },
+        .{ .raw = "steady", .proxy = proxy, .addresses = &.{}, .latency = .fromSamples(&steady) },
+        .{ .raw = "outside", .proxy = proxy, .addresses = &.{}, .latency = .fromSamples(&outside) },
+        .{ .raw = "slower_worst", .proxy = proxy, .addresses = &.{}, .latency = .fromSamples(&slower_worst) },
+    };
+    var lists = [_]std.ArrayList(WorkItem){.initBuffer(&items)};
+    lists[0].items.len = items.len;
+
+    try std.testing.expectEqualStrings("steady", selectWinner(&lists, .hydec, true).?.raw);
+    std.mem.swap(WorkItem, &items[0], &items[2]);
+    try std.testing.expectEqualStrings("steady", selectWinner(&lists, .hydec, true).?.raw);
+    items[1].latency.?.retries = 1;
+    try std.testing.expectEqualStrings("fast", selectWinner(&lists, .hydec, true).?.raw);
+}
+
+test "selectWinner with fastest breaks equal means and medians by protocol preference" {
+    const trojan_proxy: proxy_uri.Proxy = .{
+        .kind = .trojan,
+        .raw = "",
+        .host = "192.0.2.1",
+        .port = 443,
+        .userinfo = "",
+        .query = "",
+    };
+    var vless = trojan_proxy;
+    vless.kind = .vless;
+    vless.transport = .grpc;
+    var shadowsocks = trojan_proxy;
+    shadowsocks.kind = .shadowsocks;
+    var fast = [_]u64{ 100, 100, 300 };
+    var steady = [_]u64{ 109, 109, 109 };
+    const latency: Latency = .fromSamples(&steady);
+    var items = [_]WorkItem{
+        .{ .raw = "ss", .proxy = shadowsocks, .addresses = &.{}, .latency = .fromSamples(&fast) },
+        .{ .raw = "trojan", .proxy = trojan_proxy, .addresses = &.{}, .latency = latency },
+        .{ .raw = "vless", .proxy = vless, .addresses = &.{}, .latency = latency },
+    };
+    var lists = [_]std.ArrayList(WorkItem){.initBuffer(&items)};
+    lists[0].items.len = items.len;
+
+    try std.testing.expectEqualStrings("vless", selectWinner(&lists, .fastest, false).?.raw);
+    std.mem.swap(WorkItem, &items[1], &items[2]);
+    try std.testing.expectEqualStrings("vless", selectWinner(&lists, .fastest, false).?.raw);
+}
+
+test "selectWinner keeps the stable protocol winner in the median window" {
+    const trojan_proxy: proxy_uri.Proxy = .{
+        .kind = .trojan,
+        .raw = "",
+        .host = "192.0.2.1",
+        .port = 443,
+        .userinfo = "",
+        .query = "",
+    };
+    var vless = trojan_proxy;
+    vless.kind = .vless;
+    vless.transport = .grpc;
+    var vless_samples = [_]u64{ 150, 150, 200 };
+    var distant_samples = [_]u64{ 100, 100, 200 };
+    var close_samples = [_]u64{ 100, 137, 200 };
+    var items = [_]WorkItem{
+        .{ .raw = "vless", .proxy = vless, .addresses = &.{}, .latency = .fromSamples(&vless_samples) },
+        .{ .raw = "trojan_distant", .proxy = trojan_proxy, .addresses = &.{}, .latency = .fromSamples(&distant_samples) },
+        .{ .raw = "trojan_close", .proxy = trojan_proxy, .addresses = &.{}, .latency = .fromSamples(&close_samples) },
+    };
+    var lists = [_]std.ArrayList(WorkItem){.initBuffer(&items)};
+    lists[0].items.len = 2;
+    try std.testing.expectEqualStrings("vless", selectWinner(&lists, .fastest, true).?.raw);
+
+    lists[0].items.len = items.len;
+    try std.testing.expectEqualStrings("trojan_close", selectWinner(&lists, .fastest, true).?.raw);
 }
 
 test "OK/FAIL log formatters render both named and unnamed proxies" {
@@ -1278,11 +1413,11 @@ test "FailReason appends the stage once the attempt got past setup" {
 
 test "Latency.fromSamples: median ignores a single spike, min/max keep it" {
     var spike = [_]u64{ 40, 300, 42 };
-    try std.testing.expectEqual(Latency{ .median_ms = 42, .min_ms = 40, .max_ms = 300 }, Latency.fromSamples(&spike));
+    try std.testing.expectEqual(Latency{ .median_ms = 42, .mean_ms = 382.0 / 3.0, .min_ms = 40, .max_ms = 300 }, Latency.fromSamples(&spike));
     var even = [_]u64{ 30, 10, 20, 40 };
-    try std.testing.expectEqual(Latency{ .median_ms = 30, .min_ms = 10, .max_ms = 40 }, Latency.fromSamples(&even));
+    try std.testing.expectEqual(Latency{ .median_ms = 30, .mean_ms = 25, .min_ms = 10, .max_ms = 40 }, Latency.fromSamples(&even));
     var one = [_]u64{7};
-    try std.testing.expectEqual(Latency{ .median_ms = 7, .min_ms = 7, .max_ms = 7 }, Latency.fromSamples(&one));
+    try std.testing.expectEqual(Latency{ .median_ms = 7, .mean_ms = 7, .min_ms = 7, .max_ms = 7 }, Latency.fromSamples(&one));
 }
 
 const FakeProber = struct {
@@ -1321,8 +1456,8 @@ test "collectSamples reports no retries on a clean run" {
 
 test "Rank.of: median by default, worst sample with --prefer-stable" {
     // Arrange
-    const spiky: Latency = .{ .median_ms = 42, .min_ms = 40, .max_ms = 300 };
-    const steady: Latency = .{ .median_ms = 46, .min_ms = 45, .max_ms = 47 };
+    const spiky: Latency = .{ .median_ms = 42, .mean_ms = 382.0 / 3.0, .min_ms = 40, .max_ms = 300 };
+    const steady: Latency = .{ .median_ms = 46, .mean_ms = 46, .min_ms = 45, .max_ms = 47 };
 
     // Act / Assert
     try std.testing.expect(Rank.of(spiky, false).lessThan(Rank.of(steady, false)));
@@ -1330,13 +1465,13 @@ test "Rank.of: median by default, worst sample with --prefer-stable" {
 }
 
 test "Rank.of: a retried candidate loses to any clean one only with --prefer-stable" {
-    const retried: Latency = .{ .median_ms = 20, .min_ms = 20, .max_ms = 20, .retries = 1 };
-    const clean: Latency = .{ .median_ms = 200, .min_ms = 200, .max_ms = 200 };
+    const retried: Latency = .{ .median_ms = 20, .mean_ms = 20, .min_ms = 20, .max_ms = 20, .retries = 1 };
+    const clean: Latency = .{ .median_ms = 200, .mean_ms = 200, .min_ms = 200, .max_ms = 200 };
 
     try std.testing.expect(Rank.of(clean, true).lessThan(Rank.of(retried, true)));
     try std.testing.expect(Rank.of(retried, false).lessThan(Rank.of(clean, false)));
     // Among retried candidates the worst sample still decides.
-    const retried_slow: Latency = .{ .median_ms = 30, .min_ms = 30, .max_ms = 30, .retries = 1 };
+    const retried_slow: Latency = .{ .median_ms = 30, .mean_ms = 30, .min_ms = 30, .max_ms = 30, .retries = 1 };
     try std.testing.expect(Rank.of(retried, true).lessThan(Rank.of(retried_slow, true)));
 }
 
@@ -1628,7 +1763,6 @@ test "collectGroups leaves resource failures eligible for a deferred DNS probe" 
         .gpa = gpa,
         .io = io,
         .verbose = false,
-        .prefer_stable = false,
         .check_volume = false,
         .timeout_secs = 5,
         .bind = null,
