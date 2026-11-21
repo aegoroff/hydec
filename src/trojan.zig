@@ -122,6 +122,17 @@ fn tlsOptions(
     };
 }
 
+fn classifyTlsIoErr(
+    err: anyerror,
+    tls_client: *const tls.Client,
+    stream_reader: *const Io.net.Stream.Reader,
+    stream_writer: *const Io.net.Stream.Writer,
+    fired: bool,
+) anyerror {
+    const reader_err: ?anyerror = stream_reader.err orelse if (fired) null else tls_client.read_err;
+    return netutil.classifyIoErr(err, stream_writer.err, reader_err, fired);
+}
+
 /// Drain until `http_buf[0..http_len]` is a complete HTTP response, or peer close
 /// ends an unframed close-delimited body. Updates `http_len` in place.
 fn readHttpUntilReady(
@@ -130,29 +141,25 @@ fn readHttpUntilReady(
     frame_buf: []u8,
     transport_ws: bool,
     conn: ws.Conn,
+    tls_client: *const tls.Client,
     stream_reader: *const Io.net.Stream.Reader,
-    stream_writer: *Io.net.Stream.Writer,
+    stream_writer: *const Io.net.Stream.Writer,
     io: Io,
     fired: *const std.atomic.Value(bool),
     expect: util.ProbeReply,
 ) !void {
     while (!try util.takeProbeResponse(http_buf, http_len, expect, false)) {
-        const n = if (transport_ws)
-            ws.readBinaryFrame(conn, io, frame_buf) catch |err| {
-                const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
-                if (util.isPeerClosed(e)) {
-                    if (try util.takeProbeResponse(http_buf, http_len, expect, true)) return;
-                }
-                return e;
-            }
+        const result = if (transport_ws)
+            ws.readBinaryFrame(conn, io, frame_buf)
         else
-            readTlsChunk(conn.reader, frame_buf) catch |err| {
-                const e = netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
-                if (util.isPeerClosed(e)) {
-                    if (try util.takeProbeResponse(http_buf, http_len, expect, true)) return;
-                }
-                return e;
-            };
+            readTlsChunk(conn.reader, frame_buf);
+        const n = result catch |err| {
+            const e = classifyTlsIoErr(err, tls_client, stream_reader, stream_writer, fired.load(.acquire));
+            if (e != error.TlsConnectionTruncated and util.isPeerClosed(e)) {
+                if (try util.takeProbeResponse(http_buf, http_len, expect, true)) return;
+            }
+            return e;
+        };
         if (http_len.* + n > http_buf.len) return error.BufferTooSmall;
         @memcpy(http_buf[http_len.*..][0..n], frame_buf[0..n]);
         http_len.* += n;
@@ -244,7 +251,7 @@ pub fn probe(
         const path = if (opts.ws_path.len > 0) opts.ws_path else "/";
         const host_hdr = if (opts.ws_host.len > 0) opts.ws_host else sni_use;
         ws.performUpgrade(conn, io, path, host_hdr) catch |err| {
-            return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
+            return classifyTlsIoErr(err, &tls_client, &stream_reader, &stream_writer, fired.load(.acquire));
         };
     }
 
@@ -272,7 +279,7 @@ pub fn probe(
     // A `--check-volume` download may come as one large WS frame.
     const frame_buf = try gpa.alloc(u8, util.PROBE_HTTP_BUF_LEN);
     defer gpa.free(frame_buf);
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired, .{ .trace = util.PROBE_UA_WARMUP });
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &tls_client, &stream_reader, &stream_writer, io, &fired, .{ .trace = util.PROBE_UA_WARMUP });
 
     // Steady-state: require a real keep-alive reply (same fail-closed policy as gRPC/Vision).
     if (opts.transport_ws) {
@@ -287,7 +294,7 @@ pub fn probe(
             return netutil.classifyIoErr(err, stream_writer.err, stream_reader.err, fired.load(.acquire));
         };
     }
-    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &stream_reader, &stream_writer, io, &fired, target.steady_reply);
+    try readHttpUntilReady(http_buf, &http_len, frame_buf, opts.transport_ws, conn, &tls_client, &stream_reader, &stream_writer, io, &fired, target.steady_reply);
 
     return netutil.elapsedMs(attempt_start, io);
 }
@@ -356,6 +363,32 @@ test "readTlsChunk returns the ready reply without waiting to fill the buffer" {
     // Assert
     try std.testing.expectEqualStrings(reply, out[0..n]);
     try std.testing.expectEqual(@as(usize, 1), src.calls);
+}
+
+test "Trojan reply preserves TLS record truncation for retry" {
+    // Arrange: the HTTP bytes alone would pass validation on a clean close.
+    const reply = "HTTP/1.0 200 OK\r\n\r\nvisit_scheme=http\nuag=hydec-steady\n";
+    var http_buf: [128]u8 = undefined;
+    @memcpy(http_buf[0..reply.len], reply);
+    var http_len: usize = reply.len;
+    var frame_buf: [16]u8 = undefined;
+    var tls_buf: [16]u8 = undefined;
+    var tls_client: tls.Client = undefined;
+    tls_client.reader = .failing;
+    tls_client.reader.buffer = &tls_buf;
+    tls_client.read_err = error.TlsConnectionTruncated;
+    var stream_writer: Io.net.Stream.Writer = undefined;
+    stream_writer.err = null;
+    var stream_reader: Io.net.Stream.Reader = undefined;
+    stream_reader.err = null;
+    const conn: ws.Conn = .{ .reader = &tls_client.reader, .tls = &tls_client.writer, .socket = &stream_writer.interface };
+    const fired: std.atomic.Value(bool) = .init(false);
+
+    // Act and assert
+    for ([_]bool{ false, true }) |transport_ws| {
+        const result = readHttpUntilReady(&http_buf, &http_len, &frame_buf, transport_ws, conn, &tls_client, &stream_reader, &stream_writer, std.testing.io, &fired, util.LATENCY_TARGET.steady_reply);
+        try std.testing.expectError(error.TlsConnectionTruncated, result);
+    }
 }
 
 test "trojanHash matches SHA-224 hex (lowercase)" {

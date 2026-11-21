@@ -1404,9 +1404,9 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
             .allow_truncation_attacks = true,
         },
     ) catch |err| {
-        return unwrapPipeErr(&pipe, err);
+        return unwrapPipeErr(&pipe, err, null);
     };
-    pipe.writer.flush() catch |err| return unwrapPipeErr(&pipe, err);
+    pipe.writer.flush() catch |err| return unwrapPipeErr(&pipe, err, null);
     pipe.handshake_done = true;
     stage.* = .reply;
 
@@ -1419,8 +1419,8 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
     return netutil.elapsedMs(start, io);
 }
 
-/// Prefer VisionPipe / socket causes over opaque `WriteFailed` / `ReadFailed` wrappers.
-fn unwrapPipeErr(pipe: *const VisionPipe, err: anyerror) anyerror {
+/// Prefer VisionPipe / socket causes, then use the inner TLS read error if available.
+fn unwrapPipeErr(pipe: *const VisionPipe, err: anyerror, tls_read_err: ?tls.Client.ReadError) anyerror {
     if (pipe.err) |e| return e;
     if (err == error.WriteFailed) {
         if (pipe.rc.stream_writer.err) |e|
@@ -1429,13 +1429,14 @@ fn unwrapPipeErr(pipe: *const VisionPipe, err: anyerror) anyerror {
     if (err == error.ReadFailed) {
         if (pipe.rc.stream_reader.err) |e|
             return netutil.classifyDeadlineErr(e, pipe.rc.deadlineFired());
+        if (tls_read_err) |e| return if (pipe.rc.deadlineFired()) error.Timeout else e;
     }
     return err;
 }
 
 fn flushTlsApp(tls_client: *tls.Client, pipe: *VisionPipe, request: []const u8) !void {
-    tls_client.writer.writeAll(request) catch |err| return unwrapPipeErr(pipe, err);
-    netutil.flushTls(&tls_client.writer, &pipe.writer) catch |err| return unwrapPipeErr(pipe, err);
+    tls_client.writer.writeAll(request) catch |err| return unwrapPipeErr(pipe, err, null);
+    netutil.flushTls(&tls_client.writer, &pipe.writer) catch |err| return unwrapPipeErr(pipe, err, null);
 }
 
 fn readProbeReply(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8, expect: util.ProbeReply) !usize {
@@ -1453,8 +1454,8 @@ fn readProbeReply(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8, ex
         // Do not use readSliceShort on a large slice: with keep-alive it waits until
         // the whole buffer is full. Decrypt ≥1 byte, then take whatever cleartext is ready.
         tls_client.reader.fill(1) catch |err| {
-            const e = unwrapPipeErr(pipe, err);
-            if (util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) {
+            const e = unwrapPipeErr(pipe, err, tls_client.read_err);
+            if (e != error.TlsConnectionTruncated and util.isPeerClosed(e) and util.httpCloseDelimitedReady(http_buf[0..http_len])) {
                 try expect.check(http_buf[0..http_len]);
                 return http_len;
             }
@@ -1467,6 +1468,24 @@ fn readProbeReply(tls_client: *tls.Client, pipe: *VisionPipe, http_buf: []u8, ex
         tls_client.reader.toss(n);
         http_len += n;
     }
+}
+
+test "VLESS TCP reply preserves an inner TLS alert and honors the deadline" {
+    // Arrange
+    var rc: RealityConn = .{ .stream = undefined, .io = std.testing.io, .read_deadline_ns = 0 };
+    rc.stream_reader.err = null;
+    var pipe: VisionPipe = .{ .rc = &rc, .uuid = undefined, .vless_hdr = &.{}, .use_vision = false, .vision_raw = true };
+    var tls_buf: [16]u8 = undefined;
+    var tls_client: tls.Client = undefined;
+    tls_client.reader = .failing;
+    tls_client.reader.buffer = &tls_buf;
+    tls_client.read_err = error.TlsAlert;
+    var http_buf: [128]u8 = undefined;
+
+    // Act and assert
+    try std.testing.expectError(error.TlsAlert, readProbeReply(&tls_client, &pipe, &http_buf, util.LATENCY_TARGET.steady_reply));
+    rc.deadline_fired.store(true, .release);
+    try std.testing.expectError(error.Timeout, readProbeReply(&tls_client, &pipe, &http_buf, util.LATENCY_TARGET.steady_reply));
 }
 
 /// True when `data` is one or more complete TLS 1.3 Application Data records
