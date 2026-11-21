@@ -991,6 +991,7 @@ fn validateGrpcFrameStream(ftyp: u8, stream_id: u32) !void {
 /// Probe VLESS over REALITY (TCP Vision or gRPC gun).
 /// Warmup proves the tunnel; returned latency is the second (steady-state) request.
 pub fn probeVless(
+    gpa: std.mem.Allocator,
     io: Io,
     host: []const u8,
     port: u16,
@@ -1012,13 +1013,14 @@ pub fn probeVless(
 
     // Full attempt: dial, REALITY handshake and the tunneled requests.
     const start = netutil.monoNow(io);
-    var rc: RealityConn = undefined;
-    try connect(&rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind, addresses, stage);
+    const rc = try gpa.create(RealityConn);
+    defer gpa.destroy(rc);
+    try connect(rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind, addresses, stage);
     defer rc.deinit();
     stage.* = .tunnel;
 
     if (!grpc) {
-        return probeVlessTcpHttps(&rc, io, uuid, flow, target, start, stage);
+        return probeVlessTcpHttps(gpa, rc, io, uuid, flow, target, start, stage);
     }
 
     var vless_buf: [1024]u8 = undefined;
@@ -1032,13 +1034,14 @@ pub fn probeVless(
     const plen = try grpc_gun.buildClientPrefaceSettings(&preface);
     try rc.writeApp(preface[0..plen]);
 
-    return runGrpcProbe(&rc, io, start, target, vless_buf[0..vless_len], service_name, authority, stage);
+    return runGrpcProbe(gpa, rc, io, start, target, vless_buf[0..vless_len], service_name, authority, stage);
 }
 
 /// Drive the gRPC gun frame loop over `conn` (`readApp` / `writeApp`). Split from
 /// `probeVless` so the warmup/steady discard guard can be tested against a scripted
 /// byte source without a live REALITY peer.
 fn runGrpcProbe(
+    gpa: std.mem.Allocator,
     conn: anytype,
     io: Io,
     start: i128,
@@ -1048,8 +1051,10 @@ fn runGrpcProbe(
     authority: []const u8,
     stage: *util.Stage,
 ) !u64 {
-    var app_buf: [GRPC_MAX_FRAME_PAYLOAD_LEN]u8 = undefined;
-    var gather: [GRPC_GATHER_BUF_LEN]u8 = undefined;
+    const app_buf = try gpa.alloc(u8, GRPC_MAX_FRAME_PAYLOAD_LEN);
+    defer gpa.free(app_buf);
+    const gather = try gpa.alloc(u8, GRPC_GATHER_BUF_LEN);
+    defer gpa.free(gather);
     var gather_len: usize = 0;
     var settings_seen = false;
     var request_sent = false;
@@ -1060,16 +1065,19 @@ fn runGrpcProbe(
     // already buffered when the steady request was written. Ignoring them avoids false-OK;
     // keeping them in `gather` preserves HTTP/2 frame alignment (unlike wiping the buffer).
     var discard_data_before: usize = 0;
-    var http_buf: [util.PROBE_HTTP_BUF_LEN]u8 = undefined;
+    const http_buf = try gpa.alloc(u8, util.PROBE_HTTP_BUF_LEN);
+    defer gpa.free(http_buf);
     var http_len: usize = 0;
     // gRPC messages may span multiple HTTP/2 DATA frames — assemble before unwrap.
-    var grpc_stream: [grpc_gun.MAX_GRPC_MESSAGE_LEN + 5]u8 = undefined;
+    const grpc_stream = try gpa.alloc(u8, grpc_gun.MAX_GRPC_MESSAGE_LEN + 5);
+    defer gpa.free(grpc_stream);
     var grpc_stream_len: usize = 0;
-    var header_storage: [32768]u8 = undefined;
-    var header_block = grpc_gun.HeaderBlock.init(&header_storage);
+    const header_storage = try gpa.alloc(u8, 32768);
+    defer gpa.free(header_storage);
+    var header_block = grpc_gun.HeaderBlock.init(header_storage);
     while (true) {
-        const n = try conn.readApp(app_buf[0..]);
-        try appendGrpcRead(&gather, &gather_len, app_buf[0..n]);
+        const n = try conn.readApp(app_buf);
+        try appendGrpcRead(gather, &gather_len, app_buf[0..n]);
 
         var off: usize = 0;
         while (off + 9 <= gather_len) {
@@ -1113,7 +1121,7 @@ fn runGrpcProbe(
                         if (!headers.end_stream) return error.InvalidHttp2Framing;
                         if (!headers.grpc_ok or headers.http_status_ok != null) return error.GrpcBadStatus;
                         if (warmup_done and grpc_stream_len == 0 and
-                            try util.takeProbeResponse(&http_buf, &http_len, target.steady_reply, true))
+                            try util.takeProbeResponse(http_buf, &http_len, target.steady_reply, true))
                             return netutil.elapsedMs(start, io);
                         return error.GrpcStreamEnded;
                     }
@@ -1139,7 +1147,7 @@ fn runGrpcProbe(
                     };
                     const msg = try grpc_gun.vlessFromGrpcData(grpc_stream[0..total]);
                     if (!warmup_done) {
-                        if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, .{ .trace = util.PROBE_UA_WARMUP })) {
+                        if (try grpcProbeHttpReady(http_buf, &http_len, msg, &stripped_vless, .{ .trace = util.PROBE_UA_WARMUP })) {
                             if (end_stream) return error.GrpcStreamEnded;
                             warmup_done = true;
                             // Fresh buffer for the keep-alive request; VLESS header already stripped.
@@ -1156,14 +1164,14 @@ fn runGrpcProbe(
                             grpc_stream_len = 0;
                             break;
                         }
-                    } else if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, target.steady_reply)) {
+                    } else if (try grpcProbeHttpReady(http_buf, &http_len, msg, &stripped_vless, target.steady_reply)) {
                         return netutil.elapsedMs(start, io);
                     }
-                    shiftDown(&grpc_stream, &grpc_stream_len, total);
+                    shiftDown(grpc_stream, &grpc_stream_len, total);
                 }
                 if (end_stream) {
                     if (warmup_done and grpc_stream_len == 0 and
-                        try util.takeProbeResponse(&http_buf, &http_len, target.steady_reply, true))
+                        try util.takeProbeResponse(http_buf, &http_len, target.steady_reply, true))
                         return netutil.elapsedMs(start, io);
                     return error.GrpcStreamEnded;
                 }
@@ -1222,6 +1230,7 @@ const VisionPipe = struct {
     saw_vision: bool = false,
     vision_state: vless.VisionUnpadState = .{},
 
+    scratch: [32768]u8 = undefined,
     wbuf: [tls.Client.min_buffer_len]u8 = undefined,
     rbuf: [tls.Client.min_buffer_len]u8 = undefined,
     writer: Io.Writer = undefined,
@@ -1294,7 +1303,7 @@ const VisionPipe = struct {
         const data_len = Io.Writer.countSplat(data, splat);
         const total = buffered.len + data_len;
         // Large ClientHello (e.g. ML-KEM) + Vision framing can exceed 16KiB.
-        var tmp: [32768]u8 = undefined;
+        const tmp = &self.scratch;
         if (total > tmp.len) {
             self.err = error.BufferTooSmall;
             return error.WriteFailed;
@@ -1325,8 +1334,8 @@ const VisionPipe = struct {
             self.plain_off = 0;
             self.plain_len = 0;
             // Must fit a full Reality/TLS app record; 8KiB rejected large Certificate flights.
-            var resp: [MAX_TLS_RECORD_LEN]u8 = undefined;
-            const n = self.rc.readApp(&resp) catch |err| {
+            const resp = self.scratch[0..MAX_TLS_RECORD_LEN];
+            const n = self.rc.readApp(resp) catch |err| {
                 self.err = err;
                 return if (util.isPeerClosed(err)) error.EndOfStream else error.ReadFailed;
             };
@@ -1370,14 +1379,16 @@ const VisionPipe = struct {
     }
 };
 
-fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []const u8, target: util.Target, start: i128, stage: *util.Stage) !u64 {
+fn probeVlessTcpHttps(gpa: std.mem.Allocator, rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []const u8, target: util.Target, start: i128, stage: *util.Stage) !u64 {
     const use_vision = std.mem.find(u8, flow, "vision") != null;
     var uuid: [16]u8 = undefined;
     try vless.parseUuid(uuid_text, &uuid);
 
     var hdr_buf: [256]u8 = undefined;
     const hdr_len = try vless.encodeRequestDomain(&hdr_buf, &uuid, target.domain, util.PROBE_TLS_PORT, flow);
-    var pipe: VisionPipe = .{
+    const pipe = try gpa.create(VisionPipe);
+    defer gpa.destroy(pipe);
+    pipe.* = .{
         .rc = rc,
         .uuid = uuid,
         .vless_hdr = hdr_buf[0..hdr_len],
@@ -1404,17 +1415,18 @@ fn probeVlessTcpHttps(rc: *RealityConn, io: Io, uuid_text: []const u8, flow: []c
             .allow_truncation_attacks = true,
         },
     ) catch |err| {
-        return unwrapPipeErr(&pipe, err, null);
+        return unwrapPipeErr(pipe, err, null);
     };
-    pipe.writer.flush() catch |err| return unwrapPipeErr(&pipe, err, null);
+    pipe.writer.flush() catch |err| return unwrapPipeErr(pipe, err, null);
     pipe.handshake_done = true;
     stage.* = .reply;
 
     // One CF HTTPS request after inner TLS — fail-closed on distinct steady UA.
     // Nested handshake dominates wall time; a separate warmup RTT is not needed.
-    var http_buf: [util.PROBE_HTTP_BUF_LEN]u8 = undefined;
-    try flushTlsApp(&tls_client, &pipe, target.steady);
-    _ = try readProbeReply(&tls_client, &pipe, &http_buf, target.steady_reply);
+    const http_buf = try gpa.alloc(u8, util.PROBE_HTTP_BUF_LEN);
+    defer gpa.free(http_buf);
+    try flushTlsApp(&tls_client, pipe, target.steady);
+    _ = try readProbeReply(&tls_client, pipe, http_buf, target.steady_reply);
     if (use_vision and !pipe.saw_vision) return error.ExpectedVisionPadding;
     return netutil.elapsedMs(start, io);
 }
@@ -1643,7 +1655,7 @@ const TEST_RECORD_KEY: [16]u8 = @splat(0x5a);
 const TEST_RECORD_IV: [12]u8 = @splat(0x31);
 
 /// CCS and a zero-length NewSessionTicket: the two inner types the drain loop skips.
-fn ignorableRecord(index: usize) struct { typ: u8, content: []const u8 } {
+fn ignorableRecord(index: u64) struct { typ: u8, content: []const u8 } {
     return if (index % 2 == 0)
         .{ .typ = 20, .content = &[_]u8{0x01} }
     else
@@ -1940,6 +1952,23 @@ const ScriptedGrpcConn = struct {
     }
 };
 
+test "runGrpcProbe releases its buffers after allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            const io = std.testing.io;
+            var conn: ScriptedGrpcConn = .{ .reads = &.{}, .gpa = gpa };
+            defer conn.deinit();
+            var stage: util.Stage = .tunnel;
+
+            _ = runGrpcProbe(gpa, &conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage) catch |err| switch (err) {
+                error.EndOfStream => return,
+                else => return err,
+            };
+            return error.TestUnexpectedResult;
+        }
+    }.run, .{});
+}
+
 // Empty server SETTINGS (no ACK) and a HEADERS block carrying only `:status 200`
 // (static index 8) with END_HEADERS, on stream 1.
 const test_grpc_settings = [_]u8{ 0, 0, 0, 0x04, 0, 0, 0, 0, 0 };
@@ -1997,7 +2026,7 @@ test "runGrpcProbe ignores pipelined steady bytes until the steady write" {
     var stage: util.Stage = .setup;
 
     // Act
-    _ = try runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage);
+    _ = try runGrpcProbe(gpa, &conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage);
 
     // Assert: it read the genuine steady reply (did not short-circuit on the
     // pipelined bytes) and wrote stream-open then the steady request.
@@ -2032,7 +2061,7 @@ test "runGrpcProbe fails closed when only pipelined steady bytes remain" {
     // so they are discarded; with no genuine reply the probe fails, not a false OK.
     try std.testing.expectError(
         error.ConnectionResetByPeer,
-        runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage),
+        runGrpcProbe(gpa, &conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage),
     );
     try std.testing.expectEqual(@as(usize, 2), conn.writes.items.len);
 }
@@ -2081,7 +2110,7 @@ test "runGrpcProbe reassembles a maximum gRPC message followed by a partial head
     var conn: ScriptedGrpcConn = .{ .reads = &reads, .gpa = gpa };
     defer conn.deinit();
     var stage: util.Stage = .setup;
-    _ = try runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage);
+    _ = try runGrpcProbe(gpa, &conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage);
     try std.testing.expectEqual(reads.len, conn.read_i);
 }
 
@@ -2113,7 +2142,7 @@ test "runGrpcProbe validates a close-delimited steady response at HTTP/2 END_STR
         defer conn.deinit();
         var stage: util.Stage = .setup;
 
-        const result = runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage);
+        const result = runGrpcProbe(gpa, &conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage);
         if (case.err) |err| {
             try std.testing.expectError(err, result);
         } else {

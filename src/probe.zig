@@ -74,6 +74,8 @@ const WorkItem = struct {
 
 /// Cap concurrent host workers so a large subscription cannot exhaust OS threads.
 const MAX_PARALLEL_HOSTS: usize = 64;
+// The threaded DNS pool can still be alive when the probe workers start.
+const WORKER_STACK_SIZE = if (@bitSizeOf(usize) == 32) 2 * 1024 * 1024 else std.Thread.SpawnConfig.default_stack_size;
 
 const Shared = struct {
     gpa: std.mem.Allocator,
@@ -190,6 +192,7 @@ pub fn probeOne(
             defer if (authority_owned) |a| gpa.free(a);
             const authority = authority_owned orelse "";
             break :blk try reality.probeVless(
+                gpa,
                 io,
                 proxy.host,
                 proxy.port,
@@ -930,7 +933,7 @@ fn collectGroupsWithResolver(
         var spawned: usize = 0;
         defer for (threads[0..spawned]) |t| t.join();
         for (threads) |*t| {
-            t.* = try std.Thread.spawn(.{}, resolveWorker, .{ names.values(), &next, &oom, gpa, io, dns_deadline, resolver });
+            t.* = try std.Thread.spawn(.{ .stack_size = WORKER_STACK_SIZE }, resolveWorker, .{ names.values(), &next, &oom, gpa, io, dns_deadline, resolver });
             spawned += 1;
         }
     }
@@ -1046,7 +1049,7 @@ pub fn findBest(
         var spawned: usize = 0;
         defer for (threads[0..spawned]) |t| t.join();
         for (threads) |*t| {
-            t.* = try std.Thread.spawn(.{}, HostQueue.work, .{ &queue, &shared });
+            t.* = try std.Thread.spawn(.{ .stack_size = WORKER_STACK_SIZE }, HostQueue.work, .{ &queue, &shared });
             spawned += 1;
         }
     }

@@ -1023,6 +1023,13 @@ pub fn waitReadableUntil(stream: Io.net.Stream, io: Io, deadline: i128) !void {
 ///
 /// Also the only read deadline on Windows, where `waitReadableUntil` does not poll.
 pub const DeadlineShutdown = struct {
+    // glibc places static TLS, including Zig's alternate signal stack, inside the pthread stack mapping.
+    const SIGNAL_STACK_SIZE: usize = if (builtin.target.os.tag == .linux and builtin.target.abi.isGnu())
+        @intCast(std.options.signal_stack_size orelse 0)
+    else
+        0;
+    const STACK_SIZE = 64 * 1024 + SIGNAL_STACK_SIZE;
+
     const State = struct {
         wake: Io.Event = .unset,
         started: Io.Event = .unset,
@@ -1046,7 +1053,7 @@ pub const DeadlineShutdown = struct {
         const state = try std.heap.c_allocator.create(State);
         state.* = .{};
         errdefer std.heap.c_allocator.destroy(state);
-        const thread = try std.Thread.spawn(.{}, watchdog, .{ io, stream, timeout_ns, done, fired, state });
+        const thread = try std.Thread.spawn(.{ .stack_size = STACK_SIZE }, watchdog, .{ io, stream, timeout_ns, done, fired, state });
         return .{ .io = io, .state = state, .done = done, .fired = fired, .thread = thread };
     }
 
