@@ -1079,12 +1079,11 @@ fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, pref
     }
 
     const chosen = selectBestRanked(strategy, ranks) orelse return null;
-    var winner = best.get(chosen).?;
-    var winner_class = chosen;
     const stable_rank: ?Rank = if (prefer_stable) ranks.get(chosen).? else null;
     const top_tier = strategy == .hydec and (chosen == .vless2 or chosen == .trojan);
 
     var eligible: std.EnumArray(PrefClass, bool) = .initFill(false);
+    var median: u64 = std.math.maxInt(u64);
     for (std.enums.values(PrefClass)) |class| {
         const rank = ranks.get(class) orelse continue;
         if (stable_rank) |required| {
@@ -1093,34 +1092,25 @@ fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, pref
         if (strategy != .fastest and class != chosen and
             !(top_tier and (class == .vless2 or class == .trojan))) continue;
         eligible.set(class, true);
+        median = @min(median, best.get(class).?.latency.?.median_ms);
     }
 
-    const chosen_median = winner.latency.?.median_ms;
-    var median = chosen_median;
-    if (prefer_stable) {
-        // Keep the strategy's winner inside the window when ranking by worst sample.
-        for (lists) |list| {
-            for (list.items) |*item| {
-                const latency = item.latency orelse continue;
-                const candidate_ms = latency.median_ms;
-                if (candidate_ms >= median or chosen_median > candidate_ms +| candidate_ms / 10) continue;
-                _ = meanCandidateClass(item.proxy, latency, eligible, stable_rank) orelse continue;
-                median = candidate_ms;
-            }
-        }
-    }
     const limit = median +| median / 10;
+    var winner: ?*const WorkItem = null;
+    var winner_class: PrefClass = chosen;
     for (lists) |list| {
         for (list.items) |*item| {
             const latency = item.latency orelse continue;
-            if (latency.median_ms < median or latency.median_ms > limit) continue;
+            if (latency.median_ms > limit) continue;
             const class = meanCandidateClass(item.proxy, latency, eligible, stable_rank) orelse continue;
 
-            const current = winner.latency.?;
-            if (latency.mean_ms > current.mean_ms) continue;
-            if (latency.mean_ms == current.mean_ms) {
-                if (latency.median_ms > current.median_ms) continue;
-                if (latency.median_ms == current.median_ms and @backingInt(class) <= @backingInt(winner_class)) continue;
+            if (winner) |win| {
+                const current = win.latency.?;
+                if (latency.mean_ms > current.mean_ms) continue;
+                if (latency.mean_ms == current.mean_ms) {
+                    if (latency.median_ms > current.median_ms) continue;
+                    if (latency.median_ms == current.median_ms and @backingInt(class) <= @backingInt(winner_class)) continue;
+                }
             }
             winner = item;
             winner_class = class;
@@ -1259,7 +1249,7 @@ test "selectWinner with fastest breaks equal means and medians by protocol prefe
     try std.testing.expectEqualStrings("vless", selectWinner(&lists, .fastest, false).?.raw);
 }
 
-test "selectWinner keeps the stable protocol winner in the median window" {
+test "selectWinner with prefer-stable anchors the median window at the lowest eligible median" {
     const trojan_proxy: proxy_uri.Proxy = .{
         .kind = .trojan,
         .raw = "",
@@ -1272,19 +1262,31 @@ test "selectWinner keeps the stable protocol winner in the median window" {
     vless.kind = .vless;
     vless.transport = .grpc;
     var vless_samples = [_]u64{ 150, 150, 200 };
-    var distant_samples = [_]u64{ 100, 100, 200 };
-    var close_samples = [_]u64{ 100, 137, 200 };
+    var fast_trojan_samples = [_]u64{ 100, 100, 200 };
+    var slower_trojan_samples = [_]u64{ 100, 137, 200 };
     var items = [_]WorkItem{
         .{ .raw = "vless", .proxy = vless, .addresses = &.{}, .latency = .fromSamples(&vless_samples) },
-        .{ .raw = "trojan_distant", .proxy = trojan_proxy, .addresses = &.{}, .latency = .fromSamples(&distant_samples) },
-        .{ .raw = "trojan_close", .proxy = trojan_proxy, .addresses = &.{}, .latency = .fromSamples(&close_samples) },
+        .{ .raw = "trojan_fast", .proxy = trojan_proxy, .addresses = &.{}, .latency = .fromSamples(&fast_trojan_samples) },
+        .{ .raw = "trojan_slower", .proxy = trojan_proxy, .addresses = &.{}, .latency = .fromSamples(&slower_trojan_samples) },
     };
     var lists = [_]std.ArrayList(WorkItem){.initBuffer(&items)};
     lists[0].items.len = 2;
-    try std.testing.expectEqualStrings("vless", selectWinner(&lists, .fastest, true).?.raw);
+    try std.testing.expectEqualStrings("trojan_fast", selectWinner(&lists, .fastest, true).?.raw);
+    try std.testing.expectEqualStrings("trojan_fast", selectWinner(&lists, .hydec, true).?.raw);
+    try std.testing.expectEqualStrings("vless", selectWinner(&lists, .strict, true).?.raw);
 
+    // Adding a strictly slower Trojan node must not displace trojan_fast.
     lists[0].items.len = items.len;
-    try std.testing.expectEqualStrings("trojan_close", selectWinner(&lists, .fastest, true).?.raw);
+    try std.testing.expectEqualStrings("trojan_fast", selectWinner(&lists, .fastest, true).?.raw);
+    try std.testing.expectEqualStrings("trojan_fast", selectWinner(&lists, .hydec, true).?.raw);
+
+    // A higher-class tie on worst sample that falls outside the 10% median window
+    // cannot win even with a lower mean.
+    var vless_low_mean = [_]u64{ 1, 150, 200 };
+    items[0].latency = .fromSamples(&vless_low_mean);
+    try std.testing.expectEqualStrings("trojan_fast", selectWinner(&lists, .fastest, true).?.raw);
+    try std.testing.expectEqualStrings("trojan_fast", selectWinner(&lists, .hydec, true).?.raw);
+    try std.testing.expectEqualStrings("vless", selectWinner(&lists, .strict, true).?.raw);
 }
 
 test "OK/FAIL log formatters render both named and unnamed proxies" {

@@ -93,7 +93,7 @@ Every demotion in 2–4 also requires the slower class to be more than **15 ms**
 
 The strategy compares each class by its **worst** probe, so a node at 40 / 42 / 300 ms loses to one at 45 / 46 / 47 ms within the same class. Candidates that passed without a retry rank first. A class whose best needed a retry takes part only when every class needed a retry.
 
-The mean breaks ties among candidates with the same retry status and worst probe. The 10% window starts at the lowest eligible median that keeps the strategy's initial winner inside the window. The `Best:` line shows the median, and `-v` marks retried probes (for example, `OK: 42ms (min 40, max 300, retry 1) …`).
+Among eligible candidates tied on the winning retry status and worst probe, those within **10%** of the lowest median among them are compared by mean latency (then lower median, then protocol preference). The `Best:` line shows the median, and `-v` marks retried probes (for example, `OK: 42ms (min 40, max 300, retry 1) …`).
 
 #### `--check-volume`
 
