@@ -503,25 +503,21 @@ fn connectIpWindowsUntil(io: Io, address: Io.net.IpAddress, deadline: i128) !Io.
         return .{ .socket = socket };
     }
 
-    while (true) {
-        const now = monoNow(io);
-        if (now >= deadline) {
-            cancelWindowsConnect(socket.handle, &iosb);
-            return error.ConnectTimeout;
-        }
-        const remaining_100ns = @divTrunc(deadline - now, 100);
-        const timeout: windows.LARGE_INTEGER = -@as(i64, @intCast(@min(remaining_100ns, std.math.maxInt(i64))));
-        switch (windows.ntdll.NtWaitForSingleObject(socket.handle, .FALSE, &timeout)) {
-            .SUCCESS => {
-                try checkWindowsConnectStatus(iosb.u.Status);
-                return .{ .socket = socket };
-            },
-            .TIMEOUT => {
-                cancelWindowsConnect(socket.handle, &iosb);
-                return error.ConnectTimeout;
-            },
-            else => |wait_status| return windows.unexpectedStatus(wait_status),
-        }
+    var pending = true;
+    defer if (pending) cancelWindowsConnect(socket.handle, &iosb);
+
+    const now = monoNow(io);
+    if (now >= deadline) return error.ConnectTimeout;
+    const remaining_100ns = @divTrunc(deadline - now, 100);
+    const timeout: windows.LARGE_INTEGER = -@as(i64, @intCast(@min(remaining_100ns, std.math.maxInt(i64))));
+    switch (windows.ntdll.NtWaitForSingleObject(socket.handle, .FALSE, &timeout)) {
+        .SUCCESS => {
+            pending = false;
+            try checkWindowsConnectStatus(iosb.u.Status);
+            return .{ .socket = socket };
+        },
+        .TIMEOUT => return error.ConnectTimeout,
+        else => |wait_status| return windows.unexpectedStatus(wait_status),
     }
 }
 
