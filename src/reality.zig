@@ -1124,20 +1124,24 @@ fn runGrpcProbe(
                 // The gun stream's one HEADERS must carry `:status 200` before any DATA:
                 // grpc-go (Xray) drops the stream on anything else, so the reply cannot count.
                 if (!saw_headers_ok) return error.GrpcBadStatus;
-                const data = try grpc_gun.grpcDataPayload(payload, fflags);
-                if (grpc_stream_len + data.len > grpc_stream.len) return error.BufferTooSmall;
-                @memcpy(grpc_stream[grpc_stream_len..][0..data.len], data);
-                grpc_stream_len += data.len;
+                var remaining = try grpc_gun.grpcDataPayload(payload, fflags);
                 const end_stream = (fflags & 0x01) != 0;
 
-                while (try grpc_gun.completeGrpcFrameLen(grpc_stream[0..grpc_stream_len])) |total| {
+                while (true) {
+                    const total = (try grpc_gun.completeGrpcFrameLen(grpc_stream[0..grpc_stream_len])) orelse {
+                        if (remaining.len == 0) break;
+                        // An incomplete message always leaves room in the buffer.
+                        const chunk_len = @min(remaining.len, grpc_stream.len - grpc_stream_len);
+                        @memcpy(grpc_stream[grpc_stream_len..][0..chunk_len], remaining[0..chunk_len]);
+                        grpc_stream_len += chunk_len;
+                        remaining = remaining[chunk_len..];
+                        continue;
+                    };
                     const msg = try grpc_gun.vlessFromGrpcData(grpc_stream[0..total]);
-                    var finished_warmup = false;
                     if (!warmup_done) {
                         if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, .{ .trace = util.PROBE_UA_WARMUP })) {
                             if (end_stream) return error.GrpcStreamEnded;
                             warmup_done = true;
-                            finished_warmup = true;
                             // Fresh buffer for the keep-alive request; VLESS header already stripped.
                             http_len = 0;
                             var hunk: [256]u8 = undefined;
@@ -1147,17 +1151,13 @@ fn runGrpcProbe(
                             var data_frame: [384]u8 = undefined;
                             const dlen = try grpc_gun.buildDataFrame(&data_frame, 1, grpc_msg[0..glen], false);
                             try conn.writeApp(data_frame[0..dlen]);
-                            // Bytes already in `gather` cannot be a reply to the steady write.
+                            // Discard the rest of this DATA frame and ignore buffered frames.
                             discard_data_before = gather_len;
+                            grpc_stream_len = 0;
+                            break;
                         }
                     } else if (try grpcProbeHttpReady(&http_buf, &http_len, msg, &stripped_vless, target.steady_reply)) {
                         return netutil.elapsedMs(start, io);
-                    }
-                    // Drop any pipelined leftover after warmup (same as ignoring trailing
-                    // bytes in a single DATA frame before reassembly).
-                    if (finished_warmup) {
-                        grpc_stream_len = 0;
-                        break;
                     }
                     shiftDown(&grpc_stream, &grpc_stream_len, total);
                 }
@@ -2035,6 +2035,54 @@ test "runGrpcProbe fails closed when only pipelined steady bytes remain" {
         runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage),
     );
     try std.testing.expectEqual(@as(usize, 2), conn.writes.items.len);
+}
+
+test "runGrpcProbe reassembles a maximum gRPC message followed by a partial header" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var warm: [256]u8 = undefined;
+    const warm_len = try testGunData(&warm, util.PROBE_UA_WARMUP, true, true, false);
+
+    var first: [grpc_gun.MAX_GRPC_MESSAGE_LEN + 5]u8 = @splat(0);
+    std.mem.writeInt(u32, first[1..5], grpc_gun.MAX_GRPC_MESSAGE_LEN, .big);
+    const hunk_len = try grpc_gun.wrapHunk(first[5..], "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+    // A protobuf bytes field unknown to Hunk fills out the message without adding HTTP bytes.
+    const padding = first[5 + hunk_len ..];
+    const padding_len = padding.len - 4;
+    padding[0..4].* = .{
+        0x12,
+        @as(u8, @truncate(padding_len)) | 0x80,
+        @as(u8, @truncate(padding_len >> 7)) | 0x80,
+        @intCast(padding_len >> 14),
+    };
+
+    var hunk: [128]u8 = undefined;
+    const body_len = try grpc_gun.wrapHunk(&hunk, "fl=1\nvisit_scheme=http\nuag=" ++ util.PROBE_UA_STEADY ++ "\n");
+    var second: [256]u8 = undefined;
+    const second_len = try grpc_gun.wrapGrpc(&second, hunk[0..body_len]);
+
+    var frames: [6][GRPC_MAX_FRAME_PAYLOAD_LEN]u8 = undefined;
+    var reads: [3 + frames.len][]const u8 = undefined;
+    reads[0..3].* = .{ &test_grpc_settings, &test_grpc_headers_200, warm[0..warm_len] };
+    const chunk_len = GRPC_MAX_FRAME_PAYLOAD_LEN - GRPC_FRAME_HEADER_LEN;
+    for (0..4) |i| {
+        const len = try grpc_gun.buildDataFrame(&frames[i], 1, first[i * chunk_len ..][0..chunk_len], false);
+        reads[3 + i] = frames[i][0..len];
+    }
+    const tail = first[4 * chunk_len ..];
+    var joined: [tail.len + 3]u8 = undefined;
+    @memcpy(joined[0..tail.len], tail);
+    joined[tail.len..].* = second[0..3].*;
+    const joined_len = try grpc_gun.buildDataFrame(&frames[4], 1, &joined, false);
+    reads[7] = frames[4][0..joined_len];
+    const last_len = try grpc_gun.buildDataFrame(&frames[5], 1, second[3..second_len], true);
+    reads[8] = frames[5][0..last_len];
+
+    var conn: ScriptedGrpcConn = .{ .reads = &reads, .gpa = gpa };
+    defer conn.deinit();
+    var stage: util.Stage = .setup;
+    _ = try runGrpcProbe(&conn, io, netutil.monoNow(io), util.LATENCY_TARGET, "request", "", "example.com", &stage);
+    try std.testing.expectEqual(reads.len, conn.read_i);
 }
 
 test "runGrpcProbe validates a close-delimited steady response at HTTP/2 END_STREAM" {
