@@ -159,16 +159,14 @@ fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
 
         switch (hop) {
             .follow => |next| {
+                defer req.deinit();
+                errdefer gpa.free(next);
+
                 // Drain the redirect body so the next hop starts on a clean connection.
                 const reader = response.reader(&.{});
                 _ = reader.discardRemaining() catch |err| switch (err) {
-                    error.ReadFailed => {
-                        gpa.free(next);
-                        req.deinit();
-                        return response.bodyErr().?;
-                    },
+                    error.ReadFailed => return bodyReadError(&response, null),
                 };
-                req.deinit();
                 if (owned_url) |u| gpa.free(u);
                 owned_url = next;
                 current_url = next;
@@ -176,16 +174,38 @@ fn fetchUrlInner(gpa: std.mem.Allocator, io: Io, url: []const u8) ![]u8 {
             },
             .body => {
                 defer req.deinit();
-
-                var transfer_buffer: [8 * 1024]u8 = undefined;
-                var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-                var decompress: http.Decompress = undefined;
-                var body_reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
-
-                return try body_reader.allocRemaining(gpa, .limited(4 * 1024 * 1024));
+                return readSubscriptionBody(gpa, &response);
             },
         }
     }
+}
+
+fn readSubscriptionBody(gpa: std.mem.Allocator, response: *http.Client.Response) ![]u8 {
+    var transfer_buffer: [8 * 1024]u8 = undefined;
+    var decompress_buffer: [std.compress.flate.max_window_len]u8 = undefined;
+    // Zig leaves this untouched for an uncompressed body delimited by connection close.
+    var decompress: http.Decompress = .{ .none = .ending };
+    const body_reader = response.readerDecompressing(&transfer_buffer, &decompress, &decompress_buffer);
+    return body_reader.allocRemaining(gpa, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.ReadFailed => return bodyReadError(response, switch (decompress) {
+            .flate => |*d| d.err,
+            .zstd => |*d| d.err,
+            .none => null,
+        }),
+        else => |e| return e,
+    };
+}
+
+fn bodyReadError(response: *const http.Client.Response, decompress_err: ?anyerror) anyerror {
+    if (response.bodyErr()) |err| return err;
+    if (decompress_err) |err| {
+        if (err != error.ReadFailed) return err;
+    }
+    // Only inspect the connection once HTTP and decompression errors are ruled out.
+    if (response.request.connection) |connection| {
+        return connection.getReadError() orelse error.ReadFailed;
+    }
+    return error.ReadFailed;
 }
 
 /// What to do with one response hop.
@@ -258,6 +278,59 @@ test "requireHttpsUri rejects plaintext and normalizes scheme case" {
     try std.testing.expectError(error.InsecureSubscriptionUrl, requireHttpsUri("ftp://example.com/sub"));
     const uri = try requireHttpsUri("HTTPS://example.com/sub");
     try std.testing.expectEqualStrings("https", uri.scheme);
+}
+
+test "subscription body preserves HTTP framing, gzip, and socket errors" {
+    const cases = [_]struct {
+        head: []const u8,
+        input: Io.Reader,
+        expected: anyerror,
+        socket_err: ?Io.net.Stream.Reader.Error = null,
+    }{
+        .{
+            .head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Encoding: gzip\r\n\r\n",
+            .input = .fixed("10\r\n"),
+            .expected = error.HttpChunkTruncated,
+        },
+        .{
+            .head = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n",
+            .input = .fixed("bad gzip header"),
+            .expected = error.BadGzipHeader,
+        },
+        .{
+            .head = "HTTP/1.1 200 OK\r\n\r\n",
+            .input = .failing,
+            .expected = error.ReadFailed,
+        },
+        .{
+            .head = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n",
+            .input = .failing,
+            .expected = error.ConnectionResetByPeer,
+            .socket_err = error.ConnectionResetByPeer,
+        },
+    };
+    for (cases) |case| {
+        var input = case.input;
+        var connection: http.Client.Connection = undefined;
+        connection.protocol = .plain;
+        connection.stream_reader.err = case.socket_err;
+        var req: http.Client.Request = undefined;
+        req.method = .GET;
+        req.connection = if (case.socket_err != null) &connection else null;
+        req.reader = .{
+            .in = &input,
+            .interface = undefined,
+            .state = .received_head,
+            .max_head_len = 1024,
+            .side = .response,
+        };
+        var response: http.Client.Response = .{
+            .request = &req,
+            .head = try .parse(case.head),
+        };
+
+        try std.testing.expectError(case.expected, readSubscriptionBody(std.testing.allocator, &response));
+    }
 }
 
 test "resolveHttpsRedirect keeps HTTPS targets and rejects plaintext hops" {
