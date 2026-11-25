@@ -6,6 +6,7 @@ const ss = @import("ss.zig");
 const trojan = @import("trojan.zig");
 const alpn = @import("alpn.zig");
 const reality = @import("reality.zig");
+const hy2 = @import("hy2.zig");
 const netutil = @import("netutil.zig");
 const Io = std.Io;
 
@@ -35,11 +36,13 @@ pub const Strategy = enum {
 
 /// Preference class for `best` ranking (higher = preferred when latencies are comparable).
 /// VLESS² = REALITY gRPC; VLESS³ = REALITY TCP vision — matching HyNet subscription labels.
+/// `hysteria2` is a UDP reachability time and stays out of that order.
 pub const PrefClass = enum {
     shadowsocks,
     vless3,
     trojan,
     vless2,
+    hysteria2,
 
     pub fn fromProxy(proxy: proxy_uri.Proxy) ?PrefClass {
         return switch (proxy.kind) {
@@ -50,6 +53,7 @@ pub const PrefClass = enum {
             },
             .shadowsocks => .shadowsocks,
             .trojan => .trojan,
+            .hysteria2 => .hysteria2,
             else => null,
         };
     }
@@ -211,6 +215,7 @@ pub fn probeOne(
                 stage,
             );
         },
+        .hysteria2 => try hy2.probe(gpa, io, proxy.host, proxy.port, proxy.query, timeout_secs, bind, addresses, stage),
         .vmess => error.SkippedVmess,
         .unsupported => error.UnsupportedProtocol,
     };
@@ -307,7 +312,10 @@ pub fn probeLatency(
     const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind, .addresses = addresses, .stage = stage }, &samples);
     var latency = Latency.fromSamples(&samples);
     latency.retries = retries;
-    if (check_volume) {
+    if (check_volume and proxy.kind == .hysteria2) {
+        // No tunnel, so a download cannot stall or prove anything.
+        std.log.debug("volume check skipped for hysteria2 {s}:{d}", .{ proxy.host, proxy.port });
+    } else if (check_volume) {
         _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, addresses, stage) catch |err| switch (err) {
             error.VolumeRefused => {
                 if (!volumeRefusalIgnored(proxy)) return err;
@@ -560,6 +568,7 @@ pub fn failHint(err: anyerror) []const u8 {
         error.InvalidSsChunk => "ss/chunk",
         error.UnsupportedVlessEncryption => "unsupported-encryption",
         error.UnsupportedTransport => "unsupported-transport",
+        error.UnsupportedObfs => "unsupported-obfs",
         error.UnsupportedPlugin => "unsupported-plugin",
         error.BufferTooSmall, error.RecordTooLarge => "buffer/overflow",
         error.SystemResources => "sys/resources",
@@ -1081,13 +1090,15 @@ fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, pref
         }
     }
 
-    const chosen = selectBestRanked(strategy, ranks) orelse return null;
+    // A hysteria2 RTT is not a tunnel measurement, so it wins only when every full probe failed.
+    const chosen = selectBestRanked(strategy, ranks) orelse return best.get(.hysteria2);
     const stable_rank: ?Rank = if (prefer_stable) ranks.get(chosen).? else null;
     const top_tier = strategy == .hydec and (chosen == .vless2 or chosen == .trojan);
 
     var eligible: std.EnumArray(PrefClass, bool) = .initFill(false);
     var median: u64 = std.math.maxInt(u64);
     for (std.enums.values(PrefClass)) |class| {
+        if (class == .hysteria2) continue;
         const rank = ranks.get(class) orelse continue;
         if (stable_rank) |required| {
             if (!std.meta.eql(rank, required)) continue;
@@ -1191,6 +1202,53 @@ test "selectWinner respects strategy classes and prefer-stable ranking" {
     try std.testing.expectEqualStrings("ss", selectWinner(&lists, .fastest, false).?.raw);
     items[2].latency.?.retries = 1;
     try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .fastest, true).?.raw);
+}
+
+test "selectWinner falls back to hysteria2 only when nothing else passed" {
+    const trojan_proxy: proxy_uri.Proxy = .{
+        .kind = .trojan,
+        .raw = "",
+        .host = "192.0.2.1",
+        .port = 443,
+        .userinfo = "",
+        .query = "",
+    };
+    var hy_fast_proxy = trojan_proxy;
+    hy_fast_proxy.kind = .hysteria2;
+    const hy_steady_proxy = hy_fast_proxy;
+    var trojan_samples = [_]u64{ 400, 400, 400 };
+    var hy_fast = [_]u64{ 5, 5, 5 };
+    var hy_steady = [_]u64{ 20, 20, 20 };
+    var items = [_]WorkItem{
+        .{ .raw = "hy-fast", .proxy = hy_fast_proxy, .addresses = &.{}, .latency = .fromSamples(&hy_fast) },
+        .{ .raw = "hy-steady", .proxy = hy_steady_proxy, .addresses = &.{}, .latency = .fromSamples(&hy_steady) },
+        .{ .raw = "trojan", .proxy = trojan_proxy, .addresses = &.{}, .latency = .fromSamples(&trojan_samples) },
+    };
+    var lists = [_]std.ArrayList(WorkItem){.initBuffer(&items)};
+    lists[0].items.len = items.len;
+
+    try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .fastest, false).?.raw);
+    try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .hydec, false).?.raw);
+    try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .strict, false).?.raw);
+
+    items[2].latency = null;
+    try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .fastest, false).?.raw);
+    try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .strict, true).?.raw);
+
+    items[0].latency.?.retries = 1;
+    try std.testing.expectEqualStrings("hy-steady", selectWinner(&lists, .hydec, true).?.raw);
+    try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .hydec, false).?.raw);
+
+    var tied = [_]u64{ 10, 10, 10 };
+    items[0].latency = .fromSamples(&tied);
+    items[1].latency = .fromSamples(&tied);
+    try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .hydec, false).?.raw);
+    std.mem.swap(WorkItem, &items[0], &items[1]);
+    try std.testing.expectEqualStrings("hy-steady", selectWinner(&lists, .hydec, false).?.raw);
+
+    items[0].latency = null;
+    items[1].latency = null;
+    try std.testing.expect(selectWinner(&lists, .hydec, false) == null);
 }
 
 test "selectWinner with prefer-stable uses mean only for close medians at equal rank" {
@@ -1904,6 +1962,7 @@ test "failHint classifies write and buffer errors" {
     // std spells the same condition AddressUnavailable in Io.net.IpAddress.BindError.
     try std.testing.expectEqualStrings("iface/addr", failHint(error.AddressUnavailable));
     try std.testing.expectEqualStrings("iface/empty", failHint(error.EmptyInterfaceName));
+    try std.testing.expectEqualStrings("unsupported-obfs", failHint(error.UnsupportedObfs));
 }
 
 test "PrefClass.fromProxy maps vless transport and protocols" {

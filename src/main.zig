@@ -172,6 +172,7 @@ test {
     _ = @import("reality.zig");
     _ = @import("probe.zig");
     _ = @import("netutil.zig");
+    _ = @import("hy2.zig");
     _ = @import("fetch.zig");
     _ = @import("alpn.zig");
     _ = @import("tls_client.zig");

@@ -5,6 +5,7 @@ pub const Kind = enum {
     vless,
     trojan,
     shadowsocks,
+    hysteria2,
     vmess,
     unsupported,
 };
@@ -80,6 +81,7 @@ pub fn classify(line: []const u8) Kind {
     if (startsWithScheme(line, "vless")) return .vless;
     if (startsWithScheme(line, "trojan")) return .trojan;
     if (startsWithScheme(line, "ss")) return .shadowsocks;
+    if (startsWithScheme(line, "hysteria2") or startsWithScheme(line, "hy2")) return .hysteria2;
     if (startsWithScheme(line, "vmess")) return .vmess;
     return .unsupported;
 }
@@ -162,6 +164,7 @@ pub fn parse(gpa: std.mem.Allocator, line: []const u8) !Proxy {
         .vless => try parseVless(gpa, line),
         .trojan => try parseTrojan(gpa, line),
         .shadowsocks => try parseSs(gpa, line),
+        .hysteria2 => try parseHysteria2(gpa, line),
         .vmess => .{
             .kind = .vmess,
             .raw = line,
@@ -217,6 +220,38 @@ fn parseTrojan(gpa: std.mem.Allocator, line: []const u8) !Proxy {
         .transport = parseTransport(type_param),
         .security = if (security_param) |value| parseSecurity(value) else .tls,
         .name = name,
+    };
+}
+
+fn parseHysteria2(gpa: std.mem.Allocator, line: []const u8) !Proxy {
+    const rest = afterScheme(line);
+    const no_frag = stripFragment(rest);
+    const address_part = if (std.mem.findScalar(u8, no_frag, '?')) |q| no_frag[0..q] else no_frag;
+    if (std.mem.findScalar(u8, address_part, '@') != null) {
+        const parts = try parseUserAtHost(gpa, rest, 443);
+        errdefer if (parts.owns_userinfo) gpa.free(parts.userinfo);
+        return .{
+            .kind = .hysteria2,
+            .raw = line,
+            .host = parts.host,
+            .port = parts.port,
+            .userinfo = parts.userinfo,
+            .owns_userinfo = parts.owns_userinfo,
+            .query = parts.query,
+            .name = try parseName(gpa, line),
+        };
+    }
+
+    const query = if (std.mem.findScalar(u8, no_frag, '?')) |q| no_frag[q + 1 ..] else "";
+    const hp = try util.splitHostPortOrDefault(stripPath(address_part), 443);
+    return .{
+        .kind = .hysteria2,
+        .raw = line,
+        .host = hp.host,
+        .port = hp.port,
+        .userinfo = "",
+        .query = query,
+        .name = try parseName(gpa, line),
     };
 }
 
@@ -367,6 +402,28 @@ test "classify case-insensitive scheme" {
     try std.testing.expect(classify("VLESS://x") == .vless);
     try std.testing.expect(classify("SS://x") == .shadowsocks);
     try std.testing.expect(classify("Trojan://x") == .trojan);
+    try std.testing.expect(classify("HY2://x") == .hysteria2);
+    try std.testing.expect(classify("Hysteria2://x") == .hysteria2);
+}
+
+test "parse hysteria2" {
+    const gpa = std.testing.allocator;
+    var p = try parse(gpa, "hy2://p%40ss@192.0.2.10:8443/?sni=example.com&obfs=#Hy2");
+    defer p.deinit(gpa);
+    try std.testing.expect(p.kind == .hysteria2);
+    try std.testing.expectEqualStrings("p@ss", p.userinfo);
+    try std.testing.expectEqualStrings("192.0.2.10", p.host);
+    try std.testing.expectEqual(@as(u16, 8443), p.port);
+    try std.testing.expectEqualStrings("example.com", util.getQueryParam(p.query, "sni").?);
+    try std.testing.expectEqualStrings("", util.getQueryParam(p.query, "obfs").?);
+    try std.testing.expectEqualStrings("Hy2", p.name.?);
+
+    var bare = try parse(gpa, "hysteria2://[2001:db8::1]?sni=example.com");
+    defer bare.deinit(gpa);
+    try std.testing.expectEqualStrings("2001:db8::1", bare.host);
+    try std.testing.expectEqual(@as(u16, 443), bare.port);
+    try std.testing.expectEqualStrings("", bare.userinfo);
+    try std.testing.expectEqualStrings("example.com", util.getQueryParam(bare.query, "sni").?);
 }
 
 test "parse type security case-insensitive" {

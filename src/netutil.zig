@@ -656,6 +656,20 @@ test "Windows connect completion status preserves socket errors" {
     try std.testing.expectError(error.SystemResources, checkWindowsConnectStatus(.INSUFFICIENT_RESOURCES));
 }
 
+/// Non-blocking UDP socket. `bind_spec` is applied the same way as on a TCP probe.
+pub fn openUdpSocket(peer: Io.net.IpAddress, bind_spec: ?[]const u8) !posix.socket_t {
+    if (builtin.target.os.tag == .windows) return error.SocketModeUnsupported;
+    const family: posix.sa_family_t = switch (peer) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const flags: u32 = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
+    const sock = try openSocket(family, flags);
+    errdefer _ = posix.system.close(sock);
+    try applyBind(sock, bind_spec);
+    return sock;
+}
+
 fn openSocket(family: posix.sa_family_t, flags: u32) !posix.socket_t {
     while (true) {
         const rc = posix.system.socket(family, flags, 0);
