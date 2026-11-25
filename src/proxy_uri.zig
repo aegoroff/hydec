@@ -365,6 +365,104 @@ fn decodeUserinfo(gpa: std.mem.Allocator, encoded: []const u8) ![]u8 {
     return util.decodeBase64Url(gpa, pct, false);
 }
 
+/// Replace the authority host (`user@host:port`) with the IP in `address`.
+/// Query, fragment and an explicit port stay; `sni=` is left as the domain.
+/// A legacy `ss://` blob with the host inside base64 is left unchanged.
+pub fn rewriteAuthorityHost(gpa: std.mem.Allocator, line: []const u8, address: std.Io.net.IpAddress) ![]u8 {
+    const sep = std.mem.find(u8, line, "://") orelse return error.InvalidProxyUri;
+    const rest_off = sep + 3;
+    const rest = line[rest_off..];
+    const hash = std.mem.findScalar(u8, rest, '#');
+    const hier_end = hash orelse rest.len;
+    const query = std.mem.findScalar(u8, rest[0..hier_end], '?');
+    const address_end = query orelse hier_end;
+    const address_part = rest[0..address_end];
+    const at = std.mem.findScalarLast(u8, address_part, '@') orelse return error.InvalidProxyUri;
+    const after_at = address_part[at + 1 ..];
+    const slash = std.mem.findScalar(u8, after_at, '/') orelse after_at.len;
+    const hostport = after_at[0..slash];
+    const hp = try util.splitHostPortOrDefault(hostport, 0);
+    const port: ?u16 = if (hostPortExplicit(hostport)) hp.port else null;
+
+    var literal_buf: [96]u8 = undefined;
+    const literal = formatDialHost(address, port, &literal_buf);
+
+    const host_off = rest_off + at + 1;
+    const host_end = host_off + hostport.len;
+    const out = try gpa.alloc(u8, line.len - hostport.len + literal.len);
+    @memcpy(out[0..host_off], line[0..host_off]);
+    @memcpy(out[host_off..][0..literal.len], literal);
+    @memcpy(out[host_off + literal.len ..], line[host_end..]);
+    return out;
+}
+
+fn hostPortExplicit(hostport: []const u8) bool {
+    if (hostport.len > 0 and hostport[0] == '[') {
+        const close = std.mem.findScalar(u8, hostport, ']') orelse return false;
+        return close + 1 < hostport.len and hostport[close + 1] == ':';
+    }
+    return std.mem.findScalar(u8, hostport, ':') != null;
+}
+
+fn formatDialHost(address: std.Io.net.IpAddress, port: ?u16, buf: *[96]u8) []const u8 {
+    var ip_buf: [64]u8 = undefined;
+    var ip_writer: std.Io.Writer = .fixed(&ip_buf);
+    const normalized = switch (address) {
+        .ip4 => address,
+        .ip6 => |ip6| std.Io.net.IpAddress.fromIp6(ip6),
+    };
+    normalized.format(&ip_writer) catch unreachable;
+    const formatted = ip_writer.buffered();
+    const port_sep = std.mem.lastIndexOfScalar(u8, formatted, ':').?;
+    const ip = switch (normalized) {
+        .ip4 => formatted[0..port_sep],
+        .ip6 => formatted[1 .. port_sep - 1],
+    };
+    var n: usize = 0;
+    if (normalized == .ip6) {
+        buf[n] = '[';
+        n += 1;
+    }
+    @memcpy(buf[n..][0..ip.len], ip);
+    n += ip.len;
+    if (normalized == .ip6) {
+        buf[n] = ']';
+        n += 1;
+    }
+    if (port) |p| {
+        buf[n] = ':';
+        n += 1;
+        const rendered = std.fmt.bufPrint(buf[n..], "{d}", .{p}) catch unreachable;
+        n += rendered.len;
+    }
+    return buf[0..n];
+}
+
+test "rewriteAuthorityHost keeps sni, path and fragment" {
+    const gpa = std.testing.allocator;
+    const line = "trojan://a%40b@32.hcdn.uk:2058?type=ws&path=%2Ftr&security=tls&sni=32.hcdn.uk&fp=chrome#name";
+    const address = try std.Io.net.IpAddress.parse("203.0.113.10", 2058);
+    const out = try rewriteAuthorityHost(gpa, line, address);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings(
+        "trojan://a%40b@203.0.113.10:2058?type=ws&path=%2Ftr&security=tls&sni=32.hcdn.uk&fp=chrome#name",
+        out,
+    );
+
+    const v6 = try std.Io.net.IpAddress.parse("2001:db8::10", 2058);
+    const v6_out = try rewriteAuthorityHost(gpa, line, v6);
+    defer gpa.free(v6_out);
+    try std.testing.expectEqualStrings(
+        "trojan://a%40b@[2001:db8::10]:2058?type=ws&path=%2Ftr&security=tls&sni=32.hcdn.uk&fp=chrome#name",
+        v6_out,
+    );
+
+    const at = "trojan://a@b@32.hcdn.uk:2058?sni=32.hcdn.uk";
+    const at_out = try rewriteAuthorityHost(gpa, at, address);
+    defer gpa.free(at_out);
+    try std.testing.expectEqualStrings("trojan://a@b@203.0.113.10:2058?sni=32.hcdn.uk", at_out);
+}
+
 test "parse vless" {
     const gpa = std.testing.allocator;
     const line =

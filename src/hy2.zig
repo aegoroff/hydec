@@ -23,8 +23,9 @@ pub fn probe(
     query: []const u8,
     timeout_secs: u32,
     bind_spec: ?[]const u8,
-    addresses: ?[]const Io.net.IpAddress,
+    addresses: ?[]Io.net.IpAddress,
     stage: *util.Stage,
+    dialed: ?*Io.net.IpAddress,
 ) !u64 {
     stage.* = .setup;
     try rejectObfs(gpa, query);
@@ -43,10 +44,14 @@ pub fn probe(
 
     // shortcut: Windows waits on one address at a time, so a silent address
     // burns the rest of the deadline. Upgrade when several UDP sockets can be polled together.
-    if (builtin.target.os.tag == .windows) {
-        return probeWindows(io, host, port, dests, &packet, &scid, deadline, stage);
+    const ms = if (builtin.target.os.tag == .windows)
+        try probeWindows(io, host, port, dests, &packet, &scid, deadline, stage)
+    else
+        try probePosix(io, host, port, dests, bind_spec, &packet, &scid, deadline, stage);
+    if (dialed) |slot| {
+        if (dests.len > 0) slot.* = dests[0];
     }
-    return probePosix(io, host, port, dests, bind_spec, &packet, &scid, deadline, stage);
+    return ms;
 }
 
 fn rejectObfs(gpa: std.mem.Allocator, query: []const u8) !void {
@@ -68,10 +73,10 @@ fn destinations(
     io: Io,
     host: []const u8,
     port: u16,
-    addresses: ?[]const Io.net.IpAddress,
+    addresses: ?[]Io.net.IpAddress,
     deadline: i128,
     storage: *[max_peers]Io.net.IpAddress,
-) ![]const Io.net.IpAddress {
+) ![]Io.net.IpAddress {
     if (addresses) |known| if (known.len > 0) {
         if (known.len > max_peers) return error.TooManyResolvedAddresses;
         return known;
@@ -119,7 +124,7 @@ fn probeWindows(
     io: Io,
     host: []const u8,
     port: u16,
-    dests: []const Io.net.IpAddress,
+    dests: []Io.net.IpAddress,
     packet: []const u8,
     scid: *const [cid_len]u8,
     deadline: i128,
@@ -162,10 +167,20 @@ fn probeWindows(
             };
             if (message.data.len == 0 or !samePeer(message.from, dest)) continue;
             noteReply(host, port, message.data, scid);
+            promote(dests, dest);
             return netutil.elapsedMs(start, io);
         }
     }
     return last_err;
+}
+
+fn promote(addresses: []Io.net.IpAddress, chosen: Io.net.IpAddress) void {
+    for (addresses[1..], 1..) |address, i| {
+        if (!samePeer(address, chosen)) continue;
+        addresses[i] = addresses[0];
+        addresses[0] = chosen;
+        return;
+    }
 }
 
 fn samePeer(from: Io.net.IpAddress, dest: Io.net.IpAddress) bool {
@@ -177,6 +192,7 @@ fn samePeer(from: Io.net.IpAddress, dest: Io.net.IpAddress) bool {
 
 const Attempt = struct {
     sock: posix.socket_t,
+    dest: Io.net.IpAddress,
     open: bool = true,
 
     fn close(self: *Attempt) void {
@@ -190,7 +206,7 @@ fn probePosix(
     io: Io,
     host: []const u8,
     port: u16,
-    dests: []const Io.net.IpAddress,
+    dests: []Io.net.IpAddress,
     bind_spec: ?[]const u8,
     packet: []const u8,
     scid: *const [cid_len]u8,
@@ -213,7 +229,7 @@ fn probePosix(
             _ = posix.system.close(sock);
             continue;
         };
-        attempts[n] = .{ .sock = sock };
+        attempts[n] = .{ .sock = sock, .dest = dest };
         n += 1;
     }
     if (n == 0) return last_err;
@@ -233,13 +249,14 @@ fn probePosix(
         stage.* = .connect;
         return last_err;
     }
-    return waitForReply(io, host, port, attempts[0..n], scid, start, deadline, &last_err);
+    return waitForReply(io, host, port, dests, attempts[0..n], scid, start, deadline, &last_err);
 }
 
 fn waitForReply(
     io: Io,
     host: []const u8,
     port: u16,
+    dests: []Io.net.IpAddress,
     attempts: []Attempt,
     scid: *const [cid_len]u8,
     start: i128,
@@ -283,6 +300,7 @@ fn waitForReply(
             };
             if (nread == 0) continue;
             noteReply(host, port, buf[0..nread], scid);
+            promote(dests, attempts[index].dest);
             return netutil.elapsedMs(start, io);
         }
     }
@@ -421,6 +439,7 @@ test "probe rejects obfs before dialing" {
         null,
         null,
         &stage,
+        null,
     ));
     try std.testing.expectEqual(util.Stage.setup, stage);
 }
@@ -436,6 +455,7 @@ test "udp ping accepts a loopback reply" {
     const thread = try std.Thread.spawn(.{}, replyOnce, .{server.handle});
     defer thread.join();
 
+    var addresses = [_]Io.net.IpAddress{server.address};
     var stage: util.Stage = .setup;
     const ms = try probe(
         std.testing.allocator,
@@ -445,8 +465,9 @@ test "udp ping accepts a loopback reply" {
         "sni=example.com",
         2,
         null,
-        &.{server.address},
+        &addresses,
         &stage,
+        null,
     );
     try std.testing.expect(ms < 2000);
     try std.testing.expectEqual(util.Stage.handshake, stage);
@@ -473,6 +494,7 @@ test "closed udp port fails without waiting out the timeout" {
         null,
         null,
         &stage,
+        null,
     ));
     try std.testing.expect(netutil.elapsedMs(start, io) < 1000);
 }

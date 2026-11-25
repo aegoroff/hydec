@@ -188,8 +188,9 @@ pub fn probe(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]const Io.net.IpAddress,
+    addresses: ?[]Io.net.IpAddress,
     stage: *util.Stage,
+    dialed: ?*Io.net.IpAddress,
 ) !u64 {
     const start = netutil.monoNow(io);
     const sni_use = if (opts.sni.len > 0) opts.sni else host;
@@ -202,7 +203,7 @@ pub fn probe(
     // Measured from the real dial; ALPN is part of this handshake.
     const attempt_start = netutil.monoNow(io);
     stage.* = .connect;
-    const stream = try netutil.connectHostPortWithAddresses(io, host, port, connect_secs, bind, addresses);
+    const stream = try netutil.connectHostPortWithAddresses(io, host, port, connect_secs, bind, addresses, dialed);
     defer stream.close(io);
     stage.* = .handshake;
 

@@ -103,7 +103,7 @@ The latency probes move only a few hundred bytes, so a node whose sessions DPI f
 
 - **stderr:** download progress, optional verbose probe lines, summary stats, winner line  
   `Best: 59ms 192.168.11.1 — 🇸🇪 SHADOWSOCKS - Швеция`
-- **stdout:** raw winning proxy URI (one line)
+- **stdout:** winning proxy URI (one line). When `best` can replace the hostname with an IP address from DNS, it preserves the query parameters (including any explicit `sni`) and the fragment. Otherwise it prints the original URI.
 
 ### Output (`ping`)
 

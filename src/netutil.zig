@@ -17,10 +17,16 @@ pub fn connectHostPortWithAddresses(
     port: u16,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]const Io.net.IpAddress,
+    addresses: ?[]Io.net.IpAddress,
+    dialed: ?*Io.net.IpAddress,
 ) !Io.net.Stream {
     if (addresses) |resolved| {
-        if (resolved.len > 0) return connectAddressesUntil(io, resolved, deadlineNs(io, timeout_secs), bind);
+        if (resolved.len > 0) {
+            const stream = try connectAddressesUntil(io, resolved, deadlineNs(io, timeout_secs), bind);
+            // promoteAddress left the peer that connected at index 0.
+            saveDialed(dialed, resolved[0]);
+            return stream;
+        }
     }
 
     // Zig's Threaded Io panics on ConnectOptions.timeout ("TODO"), so IP dials
@@ -29,10 +35,15 @@ pub fn connectHostPortWithAddresses(
     if (Io.net.IpAddress.parse(host, port)) |addr| {
         const stream = try connectIpTimed(io, addr, timeout_secs, bind);
         setTcpNoDelay(stream);
+        saveDialed(dialed, addr);
         return stream;
     } else |_| {}
 
-    return connectHostnameTimed(io, host, port, timeout_secs, bind);
+    return connectHostnameTimed(io, host, port, timeout_secs, bind, dialed);
+}
+
+fn saveDialed(dialed: ?*Io.net.IpAddress, address: Io.net.IpAddress) void {
+    if (dialed) |slot| slot.* = address;
 }
 
 const ADDRESS_START_DELAY_NS: i128 = 250 * std.time.ns_per_ms;
@@ -40,7 +51,7 @@ const MAX_RACED_ADDRESSES = 32;
 
 fn connectAddressesUntil(
     io: Io,
-    addresses: []const Io.net.IpAddress,
+    addresses: []Io.net.IpAddress,
     deadline: i128,
     bind: ?[]const u8,
 ) !Io.net.Stream {
@@ -56,8 +67,16 @@ fn connectAddressesUntil(
     return stream;
 }
 
+fn promoteAddress(addresses: []Io.net.IpAddress, index: usize) void {
+    if (index == 0 or index >= addresses.len) return;
+    const chosen = addresses[index];
+    addresses[index] = addresses[0];
+    addresses[0] = chosen;
+}
+
 /// Start another address every 250 ms without cancelling attempts already in flight.
-fn raceAddresses(race: anytype, addresses: []const Io.net.IpAddress, deadline: i128) !Io.net.Stream {
+/// The address that connected is moved to index 0.
+fn raceAddresses(race: anytype, addresses: []Io.net.IpAddress, deadline: i128) !Io.net.Stream {
     var active: [MAX_RACED_ADDRESSES]bool = @splat(false);
     var active_count: usize = 0;
     var started: usize = 0;
@@ -79,7 +98,10 @@ fn raceAddresses(race: anytype, addresses: []const Io.net.IpAddress, deadline: i
             const index = started;
             started += 1;
             if (race.start(index, addresses[index])) |immediate| {
-                if (immediate) |stream| return stream;
+                if (immediate) |stream| {
+                    promoteAddress(addresses, index);
+                    return stream;
+                }
                 active[index] = true;
                 active_count += 1;
                 next_start = @min(deadline, race.now() + ADDRESS_START_DELAY_NS);
@@ -102,6 +124,7 @@ fn raceAddresses(race: anytype, addresses: []const Io.net.IpAddress, deadline: i
             active[index] = false;
             active_count -= 1;
             if (race.finish(index)) |stream| {
+                promoteAddress(addresses, index);
                 return stream;
             } else |err| {
                 race.cancel(index);
@@ -123,6 +146,7 @@ fn connectHostnameTimed(
     port: u16,
     timeout_secs: u32,
     bind: ?[]const u8,
+    dialed: ?*Io.net.IpAddress,
 ) !Io.net.Stream {
     const hostname = try Io.net.HostName.init(host);
     const deadline = deadlineNs(io, timeout_secs);
@@ -201,6 +225,7 @@ fn connectHostnameTimed(
         if (address_count == 0) continue;
         saw_address = true;
         if (connectAddressesUntil(io, addresses[0..address_count], deadline, bind)) |stream| {
+            saveDialed(dialed, addresses[0]);
             return stream;
         } else |err| {
             last_err = err;
@@ -319,7 +344,7 @@ test "address race keeps the first connect alive after starting the next" {
     };
 
     var race: FakeRace = .{};
-    const addresses = [_]Io.net.IpAddress{
+    var addresses = [_]Io.net.IpAddress{
         .{ .ip4 = .loopback(1) },
         .{ .ip4 = .loopback(2) },
     };
@@ -358,7 +383,7 @@ test "address race returns the last refusal when no attempts remain" {
     };
 
     var race: FakeRace = .{};
-    const addresses = [_]Io.net.IpAddress{
+    var addresses = [_]Io.net.IpAddress{
         .{ .ip4 = .loopback(1) },
         .{ .ip4 = .loopback(2) },
     };
@@ -372,10 +397,26 @@ test "hostname dial uses supplied addresses without resolving again" {
     const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
-    const addresses = [_]Io.net.IpAddress{.{ .ip4 = .loopback(server.socket.address.getPort()) }};
+    var addresses = [_]Io.net.IpAddress{.{ .ip4 = .loopback(server.socket.address.getPort()) }};
 
-    const stream = try connectHostPortWithAddresses(io, "not a hostname", 1, 2, null, &addresses);
+    const stream = try connectHostPortWithAddresses(io, "not a hostname", 1, 2, null, &addresses, null);
     stream.close(io);
+    try std.testing.expectEqual(server.socket.address.getPort(), addresses[0].ip4.port);
+}
+
+test "dial promotes the address that connected" {
+    const io = std.testing.io;
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var addresses = [_]Io.net.IpAddress{
+        .{ .ip4 = .loopback(1) },
+        .{ .ip4 = .loopback(server.socket.address.getPort()) },
+    };
+
+    const stream = try connectHostPortWithAddresses(io, "example.com", 9, 2, null, &addresses, null);
+    stream.close(io);
+    try std.testing.expectEqual(server.socket.address.getPort(), addresses[0].ip4.port);
 }
 
 test "hostname dial fails fast when no unit of concurrency is available" {
@@ -386,7 +427,7 @@ test "hostname dial fails fast when no unit of concurrency is available" {
     const io = std.Io.Threaded.global_single_threaded.io();
     try std.testing.expectError(
         error.SystemResources,
-        connectHostPortWithAddresses(io, "localhost", 1, 3, null, null),
+        connectHostPortWithAddresses(io, "localhost", 1, 3, null, null, null),
     );
 }
 
@@ -1197,7 +1238,7 @@ test "DeadlineShutdown unblocks a blocking read on a silent peer" {
         release.store(true, .release);
         peer.join();
     }
-    const stream = try connectHostPortWithAddresses(io, "127.0.0.1", server.socket.address.getPort(), 2, null, null);
+    const stream = try connectHostPortWithAddresses(io, "127.0.0.1", server.socket.address.getPort(), 2, null, null, null);
     defer stream.close(io);
     var rbuf: [16]u8 = undefined;
     var r = stream.reader(io, &rbuf);

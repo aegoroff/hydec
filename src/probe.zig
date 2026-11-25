@@ -14,11 +14,14 @@ const Result = struct {
     /// Median latency, for the `Best:` line.
     latency_ms: u64,
     raw: []const u8,
+    /// Owned when `raw` was rewritten to a dialed IP. Free with `deinit`.
+    owns_raw: bool = false,
     /// Owned copy of the host; free with `deinit`.
     host: []u8,
 
     pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
         gpa.free(self.host);
+        if (self.owns_raw) gpa.free(self.raw);
         self.* = undefined;
     }
 };
@@ -73,6 +76,8 @@ const WorkItem = struct {
     /// Owned addresses from grouping. An empty slice without an error needs fresh DNS.
     addresses: []Io.net.IpAddress,
     resolution_error: ?anyerror = null,
+    /// Address the successful probe connected to. Empty until that probe returns.
+    dialed: ?Io.net.IpAddress = null,
     latency: ?Latency = null,
 };
 
@@ -111,8 +116,9 @@ pub fn probeOne(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]const Io.net.IpAddress,
+    addresses: ?[]Io.net.IpAddress,
     stage: *util.Stage,
+    dialed: ?*Io.net.IpAddress,
 ) !u64 {
     stage.* = .setup;
     return switch (proxy.kind) {
@@ -130,7 +136,7 @@ pub fn probeOne(
             }
             const method = proxy.method orelse return error.InvalidProxyUri;
             const password = proxy.password orelse return error.InvalidProxyUri;
-            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind, addresses, stage);
+            break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind, addresses, stage, dialed);
         },
         .trojan => blk: {
             if (proxy.transport == .grpc or proxy.transport == .other) return error.UnsupportedTransport;
@@ -159,7 +165,7 @@ pub fn probeOne(
                 .ws_host = host_hdr,
                 .alpn = alpn_list,
                 .allow_insecure = allow_insecure,
-            }, target, timeout_secs, bind, addresses, stage);
+            }, target, timeout_secs, bind, addresses, stage, dialed);
         },
         .vless => blk: {
             if (proxy.security != .reality) return error.UnsupportedSecurity;
@@ -213,9 +219,10 @@ pub fn probeOne(
                 bind,
                 addresses,
                 stage,
+                dialed,
             );
         },
-        .hysteria2 => try hy2.probe(gpa, io, proxy.host, proxy.port, proxy.query, timeout_secs, bind, addresses, stage),
+        .hysteria2 => try hy2.probe(gpa, io, proxy.host, proxy.port, proxy.query, timeout_secs, bind, addresses, stage, dialed),
         .vmess => error.SkippedVmess,
         .unsupported => error.UnsupportedProtocol,
     };
@@ -288,10 +295,11 @@ pub fn probeLatency(
     proxy: proxy_uri.Proxy,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]const Io.net.IpAddress,
+    addresses: ?[]Io.net.IpAddress,
     resolution_error: ?anyerror,
     check_volume: bool,
     stage: *util.Stage,
+    dialed: *?Io.net.IpAddress,
 ) !Latency {
     if (resolution_error) |err| return err;
 
@@ -301,28 +309,34 @@ pub fn probeLatency(
         proxy: proxy_uri.Proxy,
         timeout_secs: u32,
         bind: ?[]const u8,
-        addresses: ?[]const Io.net.IpAddress,
+        addresses: ?[]Io.net.IpAddress,
         stage: *util.Stage,
+        dialed: *?Io.net.IpAddress,
 
         fn probe(self: @This()) !u64 {
-            return probeOne(self.gpa, self.io, self.proxy, util.LATENCY_TARGET, self.timeout_secs, self.bind, self.addresses, self.stage);
+            var one: Io.net.IpAddress = undefined;
+            const ms = try probeOne(self.gpa, self.io, self.proxy, util.LATENCY_TARGET, self.timeout_secs, self.bind, self.addresses, self.stage, &one);
+            self.dialed.* = one;
+            return ms;
         }
     };
     var samples: [PROBE_ATTEMPTS]u64 = undefined;
-    const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind, .addresses = addresses, .stage = stage }, &samples);
+    const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind, .addresses = addresses, .stage = stage, .dialed = dialed }, &samples);
     var latency = Latency.fromSamples(&samples);
     latency.retries = retries;
     if (check_volume and proxy.kind == .hysteria2) {
         // No tunnel, so a download cannot stall or prove anything.
         std.log.debug("volume check skipped for hysteria2 {s}:{d}", .{ proxy.host, proxy.port });
     } else if (check_volume) {
-        _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, addresses, stage) catch |err| switch (err) {
+        var one: Io.net.IpAddress = undefined;
+        _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, addresses, stage, &one) catch |err| switch (err) {
             error.VolumeRefused => {
                 if (!volumeRefusalIgnored(proxy)) return err;
                 std.log.warn("volume check skipped for {s}:{d}: download refused", .{ proxy.host, proxy.port });
             },
             else => return volumeError(err, stage.*),
         };
+        dialed.* = one;
     }
     return latency;
 }
@@ -638,7 +652,8 @@ fn probeGroup(shared: *Shared, items: []WorkItem, phase: enum { grouped, dns_fal
         }
 
         var stage: util.Stage = .setup;
-        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, item.addresses, item.resolution_error, shared.check_volume, &stage) catch |err| {
+        var dialed: ?Io.net.IpAddress = null;
+        const latency = probeLatency(shared.gpa, shared.io, proxy, shared.timeout_secs, shared.bind, item.addresses, item.resolution_error, shared.check_volume, &stage, &dialed) catch |err| {
             if (shared.verbose) {
                 std.log.warn("FAIL: {f}: {f} ({})", .{ HostIdent{ .name = proxy.name, .host = proxy.host }, FailReason{ .err = err, .stage = stage }, err });
             }
@@ -656,6 +671,7 @@ fn probeGroup(shared: *Shared, items: []WorkItem, phase: enum { grouped, dns_fal
         }
 
         item.latency = latency;
+        item.dialed = dialed;
     }
 }
 
@@ -1066,11 +1082,79 @@ pub fn findBest(
     // A fresh lookup can land on any IP, so wait for all grouped probes to finish.
     queue.workDeferred(&shared);
     const winner = selectWinner(queue.lists, strategy, prefer_stable) orelse return null;
+    const line = try authorityForPodkop(gpa, winner);
+    errdefer if (line.owned) gpa.free(line.text);
     return .{
         .latency_ms = winner.latency.?.median_ms,
-        .raw = winner.raw,
+        .raw = line.text,
+        .owns_raw = line.owned,
         .host = try gpa.dupe(u8, winner.proxy.host),
     };
+}
+
+const PrintedLine = struct { text: []const u8, owned: bool };
+
+/// Podkop dials `server` from the URI and resolves a domain through its own DoH.
+/// Hand it the address the probe connected to. `sni` in the query stays the name.
+fn authorityForPodkop(gpa: std.mem.Allocator, winner: *const WorkItem) !PrintedLine {
+    if (Io.net.IpAddress.parse(winner.proxy.host, winner.proxy.port)) |_| {
+        return .{ .text = winner.raw, .owned = false };
+    } else |_| {}
+    const address = winner.dialed orelse return .{ .text = winner.raw, .owned = false };
+    const text = proxy_uri.rewriteAuthorityHost(gpa, winner.raw, address) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return .{ .text = winner.raw, .owned = false },
+    };
+    return .{ .text = text, .owned = true };
+}
+
+test "printed uri uses the ipv6 that answered, not an unreachable ipv4" {
+    const io = std.testing.io;
+    const v6_local: Io.net.IpAddress = .{ .ip6 = .loopback(0) };
+    var server = v6_local.listen(io, .{ .reuse_address = true }) catch return error.SkipZigTest;
+    defer server.deinit(io);
+
+    var addresses = [_]Io.net.IpAddress{
+        .{ .ip4 = .loopback(1) },
+        server.socket.address,
+    };
+    var connected: Io.net.IpAddress = undefined;
+    const stream = try netutil.connectHostPortWithAddresses(io, "example.com", 9, 2, null, &addresses, &connected);
+    stream.close(io);
+    try std.testing.expect(connected == .ip6);
+
+    const gpa = std.testing.allocator;
+    const raw = "trojan://pw@example.com:2058?security=tls&sni=example.com";
+    var proxy = try proxy_uri.parse(gpa, raw);
+    defer proxy.deinit(gpa);
+    const item: WorkItem = .{
+        .raw = raw,
+        .proxy = proxy,
+        .addresses = &addresses,
+        .dialed = connected,
+    };
+    const line = try authorityForPodkop(gpa, &item);
+    defer if (line.owned) gpa.free(line.text);
+    try std.testing.expect(std.mem.indexOf(u8, line.text, "[::1]:2058") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.text, "127.0.0.1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, line.text, "sni=example.com") != null);
+}
+
+test "printed uri uses the probe address when grouping stored none" {
+    const gpa = std.testing.allocator;
+    const raw = "trojan://pw@example.com:443?security=tls&sni=example.com";
+    var proxy = try proxy_uri.parse(gpa, raw);
+    defer proxy.deinit(gpa);
+    var none: [0]Io.net.IpAddress = .{};
+    const item: WorkItem = .{
+        .raw = raw,
+        .proxy = proxy,
+        .addresses = &none,
+        .dialed = try Io.net.IpAddress.parse("203.0.113.9", 443),
+    };
+    const line = try authorityForPodkop(gpa, &item);
+    defer if (line.owned) gpa.free(line.text);
+    try std.testing.expectEqualStrings("trojan://pw@203.0.113.9:443?security=tls&sni=example.com", line.text);
 }
 
 fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, prefer_stable: bool) ?*const WorkItem {
@@ -1390,7 +1474,7 @@ test "probeOne rejects Trojan transports it cannot carry before dialing" {
         var stage: util.Stage = .setup;
 
         // Act / Assert: 192.0.2.1 is TEST-NET, so reaching the dial would hang or fail differently.
-        try std.testing.expectError(error.UnsupportedTransport, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, null, &stage));
+        try std.testing.expectError(error.UnsupportedTransport, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, null, &stage, null));
         try std.testing.expectEqual(util.Stage.setup, stage);
     }
 }
@@ -1407,7 +1491,7 @@ test "probeOne rejects non-TLS Trojan security before dialing" {
         var stage: util.Stage = .setup;
 
         // Act / Assert: 192.0.2.1 is TEST-NET, so reaching the dial would fail differently.
-        try std.testing.expectError(error.UnsupportedSecurity, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, null, &stage));
+        try std.testing.expectError(error.UnsupportedSecurity, probeOne(gpa, std.testing.io, proxy, util.LATENCY_TARGET, 1, null, null, &stage, null));
         try std.testing.expectEqual(util.Stage.setup, stage);
     }
 }
@@ -1446,7 +1530,7 @@ test "probeOne rejects SS plugins before opening a socket" {
         var proxy = try proxy_uri.parse(gpa, line);
         defer proxy.deinit(gpa);
         var stage: util.Stage = .setup;
-        try std.testing.expectError(error.UnsupportedPlugin, probeOne(gpa, io, proxy, util.LATENCY_TARGET, 1, null, null, &stage));
+        try std.testing.expectError(error.UnsupportedPlugin, probeOne(gpa, io, proxy, util.LATENCY_TARGET, 1, null, null, &stage, null));
         try std.testing.expectEqual(util.Stage.setup, stage);
     }
 
@@ -2157,6 +2241,7 @@ test "probeLatency returns a grouping DNS timeout before probing" {
         .query = "",
     };
     var stage: util.Stage = .setup;
+    var dialed: ?Io.net.IpAddress = null;
     try std.testing.expectError(error.Timeout, probeLatency(
         std.testing.allocator,
         std.testing.io,
@@ -2167,6 +2252,7 @@ test "probeLatency returns a grouping DNS timeout before probing" {
         error.Timeout,
         true,
         &stage,
+        &dialed,
     ));
 }
 

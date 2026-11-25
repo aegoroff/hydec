@@ -758,8 +758,9 @@ fn connect(
     sid_hex: []const u8,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]const Io.net.IpAddress,
+    addresses: ?[]Io.net.IpAddress,
     stage: *util.Stage,
+    dialed: ?*Io.net.IpAddress,
 ) !void {
     var server_pub: [32]u8 = undefined;
     try decodePublicKey(pbk_b64, &server_pub);
@@ -793,7 +794,7 @@ fn connect(
     const read_deadline_ns = dial_start + @as(i128, timeout_secs) * std.time.ns_per_s;
     stage.* = .connect;
     rc.* = .{
-        .stream = try netutil.connectHostPortWithAddresses(io, host, port, timeout_secs, bind, addresses),
+        .stream = try netutil.connectHostPortWithAddresses(io, host, port, timeout_secs, bind, addresses, dialed),
         .io = io,
         .open = true,
         .read_deadline_ns = read_deadline_ns,
@@ -1006,8 +1007,9 @@ pub fn probeVless(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]const Io.net.IpAddress,
+    addresses: ?[]Io.net.IpAddress,
     stage: *util.Stage,
+    dialed: ?*Io.net.IpAddress,
 ) !u64 {
     const sni_use = if (sni.len > 0) sni else host;
 
@@ -1015,7 +1017,7 @@ pub fn probeVless(
     const start = netutil.monoNow(io);
     const rc = try gpa.create(RealityConn);
     defer gpa.destroy(rc);
-    try connect(rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind, addresses, stage);
+    try connect(rc, io, host, port, sni_use, pbk, sid, timeout_secs, bind, addresses, stage, dialed);
     defer rc.deinit();
     stage.* = .tunnel;
 
@@ -2727,7 +2729,7 @@ test "connect completes a full REALITY handshake" {
     {
         defer thread.join();
         var stage: util.Stage = .setup;
-        try connect(&rc, io, "127.0.0.1", server.socket.address.getPort(), "example.com", pbk, "", 2, null, null, &stage);
+        try connect(&rc, io, "127.0.0.1", server.socket.address.getPort(), "example.com", pbk, "", 2, null, null, &stage, null);
         connected = true;
         try std.testing.expect(rc.conn.app_phase);
         try std.testing.expectEqual(util.Stage.handshake, stage);
