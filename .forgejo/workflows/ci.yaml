@@ -37,7 +37,7 @@ jobs:
           echo "using version ${ver}"
           echo "version=${ver}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v3
+      - uses: https://git.egoroff.spb.ru/egr/actions-checkout@v3
 
       - name: Trust mise config
         run: mise trust
@@ -49,13 +49,13 @@ jobs:
         run: just ver=${{ steps.get_version.outputs.version }} openwrt-apk
 
       - name: Upload archives
-        uses: actions/upload-artifact@v3
+        uses: https://git.egoroff.spb.ru/egr/actions-upload-artifact@v3
         with:
           name: archives
           path: zig-out/*.tar.gz
 
       - name: Upload apk packages
-        uses: actions/upload-artifact@v3
+        uses: https://git.egoroff.spb.ru/egr/actions-upload-artifact@v3
         with:
           name: apk
           path: zig-out/apk/**/*.apk
@@ -68,7 +68,7 @@ jobs:
       release_body: ${{ steps.changelog.outputs.release_body }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: https://git.egoroff.spb.ru/egr/actions-checkout@v3
         with:
           fetch-depth: 0
 
@@ -102,7 +102,7 @@ jobs:
           echo "version=${ver}" >> "$GITHUB_OUTPUT"
 
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: https://git.egoroff.spb.ru/egr/actions-download-artifact@v3
         with:
           path: release
 
