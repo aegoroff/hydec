@@ -25,10 +25,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const quicz = b.dependency("quicz", .{
+        .target = target,
+        .optimize = optimize,
+        .@"lib-only" = true,
+    }).module("quicz");
+    exe.root_module.addImport("quicz", quicz);
     exe.root_module.addImport("zig_cli", zig_cli.module("zig_cli"));
     exe.root_module.addImport("build_options", options.createModule());
 
     b.installArtifact(exe);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(b.path("LICENSE.quicz.txt"), .bin, "LICENSE.quicz.txt").step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -45,6 +52,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     unit_tests.root_module.addImport("zig_cli", zig_cli.module("zig_cli"));
+    unit_tests.root_module.addImport("quicz", quicz);
     unit_tests.root_module.addImport("build_options", options.createModule());
 
     const run_unit_tests = b.addRunArtifact(unit_tests);

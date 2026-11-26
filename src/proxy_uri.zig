@@ -227,6 +227,12 @@ fn parseHysteria2(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     const rest = afterScheme(line);
     const no_frag = stripFragment(rest);
     const address_part = if (std.mem.findScalar(u8, no_frag, '?')) |q| no_frag[0..q] else no_frag;
+    const authority = stripPath(address_part);
+    const hostport = if (std.mem.findScalarLast(u8, authority, '@')) |at| authority[at + 1 ..] else authority;
+    if (hostPortExplicit(hostport)) {
+        const colon = std.mem.findScalarLast(u8, hostport, ':').?;
+        if (std.mem.findAny(u8, hostport[colon + 1 ..], ",-") != null) return error.UnsupportedHysteriaPortHopping;
+    }
     if (std.mem.findScalar(u8, address_part, '@') != null) {
         const parts = try parseUserAtHost(gpa, rest, 443);
         errdefer if (parts.owns_userinfo) gpa.free(parts.userinfo);
@@ -377,8 +383,13 @@ pub fn rewriteAuthorityHost(gpa: std.mem.Allocator, line: []const u8, address: s
     const query = std.mem.findScalar(u8, rest[0..hier_end], '?');
     const address_end = query orelse hier_end;
     const address_part = rest[0..address_end];
-    const at = std.mem.findScalarLast(u8, address_part, '@') orelse return error.InvalidProxyUri;
-    const after_at = address_part[at + 1 ..];
+    const prefix_len = if (std.mem.findScalarLast(u8, address_part, '@')) |at|
+        at + 1
+    else if (classify(line) == .hysteria2)
+        0
+    else
+        return error.InvalidProxyUri;
+    const after_at = address_part[prefix_len..];
     const slash = std.mem.findScalar(u8, after_at, '/') orelse after_at.len;
     const hostport = after_at[0..slash];
     const hp = try util.splitHostPortOrDefault(hostport, 0);
@@ -387,7 +398,7 @@ pub fn rewriteAuthorityHost(gpa: std.mem.Allocator, line: []const u8, address: s
     var literal_buf: [96]u8 = undefined;
     const literal = formatDialHost(address, port, &literal_buf);
 
-    const host_off = rest_off + at + 1;
+    const host_off = rest_off + prefix_len;
     const host_end = host_off + hostport.len;
     const out = try gpa.alloc(u8, line.len - hostport.len + literal.len);
     @memcpy(out[0..host_off], line[0..host_off]);
@@ -502,6 +513,13 @@ test "classify case-insensitive scheme" {
     try std.testing.expect(classify("Trojan://x") == .trojan);
     try std.testing.expect(classify("HY2://x") == .hysteria2);
     try std.testing.expect(classify("Hysteria2://x") == .hysteria2);
+}
+
+test "parse hysteria2 reports unsupported port hopping" {
+    const gpa = std.testing.allocator;
+
+    try std.testing.expectError(error.UnsupportedHysteriaPortHopping, parse(gpa, "hy2://auth@server.test:443,5000-6000/?sni=server.test"));
+    try std.testing.expectError(error.UnsupportedHysteriaPortHopping, parse(gpa, "hy2://[2001:db8::1]:5000-6000"));
 }
 
 test "parse hysteria2" {

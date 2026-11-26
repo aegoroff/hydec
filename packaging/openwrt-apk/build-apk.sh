@@ -150,6 +150,7 @@ trap cleanup EXIT
 ROOTFS="$WORKDIR/root"
 mkdir -p "$ROOTFS/usr/bin"
 install -m 0755 "$BIN_PATH" "$ROOTFS/usr/bin/hydec"
+install -D -m 0644 "$REPO_ROOT/LICENSE.quicz.txt" "$ROOTFS/usr/share/licenses/hydec/quicz"
 
 mkdir -p "$OUT_DIR/$PKG_ARCH"
 # OpenWrt Image Builder indexes by name-version.apk only (no arch in filename).

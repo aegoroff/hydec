@@ -1,26 +1,65 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const util = @import("util.zig");
+const quicz = @import("quicz");
+const ca_bundle = @import("ca_bundle.zig");
 const netutil = @import("netutil.zig");
+const proxy_uri = @import("proxy_uri.zig");
+const util = @import("util.zig");
 
 const Io = std.Io;
-const posix = std.posix;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const MAX_PEERS = 32;
+const MAX_MESSAGE_LEN = 2048;
+const MAX_PADDING_LEN = 4096;
+const alpn = [_][]const u8{"h3"};
 
-const max_peers = 32;
-const packet_len = 1200;
-const cid_len = 8;
-/// Unsupported QUIC version (GREASE shape). A hysteria2 server must answer
-/// with Version Negotiation and does not look at the payload.
-const grease_version: u32 = 0x1a2a3a4a;
+const Options = struct {
+    auth: []const u8,
+    server_name: []const u8,
+    insecure: bool,
+    pin: ?[Sha256.digest_length]u8,
 
-/// Reachability of a hysteria2 endpoint. `OK` means some datagram came back,
-/// not that `userinfo` was accepted. `obfs` defeats this ping.
+    fn parse(arena: std.mem.Allocator, proxy: proxy_uri.Proxy) !Options {
+        var params = std.mem.splitScalar(u8, proxy.query, '&');
+        while (params.next()) |pair| {
+            const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
+            if (eq + 1 == pair.len) continue;
+            const name = pair[0..eq];
+            if (std.mem.eql(u8, name, "obfs") or std.mem.eql(u8, name, "obfs-password"))
+                return error.UnsupportedObfs;
+            if (std.mem.eql(u8, name, "ech")) return error.UnsupportedHysteriaEch;
+        }
+        const name = try proxy.getParamDecoded(arena, "sni") orelse "";
+        const raw_pin = try proxy.getParamDecoded(arena, "pinSHA256");
+        return .{
+            .auth = proxy.userinfo,
+            .server_name = if (name.len == 0) proxy.host else name,
+            .insecure = util.queryParamTruthy(proxy.query, "insecure"),
+            .pin = if (raw_pin) |pin| try parsePin(pin) else null,
+        };
+    }
+};
+
+fn parsePin(input: []const u8) ![Sha256.digest_length]u8 {
+    var hex: [Sha256.digest_length * 2]u8 = undefined;
+    var len: usize = 0;
+    for (input) |byte| {
+        if (byte == ':') continue;
+        if (len == hex.len) return error.InvalidHysteriaPin;
+        hex[len] = byte;
+        len += 1;
+    }
+    if (len != hex.len) return error.InvalidHysteriaPin;
+    var pin: [Sha256.digest_length]u8 = undefined;
+    _ = std.fmt.hexToBytes(&pin, &hex) catch return error.InvalidHysteriaPin;
+    return pin;
+}
+
 pub fn probe(
     gpa: std.mem.Allocator,
     io: Io,
-    host: []const u8,
-    port: u16,
-    query: []const u8,
+    proxy: proxy_uri.Proxy,
+    target: util.Target,
     timeout_secs: u32,
     bind_spec: ?[]const u8,
     addresses: ?[]Io.net.IpAddress,
@@ -28,495 +67,314 @@ pub fn probe(
     dialed: ?*Io.net.IpAddress,
 ) !u64 {
     stage.* = .setup;
-    try rejectObfs(gpa, query);
-
     const deadline = netutil.deadlineNs(io, timeout_secs);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const opts = try Options.parse(arena.allocator(), proxy);
+    const roots = if (opts.insecure) null else try ca_bundle.ensureCaBundle(gpa, io);
+
     stage.* = .connect;
-    var storage: [max_peers]Io.net.IpAddress = undefined;
-    const dests = try destinations(io, host, port, addresses, deadline, &storage);
-
-    var dcid: [cid_len]u8 = undefined;
-    var scid: [cid_len]u8 = undefined;
-    io.random(&dcid);
-    io.random(&scid);
-    var packet: [packet_len]u8 = undefined;
-    writeProbe(&packet, &dcid, &scid);
-
-    // shortcut: Windows waits on one address at a time, so a silent address
-    // burns the rest of the deadline. Upgrade when several UDP sockets can be polled together.
-    const ms = if (builtin.target.os.tag == .windows)
-        try probeWindows(io, host, port, dests, &packet, &scid, deadline, stage)
-    else
-        try probePosix(io, host, port, dests, bind_spec, &packet, &scid, deadline, stage);
-    if (dialed) |slot| {
-        if (dests.len > 0) slot.* = dests[0];
-    }
-    return ms;
-}
-
-fn rejectObfs(gpa: std.mem.Allocator, query: []const u8) !void {
-    var params = std.mem.splitScalar(u8, query, '&');
-    while (params.next()) |pair| {
-        const eq = std.mem.findScalar(u8, pair, '=');
-        const name = if (eq) |i| pair[0..i] else pair;
-        if (!std.mem.eql(u8, name, "obfs")) continue;
-        const raw = if (eq) |i| pair[i + 1 ..] else "";
-        if (raw.len == 0) continue;
-        const decoded = try util.urlDecodeStrict(gpa, raw);
-        defer gpa.free(decoded);
-        // An empty first value must not hide obfs in a later parameter.
-        if (decoded.len != 0) return error.UnsupportedObfs;
-    }
-}
-
-fn destinations(
-    io: Io,
-    host: []const u8,
-    port: u16,
-    addresses: ?[]Io.net.IpAddress,
-    deadline: i128,
-    storage: *[max_peers]Io.net.IpAddress,
-) ![]Io.net.IpAddress {
-    if (addresses) |known| if (known.len > 0) {
-        if (known.len > max_peers) return error.TooManyResolvedAddresses;
-        return known;
-    };
-    if (Io.net.IpAddress.parse(host, port)) |ip| {
-        storage[0] = ip;
-        return storage[0..1];
-    } else |_| {}
-    return netutil.resolveAllUntil(io, host, port, deadline, storage);
-}
-
-fn writeProbe(out: *[packet_len]u8, dcid: *const [cid_len]u8, scid: *const [cid_len]u8) void {
-    @memset(out, 0);
-    // Long header, fixed bit, Initial, 1-byte packet number.
-    out[0] = 0xc0;
-    std.mem.writeInt(u32, out[1..5], grease_version, .big);
-    out[5] = cid_len;
-    @memcpy(out[6..][0..cid_len], dcid);
-    out[14] = cid_len;
-    @memcpy(out[15..][0..cid_len], scid);
-    out[23] = 0; // empty token
-    // 2-byte varint length of the packet number and the zero payload.
-    const body: u16 = packet_len - 26;
-    out[24] = 0x40 | @as(u8, @intCast(body >> 8));
-    out[25] = @truncate(body);
-}
-
-fn isVersionNegotiation(packet: []const u8, scid: *const [cid_len]u8) bool {
-    if (packet.len < 6 + cid_len) return false;
-    if (packet[0] & 0x80 == 0) return false;
-    if (std.mem.readInt(u32, packet[1..5], .big) != 0) return false;
-    if (packet[5] != cid_len) return false;
-    return std.mem.eql(u8, packet[6..][0..cid_len], scid);
-}
-
-fn noteReply(host: []const u8, port: u16, reply: []const u8, scid: *const [cid_len]u8) void {
-    if (isVersionNegotiation(reply, scid)) {
-        std.log.debug("hysteria2 {s}:{d}: version negotiation", .{ host, port });
-    } else {
-        std.log.debug("hysteria2 {s}:{d}: udp reply ({d} bytes)", .{ host, port, reply.len });
-    }
-}
-
-fn probeWindows(
-    io: Io,
-    host: []const u8,
-    port: u16,
-    dests: []Io.net.IpAddress,
-    packet: []const u8,
-    scid: *const [cid_len]u8,
-    deadline: i128,
-    stage: *util.Stage,
-) !u64 {
-    var last_err: anyerror = error.Timeout;
-    const start = netutil.monoNow(io);
-    var sent = false;
-    for (dests) |dest| {
-        if (netutil.monoNow(io) >= deadline) return error.Timeout;
-        const local: Io.net.IpAddress = switch (dest) {
-            .ip4 => .{ .ip4 = .unspecified(0) },
-            .ip6 => .{ .ip6 = .unspecified(0) },
-        };
-        const socket = local.bind(io, .{ .mode = .dgram }) catch |err| {
-            last_err = err;
-            continue;
-        };
-        defer socket.close(io);
-
-        socket.send(io, &dest, packet) catch |err| {
-            last_err = err;
-            continue;
-        };
-        if (!sent) {
-            sent = true;
-            stage.* = .handshake;
-        }
-        var buf: [2048]u8 = undefined;
-        while (true) {
-            const now = netutil.monoNow(io);
-            if (now >= deadline) return error.Timeout;
-            const timeout: Io.Timeout = .{ .duration = .{
-                .raw = .fromNanoseconds(@intCast(deadline - now)),
-                .clock = .awake,
-            } };
-            const message = socket.receiveTimeout(io, &buf, timeout) catch |err| {
+    var storage: [MAX_PEERS]Io.net.IpAddress = undefined;
+    const known: []Io.net.IpAddress = addresses orelse &.{};
+    const peers = if (known.len != 0) known else try destinations(io, proxy, deadline, &storage);
+    var last_err: anyerror = error.ConnectTimeout;
+    for (peers, 0..) |peer, index| {
+        const now = netutil.monoNow(io);
+        if (now >= deadline) return error.ConnectTimeout;
+        const connect_budget = @divTrunc(deadline - now, @as(i128, @intCast(peers.len - index)));
+        stage.* = .connect;
+        const ms = (switch (peer) {
+            .ip4 => probePeer(quicz.runtime.client.Client, gpa, io, peer, opts, roots, target, bind_spec, connect_budget, deadline, stage),
+            .ip6 => probePeer(quicz.runtime.client.ClientForTupleWithDatagramLimit(quicz.endpoint.Udp6Tuple, 1350), gpa, io, peer, opts, roots, target, bind_spec, connect_budget, deadline, stage),
+        }) catch |err| switch (err) {
+            error.ConnectTimeout,
+            error.ConnectionRefused,
+            error.NetworkUnreachable,
+            error.HostUnreachable,
+            error.AddressFamilyUnsupported,
+            error.AddressNotAvailable,
+            error.AddressUnavailable,
+            error.HysteriaSourceFamilyMismatch,
+            => {
+                if (stage.* != .connect) return err;
                 last_err = err;
-                break;
-            };
-            if (message.data.len == 0 or !samePeer(message.from, dest)) continue;
-            noteReply(host, port, message.data, scid);
-            promote(dests, dest);
-            return netutil.elapsedMs(start, io);
-        }
+                continue;
+            },
+            error.VolumeRefused => {
+                if (dialed) |slot| slot.* = peer;
+                return err;
+            },
+            else => return err,
+        };
+        if (dialed) |slot| slot.* = peer;
+        if (index != 0) std.mem.swap(Io.net.IpAddress, &peers[0], &peers[index]);
+        return ms;
     }
     return last_err;
 }
 
-fn promote(addresses: []Io.net.IpAddress, chosen: Io.net.IpAddress) void {
-    for (addresses[1..], 1..) |address, i| {
-        if (!samePeer(address, chosen)) continue;
-        addresses[i] = addresses[0];
-        addresses[0] = chosen;
-        return;
-    }
+fn destinations(io: Io, proxy: proxy_uri.Proxy, deadline: i128, storage: *[MAX_PEERS]Io.net.IpAddress) ![]Io.net.IpAddress {
+    if (Io.net.IpAddress.parse(proxy.host, proxy.port)) |ip| {
+        storage[0] = ip;
+        return storage[0..1];
+    } else |_| {}
+    return netutil.resolveAllUntil(io, proxy.host, proxy.port, deadline, storage);
 }
 
-fn samePeer(from: Io.net.IpAddress, dest: Io.net.IpAddress) bool {
-    return switch (dest) {
-        .ip4 => |ip4| from == .ip4 and from.ip4.port == ip4.port and std.mem.eql(u8, &from.ip4.bytes, &ip4.bytes),
-        .ip6 => |ip6| from == .ip6 and from.ip6.port == ip6.port and std.mem.eql(u8, &from.ip6.bytes, &ip6.bytes),
+fn bindSocket(io: Io, peer: Io.net.IpAddress, bind_spec: ?[]const u8) !Io.net.Socket {
+    var local: Io.net.IpAddress = switch (peer) {
+        .ip4 => .{ .ip4 = .unspecified(0) },
+        .ip6 => .{ .ip6 = .unspecified(0) },
     };
+    var device: ?[]const u8 = null;
+    if (builtin.target.os.tag != .windows) {
+        if (bind_spec) |spec| {
+            if (Io.net.IpAddress.parse(spec, 0)) |source| {
+                if (std.meta.activeTag(source) != std.meta.activeTag(peer)) return error.HysteriaSourceFamilyMismatch;
+                local = source;
+            } else |_| {
+                device = spec;
+            }
+        }
+    }
+    const socket = try local.bind(io, .{ .mode = .dgram, .protocol = .udp });
+    errdefer socket.close(io);
+    if (builtin.target.os.tag != .windows) try netutil.applyBind(socket.handle, device);
+    return socket;
 }
 
-const Attempt = struct {
-    sock: posix.socket_t,
-    dest: Io.net.IpAddress,
-    open: bool = true,
-
-    fn close(self: *Attempt) void {
-        if (!self.open) return;
-        self.open = false;
-        _ = posix.system.close(self.sock);
-    }
-};
-
-fn probePosix(
+fn probePeer(
+    comptime Client: type,
+    gpa: std.mem.Allocator,
     io: Io,
-    host: []const u8,
-    port: u16,
-    dests: []Io.net.IpAddress,
+    peer: Io.net.IpAddress,
+    opts: Options,
+    roots: ?*const std.crypto.Certificate.Bundle,
+    target: util.Target,
     bind_spec: ?[]const u8,
-    packet: []const u8,
-    scid: *const [cid_len]u8,
+    connect_budget: i128,
     deadline: i128,
     stage: *util.Stage,
 ) !u64 {
-    var attempts: [max_peers]Attempt = undefined;
-    var n: usize = 0;
-    defer for (attempts[0..n]) |*attempt| attempt.close();
-
-    var last_err: anyerror = error.Timeout;
-    for (dests) |dest| {
-        const sock = netutil.openUdpSocket(dest, bind_spec) catch |err| {
-            last_err = err;
-            continue;
-        };
-        // Sets the only peer the kernel will deliver, including ICMP unreachables.
-        connectPeer(sock, dest) catch |err| {
-            last_err = err;
-            _ = posix.system.close(sock);
-            continue;
-        };
-        attempts[n] = .{ .sock = sock, .dest = dest };
-        n += 1;
-    }
-    if (n == 0) return last_err;
-
-    stage.* = .handshake;
     const start = netutil.monoNow(io);
-    var sent: usize = 0;
-    for (attempts[0..n]) |*attempt| {
-        udpSend(attempt.sock, packet) catch |err| {
-            last_err = if (err == error.WouldBlock) error.Timeout else err;
-            attempt.close();
-            continue;
-        };
-        sent += 1;
+    var config: Client.Config = .{
+        .server_port = peer.getPort(),
+        .server_name = opts.server_name,
+        .alpn = &alpn,
+        .ca_bundle = roots,
+        .insecure_skip_verify = opts.insecure,
+    };
+    if (Client == quicz.runtime.client.Client) {
+        config.server_host = peer.ip4.bytes;
+    } else {
+        config.server_host = peer.ip6.bytes;
+        config.server_scope_id = peer.ip6.interface.index;
     }
-    if (sent == 0) {
-        stage.* = .connect;
-        return last_err;
+    const client = try gpa.create(Client);
+    defer gpa.destroy(client);
+    const socket = try bindSocket(io, peer, bind_spec);
+    client.* = Client.initWithSocket(gpa, io, socket, config) catch |err| {
+        socket.close(io);
+        return err;
+    };
+    defer client.deinit();
+
+    const connect_left = @min(start + connect_budget, deadline) - netutil.monoNow(io);
+    if (connect_left <= 0) return error.ConnectTimeout;
+    const timeout_ms: u32 = @intCast(@min(@divCeil(connect_left, std.time.ns_per_ms), std.math.maxInt(u32)));
+    client.connectWithTimeout(timeout_ms) catch |err| switch (err) {
+        error.ConnectionTimedOut => return error.ConnectTimeout,
+        else => return err,
+    };
+    stage.* = .handshake;
+    const hs = &client.client.transport.backend.hs;
+    if (!std.mem.eql(u8, hs.negotiated_alpn[0..hs.negotiated_alpn_len], alpn[0])) return error.HysteriaAlpnMismatch;
+    if (opts.pin) |pin| {
+        if (hs.server_cert_len == 0) return error.HysteriaPinMismatch;
+        var digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(hs.server_cert[0..hs.server_cert_len], &digest, .{});
+        if (!std.mem.eql(u8, &pin, &digest)) return error.HysteriaPinMismatch;
     }
-    return waitForReply(io, host, port, dests, attempts[0..n], scid, start, deadline, &last_err);
-}
 
-fn waitForReply(
-    io: Io,
-    host: []const u8,
-    port: u16,
-    dests: []Io.net.IpAddress,
-    attempts: []Attempt,
-    scid: *const [cid_len]u8,
-    start: i128,
-    deadline: i128,
-    last_err: *anyerror,
-) !u64 {
-    var buf: [2048]u8 = undefined;
-    while (true) {
-        const now = netutil.monoNow(io);
-        if (now >= deadline) return error.Timeout;
-
-        var fds: [max_peers]posix.pollfd = undefined;
-        var map: [max_peers]usize = undefined;
-        var nfds: usize = 0;
-        for (attempts, 0..) |attempt, i| {
-            if (!attempt.open) continue;
-            fds[nfds] = .{ .fd = attempt.sock, .events = posix.POLL.IN, .revents = 0 };
-            map[nfds] = i;
-            nfds += 1;
+    if (netutil.monoNow(io) >= deadline) return error.Timeout;
+    const until: Io.Clock.Timestamp = .{ .raw = .fromNanoseconds(@intCast(deadline)), .clock = .awake };
+    const Result = union(enum) { exchange: anyerror!u64, timeout: Io.Cancelable!void };
+    var results: [2]Result = undefined;
+    var select = Io.Select(Result).init(io, &results);
+    defer select.cancelDiscard();
+    const Worker = struct {
+        fn run(alloc: std.mem.Allocator, worker_io: Io, conn: *Client, auth: []const u8, test_target: util.Target, progress: *util.Stage, started: i128) anyerror!u64 {
+            return exchange(alloc, worker_io, conn, auth, test_target, progress, started);
         }
-        if (nfds == 0) return last_err.*;
-
-        const timeout_ms: i32 = @intCast(@min(@divTrunc(deadline - now, std.time.ns_per_ms), std.math.maxInt(i32)));
-        if (try posix.poll(fds[0..nfds], timeout_ms) == 0) return error.Timeout;
-
-        for (fds[0..nfds], map[0..nfds]) |fd, index| {
-            if (fd.revents == 0) continue;
-            const nread = udpRecv(attempts[index].sock, &buf) catch |err| switch (err) {
-                error.WouldBlock => {
-                    if (fd.revents & (posix.POLL.ERR | posix.POLL.NVAL | posix.POLL.HUP) != 0) {
-                        last_err.* = error.ConnectionResetByPeer;
-                        attempts[index].close();
-                    }
-                    continue;
-                },
-                else => |e| {
-                    last_err.* = e;
-                    attempts[index].close();
-                    continue;
-                },
-            };
-            if (nread == 0) continue;
-            noteReply(host, port, buf[0..nread], scid);
-            promote(dests, attempts[index].dest);
-            return netutil.elapsedMs(start, io);
-        }
-    }
-}
-
-fn connectPeer(sock: posix.socket_t, address: Io.net.IpAddress) !void {
-    while (true) {
-        const rc = switch (address) {
-            .ip4 => |ip4| blk: {
-                const sa = posix.sockaddr.in{
-                    .port = std.mem.nativeToBig(u16, ip4.port),
-                    .addr = @bitCast(ip4.bytes),
-                };
-                break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in));
-            },
-            .ip6 => |ip6| blk: {
-                const sa = posix.sockaddr.in6{
-                    .port = std.mem.nativeToBig(u16, ip6.port),
-                    .flowinfo = ip6.flow,
-                    .addr = ip6.bytes,
-                    .scope_id = ip6.interface.index,
-                };
-                break :blk posix.system.connect(sock, @ptrCast(&sa), @sizeOf(posix.sockaddr.in6));
-            },
-        };
-        switch (posix.errno(rc)) {
-            .SUCCESS => return,
-            .INTR => continue,
-            // UDP connect only stores the peer. A non-blocking socket may still
-            // report these; the association is already in place.
-            .INPROGRESS, .AGAIN => return,
-            .CONNREFUSED => return error.ConnectionRefused,
-            .NETUNREACH => return error.NetworkUnreachable,
-            .HOSTUNREACH => return error.HostUnreachable,
-            .NETDOWN => return error.NetworkDown,
-            .TIMEDOUT => return error.ConnectTimeout,
-            .ADDRNOTAVAIL => return error.AddressNotAvailable,
-            .ACCES, .PERM => return error.AccessDenied,
-            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
-            else => return error.Unexpected,
-        }
-    }
-}
-
-fn udpSend(sock: posix.socket_t, data: []const u8) !void {
-    while (true) {
-        const rc = posix.system.send(sock, data.ptr, data.len, 0);
-        switch (posix.errno(rc)) {
-            .SUCCESS => {
-                if (@as(usize, @intCast(rc)) != data.len) return error.MessageOversize;
-                return;
-            },
-            .INTR => continue,
-            else => |err| return udpErrno(err),
-        }
-    }
-}
-
-fn udpRecv(sock: posix.socket_t, buf: []u8) !usize {
-    while (true) {
-        const rc = posix.system.recv(sock, buf.ptr, buf.len, 0);
-        switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .INTR => continue,
-            else => |err| return udpErrno(err),
-        }
-    }
-}
-
-fn udpErrno(err: posix.E) anyerror {
-    return switch (err) {
-        .AGAIN => error.WouldBlock,
-        .CONNREFUSED => error.ConnectionRefused,
-        .CONNRESET => error.ConnectionResetByPeer,
-        .NETUNREACH => error.NetworkUnreachable,
-        .HOSTUNREACH => error.HostUnreachable,
-        .NETDOWN => error.NetworkDown,
-        .MSGSIZE => error.MessageOversize,
-        .NOBUFS, .NOMEM => error.SystemResources,
-        .ACCES, .PERM => error.AccessDenied,
-        .AFNOSUPPORT => error.AddressFamilyUnsupported,
-        .ADDRNOTAVAIL => error.AddressNotAvailable,
-        else => error.Unexpected,
+    };
+    try select.concurrent(.exchange, Worker.run, .{ gpa, io, client, opts.auth, target, stage, start });
+    try select.concurrent(.timeout, Io.Clock.Timestamp.wait, .{ until, io });
+    return switch (try select.await()) {
+        .exchange => |result| result,
+        .timeout => |result| blk: {
+            try result;
+            break :blk error.Timeout;
+        },
     };
 }
 
-test "version negotiation probe is a padded Initial" {
-    var packet: [packet_len]u8 = undefined;
-    const dcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    const scid = [_]u8{ 8, 7, 6, 5, 4, 3, 2, 1 };
-    writeProbe(&packet, &dcid, &scid);
+fn exchange(
+    gpa: std.mem.Allocator,
+    io: Io,
+    client: anytype,
+    auth: []const u8,
+    target: util.Target,
+    stage: *util.Stage,
+    start: i128,
+) !u64 {
+    const H3 = quicz.runtime.h3_client.ClientFor(@TypeOf(client.*));
+    const http = try gpa.create(H3);
+    defer gpa.destroy(http);
+    http.* = H3.init(gpa, client, 0, 0);
+    defer http.deinit();
+    try http.run();
+    const auth_id = try http.sendRequest(.{
+        .method = "POST",
+        .authority = "hysteria",
+        .path = "/auth",
+        .extra_headers = &.{
+            .{ .name = "hysteria-auth", .value = auth },
+            .{ .name = "hysteria-cc-rx", .value = "0" },
+        },
+    });
+    const response = try http.receiveResponse(auth_id);
+    if (response.status != 233) return error.HysteriaAuthRejected;
 
-    try std.testing.expectEqual(@as(u8, 0xc0), packet[0]);
-    try std.testing.expectEqual(grease_version, std.mem.readInt(u32, packet[1..5], .big));
-    try std.testing.expectEqualSlices(u8, &dcid, packet[6..14]);
-    try std.testing.expectEqualSlices(u8, &scid, packet[15..23]);
-    try std.testing.expectEqual(@as(u8, 0), packet[23]);
-    try std.testing.expectEqual(@as(u16, 0x4496), std.mem.readInt(u16, packet[24..26], .big));
-    try std.testing.expectEqual(@as(u8, 0), packet[26]);
-    try std.testing.expectEqual(@as(u8, 0), packet[packet_len - 1]);
+    stage.* = .tunnel;
+    const stream = try client.openStream();
+    var address_storage: [256]u8 = undefined;
+    const address = try std.fmt.bufPrint(&address_storage, "{s}:{d}", .{ target.domain, util.PROBE_HTTP_PORT });
+    var request_storage: [272]u8 = undefined;
+    const request = try writeTcpRequest(&request_storage, address);
+    try client.sendOnStream(stream, request, false);
+    try readTcpResponse(client, stream);
+
+    stage.* = .reply;
+    const http_buf = try gpa.alloc(u8, util.PROBE_HTTP_BUF_LEN);
+    defer gpa.free(http_buf);
+    var len: usize = 0;
+    try client.sendOnStream(stream, target.warmup, false);
+    try readHttp(client, stream, http_buf, &len, .{ .trace = util.PROBE_UA_WARMUP });
+    try client.sendOnStream(stream, target.steady, false);
+    try readHttp(client, stream, http_buf, &len, target.steady_reply);
+    return netutil.elapsedMs(start, io);
 }
 
-test "version negotiation reply echoes our source id" {
-    const scid = [_]u8{ 9, 8, 7, 6, 5, 4, 3, 2 };
-    var reply: [20]u8 = undefined;
-    @memset(&reply, 0);
-    reply[0] = 0x80;
-    reply[5] = cid_len;
-    @memcpy(reply[6..][0..cid_len], &scid);
-    try std.testing.expect(isVersionNegotiation(&reply, &scid));
-
-    reply[6] ^= 1;
-    try std.testing.expect(!isVersionNegotiation(&reply, &scid));
-    try std.testing.expect(!isVersionNegotiation(&[_]u8{0x40}, &scid));
+fn writeTcpRequest(buf: []u8, address: []const u8) ![]const u8 {
+    var writer = Io.Writer.fixed(buf);
+    try quicz.packet.encodeVarInt(&writer, 0x401);
+    try quicz.packet.encodeVarInt(&writer, address.len);
+    try writer.writeAll(address);
+    try quicz.packet.encodeVarInt(&writer, 0);
+    return writer.buffered();
 }
 
-test "rejectObfs ignores an empty value" {
-    const gpa = std.testing.allocator;
-    try rejectObfs(gpa, "");
-    try rejectObfs(gpa, "sni=example.com");
-    try rejectObfs(gpa, "obfs=");
-    try rejectObfs(gpa, "obfs=&sni=example.com");
-    try std.testing.expectError(error.UnsupportedObfs, rejectObfs(gpa, "obfs=&obfs=salamander"));
-    try std.testing.expectError(error.UnsupportedObfs, rejectObfs(gpa, "sni=a&obfs=sala%6dander"));
-}
-
-test "probe rejects obfs before dialing" {
-    var stage: util.Stage = .reply;
-    try std.testing.expectError(error.UnsupportedObfs, probe(
-        std.testing.allocator,
-        std.testing.io,
-        "192.0.2.1",
-        443,
-        "obfs=salamander",
-        1,
-        null,
-        null,
-        &stage,
-        null,
-    ));
-    try std.testing.expectEqual(util.Stage.setup, stage);
-}
-
-test "udp ping accepts a loopback reply" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-
-    const io = std.testing.io;
-    const local: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    const server = try local.bind(io, .{ .mode = .dgram });
-    defer server.close(io);
-
-    const thread = try std.Thread.spawn(.{}, replyOnce, .{server.handle});
-    defer thread.join();
-
-    var addresses = [_]Io.net.IpAddress{server.address};
-    var stage: util.Stage = .setup;
-    const ms = try probe(
-        std.testing.allocator,
-        io,
-        "127.0.0.1",
-        server.address.getPort(),
-        "sni=example.com",
-        2,
-        null,
-        &addresses,
-        &stage,
-        null,
-    );
-    try std.testing.expect(ms < 2000);
-    try std.testing.expectEqual(util.Stage.handshake, stage);
-}
-
-test "closed udp port fails without waiting out the timeout" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-
-    const io = std.testing.io;
-    const local: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    const server = try local.bind(io, .{ .mode = .dgram });
-    const port = server.address.getPort();
-    server.close(io);
-
-    var stage: util.Stage = .setup;
-    const start = netutil.monoNow(io);
-    try std.testing.expectError(error.ConnectionRefused, probe(
-        std.testing.allocator,
-        io,
-        "127.0.0.1",
-        port,
-        "",
-        5,
-        null,
-        null,
-        &stage,
-        null,
-    ));
-    try std.testing.expect(netutil.elapsedMs(start, io) < 1000);
-}
-
-fn replyOnce(sock: posix.socket_t) void {
-    var fds = [_]posix.pollfd{.{ .fd = sock, .events = posix.POLL.IN, .revents = 0 }};
-    const ready = posix.poll(&fds, 3000) catch return;
-    if (ready == 0) return;
-
-    var buf: [2048]u8 = undefined;
-    var src: posix.sockaddr.in = undefined;
-    var src_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
-    const rc = posix.system.recvfrom(sock, &buf, buf.len, 0, @ptrCast(&src), &src_len);
-    if (posix.errno(rc) != .SUCCESS or rc == 0) return;
-
-    var reply: [14]u8 = @splat(0);
-    reply[0] = 0x80;
-    var reply_len: usize = 7;
-    if (rc >= 23 and buf[14] == cid_len) {
-        reply[5] = cid_len;
-        @memcpy(reply[6..][0..cid_len], buf[15..][0..cid_len]);
-        reply_len = reply.len;
+fn readExact(client: anytype, stream: u64, bytes: []u8) !void {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const n = try client.receive(stream, bytes[offset..]);
+        if (n == 0) return error.EndOfStream;
+        offset += n;
     }
-    _ = posix.system.sendto(sock, &reply, reply_len, 0, @ptrCast(&src), src_len);
+}
+
+fn readFieldLen(client: anytype, stream: u64, limit: usize) !usize {
+    var bytes: [8]u8 = undefined;
+    try readExact(client, stream, bytes[0..1]);
+    const width = @as(usize, 1) << @as(u2, @truncate(bytes[0] >> 6));
+    try readExact(client, stream, bytes[1..width]);
+    var len: u64 = bytes[0] & 63;
+    for (bytes[1..width]) |byte| len = (len << 8) | byte;
+    if (len > limit) return error.InvalidHysteriaResponse;
+    return @intCast(len);
+}
+
+fn readTcpResponse(client: anytype, stream: u64) !void {
+    var buf: [MAX_PADDING_LEN]u8 = undefined;
+    try readExact(client, stream, buf[0..1]);
+    switch (buf[0]) {
+        0 => {},
+        1 => return error.HysteriaTunnelRejected,
+        else => return error.InvalidHysteriaResponse,
+    }
+    const msg_len = try readFieldLen(client, stream, MAX_MESSAGE_LEN);
+    try readExact(client, stream, buf[0..msg_len]);
+    const padding_len = try readFieldLen(client, stream, MAX_PADDING_LEN);
+    try readExact(client, stream, buf[0..padding_len]);
+}
+
+fn readHttp(client: anytype, stream: u64, buf: []u8, len: *usize, expect: util.ProbeReply) !void {
+    while (!try util.takeProbeResponse(buf, len, expect, false)) {
+        if (len.* == buf.len) return error.ProbeResponseMismatch;
+        const n = try client.receive(stream, buf[len.*..]);
+        if (n == 0) {
+            if (try util.takeProbeResponse(buf, len, expect, true)) return;
+            return error.EndOfStream;
+        }
+        len.* += n;
+    }
+}
+
+test "Hysteria URI options decode the SNI and enforce a SHA-256 fingerprint" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const pin = "0123456789abcdef" ++ "0123456789abcdef" ++ "0123456789abcdef" ++ "0123456789abcdef";
+    var proxy = try proxy_uri.parse(gpa, "hy2://user%3Apass@127.0.0.1?sni=test%2Eexample&insecure=1&pinSHA256=" ++ pin);
+    defer proxy.deinit(gpa);
+
+    const opts = try Options.parse(gpa, proxy);
+
+    try std.testing.expectEqualStrings("user:pass", opts.auth);
+    try std.testing.expectEqualStrings("test.example", opts.server_name);
+    try std.testing.expect(opts.insecure);
+    try std.testing.expectEqual(@as(u8, 0x01), opts.pin.?[0]);
+    try std.testing.expectError(error.InvalidHysteriaPin, parsePin("01:23"));
+}
+
+test "Hysteria URI rejects obfuscation and ECH before dialing" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const proxy = try proxy_uri.parse(gpa, "hy2://auth@127.0.0.1?obfs=&obfs=salamander");
+    var ech_proxy = proxy;
+    ech_proxy.query = "ech=encoded";
+
+    try std.testing.expectError(error.UnsupportedObfs, Options.parse(gpa, proxy));
+    try std.testing.expectError(error.UnsupportedHysteriaEch, Options.parse(gpa, ech_proxy));
+}
+
+test "TCPRequest encodes the Hysteria frame type and a multi-byte length" {
+    const address = @as([68]u8, @splat('a')) ++ ":80";
+    var buf: [256]u8 = undefined;
+
+    const packet = try writeTcpRequest(&buf, address);
+
+    try std.testing.expectEqualSlices(u8, "\x44\x01\x40\x47" ++ address ++ "\x00", packet);
+}
+
+test "TCPResponse consumes segmented fields without consuming tunneled bytes" {
+    const Peer = struct {
+        bytes: []const u8,
+        fn receive(self: *@This(), _: u64, out: []u8) !usize {
+            if (self.bytes.len == 0) return 0;
+            out[0] = self.bytes[0];
+            self.bytes = self.bytes[1..];
+            return 1;
+        }
+    };
+    var ok: Peer = .{ .bytes = "\x00\x02ok\x03abcHTTP" };
+    var rejected: Peer = .{ .bytes = "\x01" };
+    var oversized: Peer = .{ .bytes = "\x00\x48\x01" };
+
+    try readTcpResponse(&ok, 4);
+
+    try std.testing.expectEqualStrings("HTTP", ok.bytes);
+    try std.testing.expectError(error.HysteriaTunnelRejected, readTcpResponse(&rejected, 4));
+    try std.testing.expectError(error.InvalidHysteriaResponse, readTcpResponse(&oversized, 4));
 }

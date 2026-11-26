@@ -39,13 +39,13 @@ pub const Strategy = enum {
 
 /// Preference class for `best` ranking (higher = preferred when latencies are comparable).
 /// VLESS² = REALITY gRPC; VLESS³ = REALITY TCP vision — matching HyNet subscription labels.
-/// `hysteria2` is a UDP reachability time and stays out of that order.
+/// Hysteria 2 ranks last on a tie and is a fallback under hydec and strict.
 pub const PrefClass = enum {
+    hysteria2,
     shadowsocks,
     vless3,
     trojan,
     vless2,
-    hysteria2,
 
     pub fn fromProxy(proxy: proxy_uri.Proxy) ?PrefClass {
         return switch (proxy.kind) {
@@ -222,7 +222,7 @@ pub fn probeOne(
                 dialed,
             );
         },
-        .hysteria2 => try hy2.probe(gpa, io, proxy.host, proxy.port, proxy.query, timeout_secs, bind, addresses, stage, dialed),
+        .hysteria2 => try hy2.probe(gpa, io, proxy, target, timeout_secs, bind, addresses, stage, dialed),
         .vmess => error.SkippedVmess,
         .unsupported => error.UnsupportedProtocol,
     };
@@ -324,10 +324,7 @@ pub fn probeLatency(
     const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind, .addresses = addresses, .stage = stage, .dialed = dialed }, &samples);
     var latency = Latency.fromSamples(&samples);
     latency.retries = retries;
-    if (check_volume and proxy.kind == .hysteria2) {
-        // No tunnel, so a download cannot stall or prove anything.
-        std.log.debug("volume check skipped for hysteria2 {s}:{d}", .{ proxy.host, proxy.port });
-    } else if (check_volume) {
+    if (check_volume) {
         var one: Io.net.IpAddress = undefined;
         _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, addresses, stage, &one) catch |err| switch (err) {
             error.VolumeRefused => {
@@ -390,7 +387,13 @@ fn selectBestRanked(strategy: Strategy, best: std.EnumArray(PrefClass, ?Rank)) ?
             if (r.retried and !allow_retried) continue;
             ms.set(class, r.ms);
         }
-        if (selectBestClass(strategy, ms.get(.vless2), ms.get(.vless3), ms.get(.shadowsocks), ms.get(.trojan))) |class| return class;
+        const chosen = selectBestClass(strategy, ms.get(.vless2), ms.get(.vless3), ms.get(.shadowsocks), ms.get(.trojan));
+        if (strategy == .fastest) {
+            if (ms.get(.hysteria2)) |hy_ms| {
+                if (chosen == null or hy_ms < ms.get(chosen.?).?) return .hysteria2;
+            }
+        }
+        if (chosen) |class| return class;
     }
     return null;
 }
@@ -582,6 +585,15 @@ pub fn failHint(err: anyerror) []const u8 {
         error.InvalidSsChunk => "ss/chunk",
         error.UnsupportedVlessEncryption => "unsupported-encryption",
         error.UnsupportedTransport => "unsupported-transport",
+        error.HysteriaAuthRejected => "hy2/auth",
+        error.HysteriaTunnelRejected => "hy2/tunnel",
+        error.HysteriaPinMismatch => "hy2/pin",
+        error.InvalidHysteriaPin => "hy2/invalid-pin",
+        error.HysteriaAlpnMismatch => "hy2/alpn",
+        error.InvalidHysteriaResponse => "hy2/invalid-response",
+        error.HysteriaSourceFamilyMismatch => "iface/family",
+        error.UnsupportedHysteriaEch => "unsupported-ech",
+        error.UnsupportedHysteriaPortHopping => "unsupported-port-hopping",
         error.UnsupportedObfs => "unsupported-obfs",
         error.UnsupportedPlugin => "unsupported-plugin",
         error.BufferTooSmall, error.RecordTooLarge => "buffer/overflow",
@@ -1105,7 +1117,32 @@ fn authorityForPodkop(gpa: std.mem.Allocator, winner: *const WorkItem) !PrintedL
         error.OutOfMemory => return err,
         else => return .{ .text = winner.raw, .owned = false },
     };
-    return .{ .text = text, .owned = true };
+    if (winner.proxy.kind != .hysteria2) return .{ .text = text, .owned = true };
+    errdefer gpa.free(text);
+
+    const frag_at = std.mem.findScalar(u8, text, '#') orelse text.len;
+    const base = text[0..frag_at];
+    var start = frag_at;
+    var end = frag_at;
+    var separator: []const u8 = "?";
+    if (std.mem.findScalar(u8, base, '?')) |query_at| {
+        separator = if (query_at + 1 == base.len) "" else "&";
+        var params = std.mem.splitScalar(u8, base[query_at + 1 ..], '&');
+        while (true) {
+            const param_start = base.len - params.rest().len;
+            const param = params.next() orelse break;
+            if (!std.mem.eql(u8, std.mem.sliceTo(param, '='), "sni")) continue;
+            if (param.len > "sni=".len) return .{ .text = text, .owned = true };
+            start = param_start;
+            end = start + param.len;
+            separator = "";
+            break;
+        }
+    }
+
+    const with_sni = try gpa.print("{s}{s}sni={s}{s}", .{ text[0..start], separator, winner.proxy.host, text[end..] });
+    gpa.free(text);
+    return .{ .text = with_sni, .owned = true };
 }
 
 test "printed uri uses the ipv6 that answered, not an unreachable ipv4" {
@@ -1157,6 +1194,38 @@ test "printed uri uses the probe address when grouping stored none" {
     try std.testing.expectEqualStrings("trojan://pw@203.0.113.9:443?security=tls&sni=example.com", line.text);
 }
 
+test "printed hysteria2 URI preserves the default TLS name with an IP authority" {
+    const gpa = std.testing.allocator;
+    const prefix = "hy2://pass@example.com:8443/";
+    const rendered = "hy2://pass@[2001:db8::1]:8443/";
+    const cases = [_]struct { suffix: []const u8, want: []const u8 }{
+        .{ .suffix = "#name", .want = "?sni=example.com#name" },
+        .{ .suffix = "?insecure=0#name", .want = "?insecure=0&sni=example.com#name" },
+        .{ .suffix = "?sni=&insecure=0#name", .want = "?sni=example.com&insecure=0#name" },
+        .{ .suffix = "?insecure=0&sni#name", .want = "?insecure=0&sni=example.com#name" },
+        .{ .suffix = "?sni=alt%2Eexample#name", .want = "?sni=alt%2Eexample#name" },
+    };
+    for (cases) |case| {
+        const raw = try gpa.print("{s}{s}", .{ prefix, case.suffix });
+        defer gpa.free(raw);
+        var proxy = try proxy_uri.parse(gpa, raw);
+        defer proxy.deinit(gpa);
+        const item: WorkItem = .{
+            .raw = raw,
+            .proxy = proxy,
+            .addresses = &.{},
+            .dialed = try Io.net.IpAddress.parse("2001:db8::1", 8443),
+        };
+        const want = try gpa.print("{s}{s}", .{ rendered, case.want });
+        defer gpa.free(want);
+
+        const line = try authorityForPodkop(gpa, &item);
+        defer if (line.owned) gpa.free(line.text);
+
+        try std.testing.expectEqualStrings(want, line.text);
+    }
+}
+
 fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, prefer_stable: bool) ?*const WorkItem {
     var ranks: std.EnumArray(PrefClass, ?Rank) = .initFill(null);
     var best: std.EnumArray(PrefClass, ?*const WorkItem) = .initFill(null);
@@ -1174,15 +1243,14 @@ fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, pref
         }
     }
 
-    // A hysteria2 RTT is not a tunnel measurement, so it wins only when every full probe failed.
-    const chosen = selectBestRanked(strategy, ranks) orelse return best.get(.hysteria2);
+    const chosen = selectBestRanked(strategy, ranks) orelse
+        if (ranks.get(.hysteria2) != null) .hysteria2 else return null;
     const stable_rank: ?Rank = if (prefer_stable) ranks.get(chosen).? else null;
     const top_tier = strategy == .hydec and (chosen == .vless2 or chosen == .trojan);
 
     var eligible: std.EnumArray(PrefClass, bool) = .initFill(false);
     var median: u64 = std.math.maxInt(u64);
     for (std.enums.values(PrefClass)) |class| {
-        if (class == .hysteria2) continue;
         const rank = ranks.get(class) orelse continue;
         if (stable_rank) |required| {
             if (!std.meta.eql(rank, required)) continue;
@@ -1288,7 +1356,7 @@ test "selectWinner respects strategy classes and prefer-stable ranking" {
     try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .fastest, true).?.raw);
 }
 
-test "selectWinner falls back to hysteria2 only when nothing else passed" {
+test "selectWinner compares hysteria2 in fastest and uses it as a fallback in other strategies" {
     const trojan_proxy: proxy_uri.Proxy = .{
         .kind = .trojan,
         .raw = "",
@@ -1311,7 +1379,7 @@ test "selectWinner falls back to hysteria2 only when nothing else passed" {
     var lists = [_]std.ArrayList(WorkItem){.initBuffer(&items)};
     lists[0].items.len = items.len;
 
-    try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .fastest, false).?.raw);
+    try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .fastest, false).?.raw);
     try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .hydec, false).?.raw);
     try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .strict, false).?.raw);
 
@@ -1322,6 +1390,15 @@ test "selectWinner falls back to hysteria2 only when nothing else passed" {
     items[0].latency.?.retries = 1;
     try std.testing.expectEqualStrings("hy-steady", selectWinner(&lists, .hydec, true).?.raw);
     try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .hydec, false).?.raw);
+
+    var low_median = [_]u64{ 100, 100, 1000 };
+    var low_mean = [_]u64{ 100, 110, 120 };
+    items[0].latency = .fromSamples(&low_median);
+    items[1].latency = .fromSamples(&low_mean);
+    for ([_]Strategy{ .hydec, .strict }) |strategy| {
+        try std.testing.expectEqualStrings("hy-steady", selectWinner(&lists, strategy, false).?.raw);
+        try std.testing.expectEqualStrings("hy-steady", selectWinner(&lists, strategy, true).?.raw);
+    }
 
     var tied = [_]u64{ 10, 10, 10 };
     items[0].latency = .fromSamples(&tied);
