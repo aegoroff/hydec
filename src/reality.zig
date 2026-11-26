@@ -633,6 +633,8 @@ const RealityConn = struct {
             const rec = try self.readRecordDeadline(dest, false);
             switch (rec.typ) {
                 23 => {
+                    // REALITY peers may send empty application records before tunnel data.
+                    if (rec.len == 0) continue;
                     if (rec.len > out.len) return error.BufferTooSmall;
                     if (dest.ptr != out.ptr) @memcpy(out[0..rec.len], dest[0..rec.len]);
                     return rec.len;
@@ -729,6 +731,7 @@ const RealityConn = struct {
             const msg_len = end - 1;
             switch (inner_type) {
                 23 => {
+                    if (msg_len == 0) continue;
                     if (msg_len > out.len) return error.BufferTooSmall;
                     @memcpy(out[0..msg_len], plain[0..msg_len]);
                     return .{ .plaintext = msg_len };
@@ -1766,6 +1769,24 @@ test "readApp does not leak a partial Reality record as raw TCP at EOF" {
     // Act / Assert: ciphertext must not be returned to the inner TLS client.
     try std.testing.expectError(error.EndOfStream, rc.readApp(&out));
     try std.testing.expectEqual(@as(u64, 0), rc.conn.read_seq);
+}
+
+test "readApp skips empty application records before and after PaddingDirect" {
+    var wire: [512]u8 = undefined;
+    const empty_len = appendSealedRecord(&wire, &TEST_RECORD_KEY, &TEST_RECORD_IV, 0, 23, "");
+    const data_len = appendSealedRecord(wire[empty_len..], &TEST_RECORD_KEY, &TEST_RECORD_IV, 1, 23, "hello");
+
+    for ([_]bool{ false, true }) |raw| {
+        var reader: Io.Reader = .fixed(wire[0 .. empty_len + data_len]);
+        var rc = testRawReadConn(&reader);
+        rc.xtls_raw_read = raw;
+        var out: [64]u8 = undefined;
+
+        const n = try rc.readApp(&out);
+
+        try std.testing.expectEqualStrings("hello", out[0..n]);
+        try std.testing.expectEqual(@as(u64, 2), rc.conn.read_seq);
+    }
 }
 
 test "readApp completes a Reality record split between reader fills" {
