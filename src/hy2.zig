@@ -419,6 +419,29 @@ fn readHttp(client: anytype, stream: u64, buf: []u8, len: *usize, expect: util.P
     }
 }
 
+test "Hysteria 2 can repeatedly decode HTTP/3 authentication headers" {
+    const qpack = quicz.qpack;
+    const headers = [_]qpack.HeaderField{
+        .{ .name = ":status", .value = "233" },
+        .{ .name = "hysteria-udp", .value = "true" },
+        .{ .name = "hysteria-cc-rx", .value = "auto" },
+    };
+    var encoded: [128]u8 = undefined;
+    const len = try qpack.encodeHeaderBlock(&encoded, &headers);
+    var table = qpack.DynamicTable.init(std.testing.allocator);
+    defer table.deinit();
+
+    for (0..4096) |_| {
+        var decoded: [headers.len]qpack.HeaderField = undefined;
+        const count = try qpack.decodeHeaderBlockWithDynamic(encoded[0..len], &decoded, &table);
+        try std.testing.expectEqual(headers.len, count);
+        for (headers, decoded) |expected, actual| {
+            try std.testing.expectEqualStrings(expected.name, actual.name);
+            try std.testing.expectEqualStrings(expected.value, actual.value);
+        }
+    }
+}
+
 test "Hysteria 2 keeps the first handshake alive after starting the fallback" {
     const FakeConnector = struct {
         second_started: *Io.Event,
