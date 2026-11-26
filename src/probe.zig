@@ -39,7 +39,7 @@ pub const Strategy = enum {
 
 /// Preference class for `best` ranking (higher = preferred when latencies are comparable).
 /// VLESS² = REALITY gRPC; VLESS³ = REALITY TCP vision — matching HyNet subscription labels.
-/// Hysteria 2 ranks last on a tie and is a fallback under hydec and strict.
+/// Enum order breaks exact latency ties. Strict uses its own class order.
 pub const PrefClass = enum {
     hysteria2,
     shadowsocks,
@@ -387,13 +387,8 @@ fn selectBestRanked(strategy: Strategy, best: std.EnumArray(PrefClass, ?Rank)) ?
             if (r.retried and !allow_retried) continue;
             ms.set(class, r.ms);
         }
-        const chosen = selectBestClass(strategy, ms.get(.vless2), ms.get(.vless3), ms.get(.shadowsocks), ms.get(.trojan));
-        if (strategy == .fastest) {
-            if (ms.get(.hysteria2)) |hy_ms| {
-                if (chosen == null or hy_ms < ms.get(chosen.?).?) return .hysteria2;
-            }
-        }
-        if (chosen) |class| return class;
+        if (selectBestClass(strategy, ms.get(.vless2), ms.get(.vless3), ms.get(.shadowsocks), ms.get(.trojan), ms.get(.hysteria2))) |class|
+            return class;
     }
     return null;
 }
@@ -405,11 +400,12 @@ pub fn selectBestClass(
     vless3_ms: ?u64,
     ss_ms: ?u64,
     trojan_ms: ?u64,
+    hysteria2_ms: ?u64,
 ) ?PrefClass {
     return switch (strategy) {
-        .hydec => selectHydecClass(vless2_ms, vless3_ms, ss_ms, trojan_ms),
-        .fastest => selectFastestClass(vless2_ms, vless3_ms, ss_ms, trojan_ms),
-        .strict => selectStrictClass(vless2_ms, vless3_ms, ss_ms, trojan_ms),
+        .hydec => selectHydecClass(vless2_ms, vless3_ms, ss_ms, trojan_ms, hysteria2_ms),
+        .fastest => selectFastestClass(vless2_ms, vless3_ms, ss_ms, trojan_ms, hysteria2_ms),
+        .strict => selectStrictClass(vless2_ms, vless3_ms, ss_ms, trojan_ms, hysteria2_ms),
     };
 }
 
@@ -422,14 +418,13 @@ fn clearlySlower(slow: u64, fast: u64) bool {
     return slow -| fast > MIN_DEMOTE_GAP_MS;
 }
 
-/// Default `hydec` policy. VLESS² and Trojan form the top tier ("VLESS²/Trojan" below):
-/// the faster of the two stands for it, VLESS² on a tie.
-/// 1. Prefer fastest VLESS² (gRPC) or Trojan.
-/// 2. Prefer VLESS³ over VLESS²/Trojan when it is strictly more than 2× slower.
-/// 3. Prefer SS over VLESS²/Trojan only when there is no VLESS²/Trojan, or it is ≥3× slower.
+/// Default `hydec` policy. VLESS², Trojan, and Hysteria 2 share the top tier.
+/// 1. Use the fastest class in that tier, breaking ties in the listed order.
+/// 2. Prefer VLESS³ when the top tier is strictly more than 2× slower.
+/// 3. Prefer SS over the top tier if it is absent or at least 3× slower.
 ///    When SS is eligible and VLESS³ exists, prefer VLESS³ unless it is >3× slower
 ///    than SS (even if VLESS²/Trojan was not demoted to VLESS³).
-/// 4. With VLESS³ but no VLESS²/Trojan: prefer VLESS³ unless it is strictly more than 2× slower
+/// 4. With VLESS³ but no top-tier class: prefer VLESS³ unless it is strictly more than 2× slower
 ///    than SS.
 /// Every demotion in 2–4 also needs the slower class to lose by more than
 /// `MIN_DEMOTE_GAP_MS`, so jitter between near-local nodes cannot flip the pick.
@@ -438,23 +433,24 @@ fn selectHydecClass(
     vless3_ms: ?u64,
     ss_ms: ?u64,
     trojan_ms: ?u64,
+    hysteria2_ms: ?u64,
 ) ?PrefClass {
-    const top: ?struct { class: PrefClass, ms: u64 } = blk: {
-        const v2 = vless2_ms orelse break :blk if (trojan_ms) |t| .{ .class = .trojan, .ms = t } else null;
-        const t = trojan_ms orelse break :blk .{ .class = .vless2, .ms = v2 };
-        break :blk if (t < v2) .{ .class = .trojan, .ms = t } else .{ .class = .vless2, .ms = v2 };
-    };
-
-    if (top) |hi| {
-        var class = hi.class;
+    if (selectFastestClass(vless2_ms, null, null, trojan_ms, hysteria2_ms)) |top| {
+        const top_ms = switch (top) {
+            .vless2 => vless2_ms.?,
+            .trojan => trojan_ms.?,
+            .hysteria2 => hysteria2_ms.?,
+            else => unreachable,
+        };
+        var class = top;
         if (vless3_ms) |v3| {
-            if (hi.ms > v3 *| 2 and clearlySlower(hi.ms, v3)) {
+            if (top_ms > v3 *| 2 and clearlySlower(top_ms, v3)) {
                 class = .vless3;
             }
         }
         if (ss_ms) |ss_lat| {
-            if (hi.ms >= ss_lat *| 3 and clearlySlower(hi.ms, ss_lat)) {
-                // SS eligible vs VLESS²/Trojan: prefer VLESS³ unless it is >3× slower.
+            if (top_ms >= ss_lat *| 3 and clearlySlower(top_ms, ss_lat)) {
+                // SS eligible against the top tier: prefer VLESS³ unless it is >3× slower.
                 if (vless3_ms) |v3| {
                     if (v3 > ss_lat *| 3 and clearlySlower(v3, ss_lat)) return .shadowsocks;
                     return .vless3;
@@ -475,18 +471,20 @@ fn selectHydecClass(
     return if (ss_ms != null) .shadowsocks else null;
 }
 
-/// Minimum latency; on a tie keep the higher preference class (VLESS² → Trojan → VLESS³ → SS).
+/// Minimum latency, with ties resolved in enum preference order.
 fn selectFastestClass(
     vless2_ms: ?u64,
     vless3_ms: ?u64,
     ss_ms: ?u64,
     trojan_ms: ?u64,
+    hysteria2_ms: ?u64,
 ) ?PrefClass {
     const candidates = [_]struct { class: PrefClass, ms: ?u64 }{
         .{ .class = .vless2, .ms = vless2_ms },
         .{ .class = .trojan, .ms = trojan_ms },
         .{ .class = .vless3, .ms = vless3_ms },
         .{ .class = .shadowsocks, .ms = ss_ms },
+        .{ .class = .hysteria2, .ms = hysteria2_ms },
     };
     var best_class: ?PrefClass = null;
     var best_ms: u64 = undefined;
@@ -506,9 +504,11 @@ fn selectStrictClass(
     vless3_ms: ?u64,
     ss_ms: ?u64,
     trojan_ms: ?u64,
+    hysteria2_ms: ?u64,
 ) ?PrefClass {
     if (vless2_ms != null) return .vless2;
     if (trojan_ms != null) return .trojan;
+    if (hysteria2_ms != null) return .hysteria2;
     if (vless3_ms != null) return .vless3;
     if (ss_ms != null) return .shadowsocks;
     return null;
@@ -1226,6 +1226,10 @@ test "printed hysteria2 URI preserves the default TLS name with an IP authority"
     }
 }
 
+fn inTopTier(class: PrefClass) bool {
+    return class == .vless2 or class == .trojan or class == .hysteria2;
+}
+
 fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, prefer_stable: bool) ?*const WorkItem {
     var ranks: std.EnumArray(PrefClass, ?Rank) = .initFill(null);
     var best: std.EnumArray(PrefClass, ?*const WorkItem) = .initFill(null);
@@ -1243,10 +1247,9 @@ fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, pref
         }
     }
 
-    const chosen = selectBestRanked(strategy, ranks) orelse
-        if (ranks.get(.hysteria2) != null) .hysteria2 else return null;
+    const chosen = selectBestRanked(strategy, ranks) orelse return null;
     const stable_rank: ?Rank = if (prefer_stable) ranks.get(chosen).? else null;
-    const top_tier = strategy == .hydec and (chosen == .vless2 or chosen == .trojan);
+    const top_tier = strategy == .hydec and inTopTier(chosen);
 
     var eligible: std.EnumArray(PrefClass, bool) = .initFill(false);
     var median: u64 = std.math.maxInt(u64);
@@ -1256,7 +1259,7 @@ fn selectWinner(lists: []const std.ArrayList(WorkItem), strategy: Strategy, pref
             if (!std.meta.eql(rank, required)) continue;
         }
         if (strategy != .fastest and class != chosen and
-            !(top_tier and (class == .vless2 or class == .trojan))) continue;
+            !(top_tier and inTopTier(class))) continue;
         eligible.set(class, true);
         median = @min(median, best.get(class).?.latency.?.median_ms);
     }
@@ -1356,7 +1359,7 @@ test "selectWinner respects strategy classes and prefer-stable ranking" {
     try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .fastest, true).?.raw);
 }
 
-test "selectWinner compares hysteria2 in fastest and uses it as a fallback in other strategies" {
+test "selectWinner includes hysteria2 in each strategy" {
     const trojan_proxy: proxy_uri.Proxy = .{
         .kind = .trojan,
         .raw = "",
@@ -1380,8 +1383,10 @@ test "selectWinner compares hysteria2 in fastest and uses it as a fallback in ot
     lists[0].items.len = items.len;
 
     try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .fastest, false).?.raw);
-    try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .hydec, false).?.raw);
+    try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .hydec, false).?.raw);
     try std.testing.expectEqualStrings("trojan", selectWinner(&lists, .strict, false).?.raw);
+    items[2].latency.?.retries = 1;
+    try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .strict, true).?.raw);
 
     items[2].latency = null;
     try std.testing.expectEqualStrings("hy-fast", selectWinner(&lists, .fastest, false).?.raw);
@@ -1399,6 +1404,10 @@ test "selectWinner compares hysteria2 in fastest and uses it as a fallback in ot
         try std.testing.expectEqualStrings("hy-steady", selectWinner(&lists, strategy, false).?.raw);
         try std.testing.expectEqualStrings("hy-steady", selectWinner(&lists, strategy, true).?.raw);
     }
+
+    items[2].latency = items[0].latency;
+    try std.testing.expectEqualStrings("hy-steady", selectWinner(&lists, .hydec, false).?.raw);
+    items[2].latency = null;
 
     var tied = [_]u64{ 10, 10, 10 };
     items[0].latency = .fromSamples(&tied);
@@ -2154,82 +2163,82 @@ test "PrefClass.fromProxy maps vless transport and protocols" {
 
 test "selectBestClass hydec prefers VLESS2 then demotes on 2x / SS on 3x" {
     // Fastest VLESS² wins when close to others.
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 100, 90, 80, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 100, 90, 80, null, null));
     // Exactly 2×: keep VLESS² ("больше чем в два раза").
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 200, 100, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 200, 100, null, null, null));
     // Strictly more than 2× → VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 201, 100, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 201, 100, null, null, null));
     // SS needs ≥3× vs VLESS².
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 299, null, 100, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 300, null, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 299, null, 100, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 300, null, 100, null, null));
     // Demoted to VLESS³; SS eligible via VLESS²≥3×SS, then 3× vs VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 600, 100, 40, null)); // 100 ≯ 3×40
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 600, 100, 30, null)); // 100 > 3×30
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 600, 100, 40, null, null)); // 100 ≯ 3×40
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 600, 100, 30, null, null)); // 100 > 3×30
     // VLESS² kept vs VLESS³, but SS eligible (≥3×); still apply 3× to VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 100, 40, 20, null)); // 40 ≯ 3×20
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 100, 70, 20, null)); // 70 > 3×20
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 100, 40, 20, null, null)); // 40 ≯ 3×20
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 100, 70, 20, null, null)); // 70 > 3×20
     // No VLESS² / Trojan: VLESS³ vs SS at 2×.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 200, 100, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, 201, 100, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, null, 40, null));
-    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.hydec, null, null, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 200, 100, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, 201, 100, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, null, 40, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.hydec, null, null, null, null, null));
 }
 
 test "selectBestClass hydec ranks Trojan in the VLESS2 tier" {
     // Both present: the faster of the two stands for the tier, VLESS² on a tie.
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, 100, 90, 80, 50));
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 50, 90, 80, 100));
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 100, null, null, 100));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, 100, 90, 80, 50, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 50, 90, 80, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 100, null, null, 100, null));
     // Trojan beats a faster SS until the 3× gap, even with no VLESS at all.
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, null, 20, 40));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, null, 10, 40));
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, null, null, 10));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, null, 20, 40, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, null, 10, 40, null));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, null, null, 10, null));
     // Trojan alone in the tier: same thresholds VLESS² would get.
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, 100, null, 200));
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 100, null, 201));
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, null, 100, 299));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, null, 100, 300));
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 100, 40, 600));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, 100, null, 200, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 100, null, 201, null));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, null, null, 100, 299, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, null, 100, 300, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 100, 40, 600, null));
     // The faster of VLESS² / Trojan is what SS and VLESS³ are compared against.
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, 600, null, 100, 250));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 600, null, 100, 300));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, 600, null, 100, 250, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 600, null, 100, 300, null));
     // Live HyNet NL: VLESS² 333, VLESS³ 330, SS 161, Trojan 307 — Trojan (307 < 3×161).
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, 333, 330, 161, 307));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.hydec, 333, 330, 161, 307, null));
 }
 
 test "selectBestClass hydec ignores ratio wins below the absolute gap" {
     // 3× but only 14 ms apart: no VLESS²→SS demotion.
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 21, null, 7, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 23, null, 7, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 21, null, 7, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 23, null, 7, null, null));
     // >2× but 15 ms apart (not more): no VLESS²→VLESS³ demotion.
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 29, 14, null, null));
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 30, 14, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.hydec, 29, 14, null, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 30, 14, null, null, null));
     // No VLESS²: VLESS³ 20 ms vs SS 5 ms stays VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 20, 5, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, 21, 5, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 20, 5, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, 21, 5, null, null));
     // SS eligible vs VLESS², VLESS³ >3× SS yet within the gap: keep VLESS³.
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 100, 20, 5, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 100, 21, 5, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, 100, 20, 5, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, 100, 21, 5, null, null));
 }
 
 test "selectBestClass fastest picks minimum latency" {
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.fastest, 100, 90, 80, 50));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.fastest, 300, 100, 40, null));
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.fastest, 201, 100, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.fastest, 100, 90, 80, 50, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.fastest, 300, 100, 40, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.fastest, 201, 100, null, null, null));
     // Tie: keep the higher preference class.
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.fastest, 100, 100, 100, 100));
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.fastest, null, 100, 100, 100));
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.fastest, null, 100, 100, null));
-    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.fastest, null, null, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.fastest, 100, 100, 100, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.fastest, null, 100, 100, 100, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.fastest, null, 100, 100, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.fastest, null, null, null, null, null));
 }
 
 test "selectBestClass strict never demotes" {
-    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.strict, 500, 10, 5, 1));
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.strict, null, 200, 10, 300));
-    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.strict, null, 200, 10, null));
-    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.strict, null, null, 40, null));
-    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.strict, null, null, null, 10));
-    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.strict, null, null, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless2), selectBestClass(.strict, 500, 10, 5, 1, null));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.strict, null, 200, 10, 300, null));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.strict, null, 200, 10, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.strict, null, null, 40, null, null));
+    try std.testing.expectEqual(@as(?PrefClass, .trojan), selectBestClass(.strict, null, null, null, 10, null));
+    try std.testing.expectEqual(@as(?PrefClass, null), selectBestClass(.strict, null, null, null, null, null));
 }
 
 test "Strategy.parse accepts known names" {
@@ -2273,6 +2282,14 @@ test "failHint covers every Io.net.IpAddress.BindError member" {
             return err;
         };
     }
+}
+
+test "Hysteria 2 follows top-tier demotion, strict order, and fastest tie order" {
+    try std.testing.expectEqual(@as(?PrefClass, .hysteria2), selectBestClass(.hydec, null, 100, null, null, 200));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.hydec, null, 100, null, null, 201));
+    try std.testing.expectEqual(@as(?PrefClass, .shadowsocks), selectBestClass(.hydec, null, null, 100, null, 300));
+    try std.testing.expectEqual(@as(?PrefClass, .hysteria2), selectBestClass(.strict, null, 30, 10, null, 500));
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), selectBestClass(.fastest, null, 25, 25, null, 25));
 }
 
 test "volumeError names only post-connect stalls and keeps lookup timeouts" {
