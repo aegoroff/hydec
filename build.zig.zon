@@ -15,8 +15,8 @@
     },
     .dependencies = .{
         .quicz = .{
-            .url = "git+https://git.egoroff.spb.ru/egr/quicz.git?ref=hydec-zig-0.17#37756e891013279d7ceb9799a21d8368e222f1f0",
-            .hash = "quicz-0.1.0-g2J97-B5nwB8GC-SCN2zzcBSKaMiiE1JWGBRf0Bg6jOv",
+            .url = "git+https://git.egoroff.spb.ru/egr/quicz.git?ref=hydec-zig-0.17#bc3f50ec1d1f254de3e67aa2f4da3f195bb1c74c",
+            .hash = "quicz-0.1.0-g2J97zF6nwCzHOw8ybm7C4ISRRvpmsBYcVhBvDFhYyjw",
         },
         .zig_cli = .{
             .url = "https://github.com/zig-utils/zig-cli/archive/d5b6d7cce234514e53073d566696cd2e69ef4836.tar.gz",
