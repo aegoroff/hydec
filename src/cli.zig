@@ -23,6 +23,7 @@ pub const Options = struct {
     prefer_stable: bool,
     /// `--check-volume`: also require a `util.VOLUME_BYTES` download through the tunnel.
     check_volume: bool,
+    raw_output: bool = false,
 };
 
 const Capture = struct {
@@ -71,6 +72,7 @@ fn onBest(ctx: *zig_cli.BaseCommand.ParseContext) !void {
         .strategy = strategy,
         .prefer_stable = ctx.hasOption("prefer-stable"),
         .check_volume = ctx.hasOption("check-volume"),
+        .raw_output = ctx.hasOption("raw"),
     };
 }
 
@@ -257,6 +259,14 @@ fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseComm
             ),
         );
         _ = try addCheckVolumeOption(best);
+        _ = try best.addOption(
+            zig_cli.Option.init(
+                "raw",
+                "raw",
+                "Print the original winning proxy URI (default: replace its hostname with the probed IP)",
+                .bool,
+            ),
+        );
         _ = try best.addOption(
             zig_cli.Option.init(
                 "prefer-stable",

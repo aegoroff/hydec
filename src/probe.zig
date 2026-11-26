@@ -1045,6 +1045,7 @@ pub fn findBest(
     strategy: Strategy,
     prefer_stable: bool,
     check_volume: bool,
+    raw_output: bool,
     stats: *Stats,
 ) !?Result {
     var groups = try collectGroups(gpa, io, lines, stats, verbose, timeout_secs);
@@ -1080,7 +1081,7 @@ pub fn findBest(
     // A fresh lookup can land on any IP, so wait for all grouped probes to finish.
     queue.workDeferred(&shared);
     const winner = selectWinner(queue.lists, strategy, prefer_stable) orelse return null;
-    const line = try authorityForPodkop(gpa, winner);
+    const line = try printedLine(gpa, winner, raw_output);
     errdefer if (line.owned) gpa.free(line.text);
     return .{
         .latency_ms = winner.latency.?.median_ms,
@@ -1094,7 +1095,8 @@ const PrintedLine = struct { text: []const u8, owned: bool };
 
 /// Podkop dials `server` from the URI and resolves a domain through its own DoH.
 /// Hand it the address the probe connected to. `sni` in the query stays the name.
-fn authorityForPodkop(gpa: std.mem.Allocator, winner: *const WorkItem) !PrintedLine {
+fn printedLine(gpa: std.mem.Allocator, winner: *const WorkItem, raw_output: bool) !PrintedLine {
+    if (raw_output) return .{ .text = winner.raw, .owned = false };
     if (Io.net.IpAddress.parse(winner.proxy.host, winner.proxy.port)) |_| {
         return .{ .text = winner.raw, .owned = false };
     } else |_| {}
@@ -1156,7 +1158,7 @@ test "printed uri uses the ipv6 that answered, not an unreachable ipv4" {
         .addresses = &addresses,
         .dialed = connected,
     };
-    const line = try authorityForPodkop(gpa, &item);
+    const line = try printedLine(gpa, &item, false);
     defer if (line.owned) gpa.free(line.text);
     try std.testing.expect(std.mem.indexOf(u8, line.text, "[::1]:2058") != null);
     try std.testing.expect(std.mem.indexOf(u8, line.text, "127.0.0.1") == null);
@@ -1175,7 +1177,7 @@ test "printed uri uses the probe address when grouping stored none" {
         .addresses = &none,
         .dialed = try Io.net.IpAddress.parse("203.0.113.9", 443),
     };
-    const line = try authorityForPodkop(gpa, &item);
+    const line = try printedLine(gpa, &item, false);
     defer if (line.owned) gpa.free(line.text);
     try std.testing.expectEqualStrings("trojan://pw@203.0.113.9:443?security=tls&sni=example.com", line.text);
 }
@@ -1205,11 +1207,29 @@ test "printed hysteria2 URI preserves the default TLS name with an IP authority"
         const want = try gpa.print("{s}{s}", .{ rendered, case.want });
         defer gpa.free(want);
 
-        const line = try authorityForPodkop(gpa, &item);
+        const line = try printedLine(gpa, &item, false);
         defer if (line.owned) gpa.free(line.text);
 
         try std.testing.expectEqualStrings(want, line.text);
     }
+}
+
+test "raw output preserves the original hysteria2 URI" {
+    const gpa = std.testing.allocator;
+    const raw = "hy2://pass@example.com:8443/?insecure=0#My%20proxy";
+    var proxy = try proxy_uri.parse(gpa, raw);
+    defer proxy.deinit(gpa);
+    const item: WorkItem = .{
+        .raw = raw,
+        .proxy = proxy,
+        .addresses = &.{},
+        .dialed = try Io.net.IpAddress.parse("2001:db8::1", 8443),
+    };
+
+    const line = try printedLine(gpa, &item, true);
+    defer if (line.owned) gpa.free(line.text);
+
+    try std.testing.expectEqualStrings(raw, line.text);
 }
 
 fn inTopTier(class: PrefClass) bool {
