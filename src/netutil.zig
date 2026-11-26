@@ -46,7 +46,7 @@ fn saveDialed(dialed: ?*Io.net.IpAddress, address: Io.net.IpAddress) void {
     if (dialed) |slot| slot.* = address;
 }
 
-const ADDRESS_START_DELAY_NS: i128 = 250 * std.time.ns_per_ms;
+pub const ADDRESS_START_DELAY_NS: i128 = 250 * std.time.ns_per_ms;
 const MAX_RACED_ADDRESSES = 32;
 
 fn connectAddressesUntil(

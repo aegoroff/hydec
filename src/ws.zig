@@ -134,11 +134,12 @@ fn writeRequestTarget(writer: *Io.Writer, path: []const u8) !void {
 }
 
 fn writeUpgradeRequest(writer: *Io.Writer, path: []const u8, host_header: []const u8, key_b64: []const u8) !void {
+    const bare_ipv6 = Io.net.Ip6Address.Unresolved.parse(host_header) == .success;
     try writer.writeAll("GET ");
     try writeRequestTarget(writer, path);
     try writer.print(
-        " HTTP/1.1\r\nHost: {s}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n\r\n",
-        .{ host_header, key_b64 },
+        " HTTP/1.1\r\nHost: {s}{s}{s}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {s}\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        .{ if (bare_ipv6) "[" else "", host_header, if (bare_ipv6) "]" else "", key_b64 },
     );
 }
 
@@ -312,6 +313,24 @@ test "writeUpgradeRequest serializes a decoded path as exact request bytes" {
             "Sec-WebSocket-Version: 13\r\n\r\n",
         writer.buffered(),
     );
+}
+
+test "writeUpgradeRequest brackets only bare IPv6 hosts" {
+    const cases = .{
+        .{ "2001:db8::1", "[2001:db8::1]" },
+        .{ "[2001:db8::1]", "[2001:db8::1]" },
+        .{ "[2001:db8::1]:8443", "[2001:db8::1]:8443" },
+        .{ "example.com:8443", "example.com:8443" },
+        .{ "192.0.2.1:8443", "192.0.2.1:8443" },
+    };
+    inline for (cases) |case| {
+        var buf: [256]u8 = undefined;
+        var writer: Io.Writer = .fixed(&buf);
+
+        try writeUpgradeRequest(&writer, "/", case[0], "dGhlIHNhbXBsZSBub25jZQ==");
+
+        try std.testing.expectStringStartsWith(writer.buffered(), "GET / HTTP/1.1\r\nHost: " ++ case[1] ++ "\r\n");
+    }
 }
 
 test "writeUpgradeRequest handles long paths and hosts" {

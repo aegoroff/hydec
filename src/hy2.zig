@@ -77,41 +77,139 @@ pub fn probe(
     var storage: [MAX_PEERS]Io.net.IpAddress = undefined;
     const known: []Io.net.IpAddress = addresses orelse &.{};
     const peers = if (known.len != 0) known else try destinations(io, proxy, deadline, &storage);
+    const winner = try connectPeers(io, peers, deadline, Connector{ .gpa = gpa, .opts = opts, .roots = roots, .bind_spec = bind_spec });
+    defer winner.connection.deinit();
+    const peer = peers[winner.index];
+    const ms = (switch (winner.connection.client) {
+        inline else => |client| probeConnected(gpa, io, client, opts, target, winner.connection.start, deadline, stage),
+    }) catch |err| {
+        if (err == error.VolumeRefused) {
+            if (dialed) |slot| slot.* = peer;
+        }
+        return err;
+    };
+    if (dialed) |slot| slot.* = peer;
+    if (winner.index != 0) std.mem.swap(Io.net.IpAddress, &peers[0], &peers[winner.index]);
+    return ms;
+}
+
+fn Winner(comptime Connection: type) type {
+    return struct { index: usize, connection: Connection };
+}
+
+fn connectPeers(io: Io, peers: []const Io.net.IpAddress, deadline: i128, connector: anytype) !Winner(@TypeOf(connector).Connection) {
+    const Connected = Winner(@TypeOf(connector).Connection);
+    if (peers.len == 1) return .{ .index = 0, .connection = try connector.connect(io, peers[0], deadline) };
+    if (peers.len > MAX_PEERS) return error.TooManyResolvedAddresses;
+
+    const Result = union(enum) { connected: anyerror!Connected, wake: Io.Cancelable!void };
+    const Worker = struct {
+        fn connect(args: @TypeOf(connector), worker_io: Io, peer: Io.net.IpAddress, index: usize, until: i128) anyerror!Connected {
+            return .{ .index = index, .connection = try args.connect(worker_io, peer, until) };
+        }
+    };
+    var results: [MAX_PEERS + 1]Result = undefined;
+    var select = Io.Select(Result).init(io, &results);
+    // Another handshake can succeed before cancellation reaches its worker.
+    defer while (select.cancel()) |result| {
+        if (result == .connected) {
+            if (result.connected) |loser| loser.connection.deinit() else |_| {}
+        }
+    };
+
+    var started: usize = 0;
+    var active: usize = 0;
+    var next_start = netutil.monoNow(io);
+    var timer_pending = false;
     var last_err: anyerror = error.ConnectTimeout;
-    for (peers, 0..) |peer, index| {
+    while (active != 0 or started < peers.len) {
         const now = netutil.monoNow(io);
         if (now >= deadline) return error.ConnectTimeout;
-        const connect_budget = @divTrunc(deadline - now, @as(i128, @intCast(peers.len - index)));
-        stage.* = .connect;
-        const ms = (switch (peer) {
-            .ip4 => probePeer(quicz.runtime.client.Client, gpa, io, peer, opts, roots, target, bind_spec, connect_budget, deadline, stage),
-            .ip6 => probePeer(quicz.runtime.client.ClientForTupleWithDatagramLimit(quicz.endpoint.Udp6Tuple, 1350), gpa, io, peer, opts, roots, target, bind_spec, connect_budget, deadline, stage),
-        }) catch |err| switch (err) {
-            error.ConnectTimeout,
-            error.ConnectionRefused,
-            error.NetworkUnreachable,
-            error.HostUnreachable,
-            error.AddressFamilyUnsupported,
-            error.AddressNotAvailable,
-            error.AddressUnavailable,
-            error.HysteriaSourceFamilyMismatch,
-            => {
-                if (stage.* != .connect) return err;
-                last_err = err;
-                continue;
+        if (started < peers.len and (active == 0 or now >= next_start)) {
+            try select.concurrent(.connected, Worker.connect, .{ connector, io, peers[started], started, deadline });
+            started += 1;
+            active += 1;
+            next_start = now + netutil.ADDRESS_START_DELAY_NS;
+            continue;
+        }
+        if (started < peers.len and !timer_pending) {
+            const until: Io.Clock.Timestamp = .{
+                .raw = .fromNanoseconds(@intCast(@min(next_start, deadline))),
+                .clock = .awake,
+            };
+            try select.concurrent(.wake, Io.Clock.Timestamp.wait, .{ until, io });
+            timer_pending = true;
+        }
+        switch (try select.await()) {
+            .connected => |outcome| {
+                const winner = outcome catch |err| {
+                    if (!isPeerConnectError(err)) return err;
+                    last_err = err;
+                    active -= 1;
+                    next_start = netutil.monoNow(io);
+                    continue;
+                };
+                return winner;
             },
-            error.VolumeRefused => {
-                if (dialed) |slot| slot.* = peer;
-                return err;
+            .wake => |outcome| {
+                try outcome;
+                timer_pending = false;
             },
-            else => return err,
-        };
-        if (dialed) |slot| slot.* = peer;
-        if (index != 0) std.mem.swap(Io.net.IpAddress, &peers[0], &peers[index]);
-        return ms;
+        }
     }
     return last_err;
 }
+
+fn isPeerConnectError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectTimeout,
+        error.ConnectionRefused,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.AddressFamilyUnsupported,
+        error.AddressNotAvailable,
+        error.AddressUnavailable,
+        error.HysteriaSourceFamilyMismatch,
+        => true,
+        else => false,
+    };
+}
+
+const Client4 = quicz.runtime.client.Client;
+const Client6 = quicz.runtime.client.ClientForTupleWithDatagramLimit(quicz.endpoint.Udp6Tuple, 1350);
+
+const Connector = struct {
+    gpa: std.mem.Allocator,
+    opts: Options,
+    roots: ?*const std.crypto.Certificate.Bundle,
+    bind_spec: ?[]const u8,
+
+    const Connection = struct {
+        start: i128,
+        client: union(enum) { ip4: *Client4, ip6: *Client6 },
+
+        fn deinit(self: @This()) void {
+            switch (self.client) {
+                inline else => |client| {
+                    const gpa = client.allocator;
+                    client.deinit();
+                    gpa.destroy(client);
+                },
+            }
+        }
+    };
+
+    fn connect(self: @This(), io: Io, peer: Io.net.IpAddress, deadline: i128) !Connection {
+        const start = netutil.monoNow(io);
+        return .{
+            .start = start,
+            .client = switch (peer) {
+                .ip4 => .{ .ip4 = try connectPeer(Client4, self, io, peer, deadline) },
+                .ip6 => .{ .ip6 = try connectPeer(Client6, self, io, peer, deadline) },
+            },
+        };
+    }
+};
 
 fn destinations(io: Io, proxy: proxy_uri.Proxy, deadline: i128, storage: *[MAX_PEERS]Io.net.IpAddress) ![]Io.net.IpAddress {
     if (Io.net.IpAddress.parse(proxy.host, proxy.port)) |ip| {
@@ -143,49 +241,50 @@ fn bindSocket(io: Io, peer: Io.net.IpAddress, bind_spec: ?[]const u8) !Io.net.So
     return socket;
 }
 
-fn probePeer(
-    comptime Client: type,
-    gpa: std.mem.Allocator,
-    io: Io,
-    peer: Io.net.IpAddress,
-    opts: Options,
-    roots: ?*const std.crypto.Certificate.Bundle,
-    target: util.Target,
-    bind_spec: ?[]const u8,
-    connect_budget: i128,
-    deadline: i128,
-    stage: *util.Stage,
-) !u64 {
-    const start = netutil.monoNow(io);
+fn connectPeer(comptime Client: type, args: Connector, io: Io, peer: Io.net.IpAddress, deadline: i128) !*Client {
+    if (netutil.monoNow(io) >= deadline) return error.ConnectTimeout;
     var config: Client.Config = .{
         .server_port = peer.getPort(),
-        .server_name = opts.server_name,
+        .server_name = args.opts.server_name,
         .alpn = &alpn,
-        .ca_bundle = roots,
-        .insecure_skip_verify = opts.insecure,
+        .ca_bundle = args.roots,
+        .insecure_skip_verify = args.opts.insecure,
     };
-    if (Client == quicz.runtime.client.Client) {
+    if (Client == Client4) {
         config.server_host = peer.ip4.bytes;
     } else {
         config.server_host = peer.ip6.bytes;
         config.server_scope_id = peer.ip6.interface.index;
     }
-    const client = try gpa.create(Client);
-    defer gpa.destroy(client);
-    const socket = try bindSocket(io, peer, bind_spec);
-    client.* = Client.initWithSocket(gpa, io, socket, config) catch |err| {
+    const client = try args.gpa.create(Client);
+    errdefer args.gpa.destroy(client);
+    const socket = try bindSocket(io, peer, args.bind_spec);
+    client.* = Client.initWithSocket(args.gpa, io, socket, config) catch |err| {
         socket.close(io);
         return err;
     };
-    defer client.deinit();
+    errdefer client.deinit();
 
-    const connect_left = @min(start + connect_budget, deadline) - netutil.monoNow(io);
+    const connect_left = deadline - netutil.monoNow(io);
     if (connect_left <= 0) return error.ConnectTimeout;
     const timeout_ms: u32 = @intCast(@min(@divCeil(connect_left, std.time.ns_per_ms), std.math.maxInt(u32)));
     client.connectWithTimeout(timeout_ms) catch |err| switch (err) {
         error.ConnectionTimedOut => return error.ConnectTimeout,
         else => return err,
     };
+    return client;
+}
+
+fn probeConnected(
+    gpa: std.mem.Allocator,
+    io: Io,
+    client: anytype,
+    opts: Options,
+    target: util.Target,
+    start: i128,
+    deadline: i128,
+    stage: *util.Stage,
+) !u64 {
     stage.* = .handshake;
     const hs = &client.client.transport.backend.hs;
     if (!std.mem.eql(u8, hs.negotiated_alpn[0..hs.negotiated_alpn_len], alpn[0])) return error.HysteriaAlpnMismatch;
@@ -203,7 +302,7 @@ fn probePeer(
     var select = Io.Select(Result).init(io, &results);
     defer select.cancelDiscard();
     const Worker = struct {
-        fn run(alloc: std.mem.Allocator, worker_io: Io, conn: *Client, auth: []const u8, test_target: util.Target, progress: *util.Stage, started: i128) anyerror!u64 {
+        fn run(alloc: std.mem.Allocator, worker_io: Io, conn: @TypeOf(client), auth: []const u8, test_target: util.Target, progress: *util.Stage, started: i128) anyerror!u64 {
             return exchange(alloc, worker_io, conn, auth, test_target, progress, started);
         }
     };
@@ -318,6 +417,84 @@ fn readHttp(client: anytype, stream: u64, buf: []u8, len: *usize, expect: util.P
         }
         len.* += n;
     }
+}
+
+test "Hysteria 2 keeps the first handshake alive after starting the fallback" {
+    const FakeConnector = struct {
+        second_started: *Io.Event,
+        second_started_at: *i128,
+        second_canceled: *bool,
+
+        const Connection = struct {
+            fn deinit(_: @This()) void {}
+        };
+
+        fn connect(self: @This(), io: Io, peer: Io.net.IpAddress, deadline: i128) !Connection {
+            const until: Io.Clock.Timestamp = .{ .raw = .fromNanoseconds(@intCast(deadline)), .clock = .awake };
+            switch (peer) {
+                .ip6 => {
+                    self.second_started.waitTimeout(io, .{ .deadline = until }) catch |err| switch (err) {
+                        error.Timeout => return error.ConnectTimeout,
+                        error.Canceled => return error.Canceled,
+                    };
+                    return .{};
+                },
+                .ip4 => {
+                    self.second_started_at.* = netutil.monoNow(io);
+                    self.second_started.set(io);
+                    until.wait(io) catch |err| {
+                        self.second_canceled.* = true;
+                        return err;
+                    };
+                    return error.ConnectTimeout;
+                },
+            }
+        }
+    };
+    const io = std.testing.io;
+    const peers = [_]Io.net.IpAddress{
+        try .parse("2001:db8::1", 443),
+        try .parse("192.0.2.1", 443),
+    };
+    var second_started: Io.Event = .unset;
+    var second_started_at: i128 = undefined;
+    var second_canceled = false;
+    const start = netutil.monoNow(io);
+
+    const winner = try connectPeers(io, &peers, netutil.deadlineNs(io, 2), FakeConnector{
+        .second_started = &second_started,
+        .second_started_at = &second_started_at,
+        .second_canceled = &second_canceled,
+    });
+    defer winner.connection.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), winner.index);
+    try std.testing.expect(second_started_at - start >= netutil.ADDRESS_START_DELAY_NS);
+    try std.testing.expect(second_canceled);
+}
+
+test "Hysteria 2 starts the next address immediately after refusal" {
+    const FakeConnector = struct {
+        const Connection = struct {
+            fn deinit(_: @This()) void {}
+        };
+
+        fn connect(_: @This(), _: Io, peer: Io.net.IpAddress, _: i128) !Connection {
+            if (peer == .ip6) return error.ConnectionRefused;
+            return .{};
+        }
+    };
+    const io = std.testing.io;
+    const peers = [_]Io.net.IpAddress{
+        try .parse("2001:db8::1", 443),
+        try .parse("192.0.2.1", 443),
+    };
+    const deadline = netutil.monoNow(io) + 200 * std.time.ns_per_ms;
+
+    const winner = try connectPeers(io, &peers, deadline, FakeConnector{});
+    defer winner.connection.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), winner.index);
 }
 
 test "Hysteria URI options decode the SNI and enforce a SHA-256 fingerprint" {

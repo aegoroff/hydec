@@ -416,34 +416,9 @@ fn hostPortExplicit(hostport: []const u8) bool {
 }
 
 fn formatDialHost(address: std.Io.net.IpAddress, port: ?u16, buf: *[96]u8) []const u8 {
-    var ip_buf: [64]u8 = undefined;
-    var ip_writer: std.Io.Writer = .fixed(&ip_buf);
-    const normalized = switch (address) {
-        .ip4 => address,
-        .ip6 => |ip6| std.Io.net.IpAddress.fromIp6(ip6),
-    };
-    normalized.format(&ip_writer) catch unreachable;
-    const formatted = ip_writer.buffered();
-    const port_sep = std.mem.lastIndexOfScalar(u8, formatted, ':').?;
-    const ip = switch (normalized) {
-        .ip4 => formatted[0..port_sep],
-        .ip6 => formatted[1 .. port_sep - 1],
-    };
-    var n: usize = 0;
-    if (normalized == .ip6) {
-        buf[n] = '[';
-        n += 1;
-    }
-    @memcpy(buf[n..][0..ip.len], ip);
-    n += ip.len;
-    if (normalized == .ip6) {
-        buf[n] = ']';
-        n += 1;
-    }
+    var n = util.formatIpHost(address, true, buf[0..64]).len;
     if (port) |p| {
-        buf[n] = ':';
-        n += 1;
-        const rendered = std.fmt.bufPrint(buf[n..], "{d}", .{p}) catch unreachable;
+        const rendered = std.fmt.bufPrint(buf[n..], ":{d}", .{p}) catch unreachable;
         n += rendered.len;
     }
     return buf[0..n];

@@ -1,5 +1,18 @@
 const std = @import("std");
 
+pub fn formatIpHost(ip: std.Io.net.IpAddress, bracket_ipv6: bool, buf: *[64]u8) []const u8 {
+    const address = switch (ip) {
+        .ip4 => ip,
+        .ip6 => |ip6| std.Io.net.IpAddress.fromIp6(ip6),
+    };
+    var writer: std.Io.Writer = .fixed(buf);
+    address.format(&writer) catch unreachable;
+    const formatted = writer.buffered();
+    const port_sep = std.mem.lastIndexOfScalar(u8, formatted, ':').?;
+    if (address == .ip6 and !bracket_ipv6) return formatted[1 .. port_sep - 1];
+    return formatted[0..port_sep];
+}
+
 /// Decode percent-encoding without treating `+` as space (RFC 3986 fragment/userinfo).
 pub fn urlDecodeStrict(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;

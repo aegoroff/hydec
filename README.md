@@ -7,10 +7,10 @@ Requires **Zig 0.17.1** ([mise](https://mise.jdx.dev/) pin in `mise.toml`, or in
 ## Features
 
 - Fetches an **HTTPS-only** subscription URL (HTTP redirects rejected) and base64-decodes URI lines
-- Probes **Shadowsocks** (AEAD), **Trojan** (TLS / WebSocket), **VLESS REALITY** (TCP vision and gRPC gun)
+- Probes **Shadowsocks** (AEAD), **Trojan** (TLS / WebSocket), **VLESS REALITY** (TCP vision and gRPC gun), and **Hysteria 2** (QUIC, `hysteria2://` and `hy2://`)
 - Skips VMess (counted in stats)
 - Groups by host/IP: different IPs in parallel, same IP sequentially
-- Ranks by **protocol preference** (VLESS gRPC / Trojan → VLESS TCP → SS), demoting a preferred tier only when a lower tier is much faster (2× / 3× rules); override with `--strategy fastest` or `strict`
+- Ranks by **protocol preference** (VLESS gRPC / Trojan / Hysteria 2 → VLESS TCP → SS), with 2× / 3× demotion thresholds and a minimum latency gap. Override with `--strategy fastest` or `strict`
 - Optional `--prefer-stable` ranks by the worst probe and puts candidates that needed a retry last
 - Optional `--check-volume` downloads 40 KB through each tunnel to catch nodes that DPI freezes after the first ~16 KB
 - Optional `--interface` / `-I` binds probe sockets to a source IP or Linux device name
@@ -73,19 +73,19 @@ Each candidate is probed **3 times**; one timeout or dropped connection is retri
 
 | Strategy | Behavior |
 |----------|----------|
-| `hydec` (default) | Protocol preference with 2× / 3× demotion (below) |
+| `hydec` (default) | VLESS², Trojan, and Hysteria 2 share the top tier, followed by VLESS³ and SS, with 2× / 3× demotion |
 | `fastest` | Compare nodes across all protocol classes using the 10% median window |
-| `strict` | Never demote: first successful class in VLESS² → Trojan → VLESS³ → SS |
+| `strict` | Use the first successful class in VLESS² → Trojan → Hysteria 2 → VLESS³ → SS |
 
-By default, candidates with median latency at most **10%** above the lowest eligible median are compared by the arithmetic mean of their three successful probes. Ties go to the lower median, then to VLESS² → Trojan → VLESS³ → SS. The window covers all classes with `fastest`, the winning tier with `hydec`, or the winning class with `strict`.
+By default, candidates with median latency at most **10%** above the lowest eligible median are compared by the arithmetic mean of their three successful probes. Ties go to the lower median, then to VLESS² → Trojan → VLESS³ → SS → Hysteria 2. The window covers all classes with `fastest`, the winning tier with `hydec`, or the winning class with `strict`.
 
 `hydec` winner selection:
 
-1. Start with the **VLESS²** (REALITY gRPC) / **Trojan** tier. Use its lowest median for the demotion rules below.
-2. Prefer **VLESS³** (REALITY TCP vision) over VLESS² / Trojan when it is **>2×** slower
-3. Prefer **Shadowsocks** over VLESS² / Trojan when it is **≥3×** slower. If SS is eligible and VLESS³ exists, keep VLESS³ unless it is **>3×** slower than SS (even if VLESS² / Trojan was not demoted to VLESS³)
-4. With VLESS³ but no VLESS² / Trojan: prefer VLESS³ unless it is **>2×** slower than SS
-5. With only SS: SS
+1. Start with the **VLESS²** (REALITY gRPC), **Trojan**, and **Hysteria 2** tier. Use its lowest median for the demotion rules below.
+2. Prefer **VLESS³** (REALITY TCP vision) when the top tier's median is **>2×** its median.
+3. **Shadowsocks** becomes eligible when the top tier's median is **≥3×** the SS median. If VLESS³ is also available, keep VLESS³ unless it is **>3×** slower than SS.
+4. If the top tier has no successful probes, prefer VLESS³ unless it is **>2×** slower than SS.
+5. If only SS succeeds, choose SS.
 
 Every demotion in 2–4 also requires the slower class to be more than **15 ms** behind, so jitter between nearby nodes (e.g. 21 ms vs 7 ms) does not change the winner.
 

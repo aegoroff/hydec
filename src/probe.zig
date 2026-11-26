@@ -729,21 +729,8 @@ fn logParseFail(gpa: std.mem.Allocator, index: usize, line: []const u8, err: any
 }
 
 fn dupeIpKey(gpa: std.mem.Allocator, ip: Io.net.IpAddress) ![]u8 {
-    const address = switch (ip) {
-        .ip4 => ip,
-        .ip6 => |ip6| Io.net.IpAddress.fromIp6(ip6),
-    };
     var buf: [64]u8 = undefined;
-    var writer: Io.Writer = .fixed(&buf);
-    try address.format(&writer);
-    const formatted = writer.buffered();
-    // IpAddress.format includes the port and, for IPv6, brackets.
-    const port_sep = std.mem.lastIndexOfScalar(u8, formatted, ':').?;
-    const key = switch (address) {
-        .ip4 => formatted[0..port_sep],
-        .ip6 => formatted[1 .. port_sep - 1],
-    };
-    return gpa.dupe(u8, key);
+    return gpa.dupe(u8, util.formatIpHost(ip, false, &buf));
 }
 
 fn dupeNameOwnerKey(gpa: std.mem.Allocator, host: []const u8) ![]u8 {
@@ -845,14 +832,15 @@ fn resolveWorker(
     oom: *std.atomic.Value(bool),
     gpa: std.mem.Allocator,
     io: Io,
-    deadline: i128,
+    timeout_secs: u32,
     resolver: anytype,
 ) void {
     while (true) {
         const i = next.fetchAdd(1, .monotonic);
         if (i >= names.len) return;
         const name = &names[i];
-        if (netutil.monoNow(io) >= deadline) {
+        const deadline = netutil.deadlineNs(io, timeout_secs);
+        if (timeout_secs == 0) {
             name.err = error.Timeout;
             continue;
         }
@@ -906,7 +894,6 @@ fn collectGroupsWithResolver(
     timeout_secs: u32,
     resolver: anytype,
 ) !GroupMap {
-    const dns_deadline = netutil.deadlineNs(io, timeout_secs);
     var pending: std.ArrayList(PendingEntry) = .empty;
     defer pending.deinit(gpa);
     var moved: usize = 0;
@@ -961,7 +948,6 @@ fn collectGroupsWithResolver(
         try pending.append(gpa, .{ .raw = line, .proxy = proxy, .endpoint = endpoint });
     }
 
-    // The same DNS budget covers queued names and retries.
     var oom: std.atomic.Value(bool) = .init(false);
     {
         var next: std.atomic.Value(usize) = .init(0);
@@ -970,7 +956,7 @@ fn collectGroupsWithResolver(
         var spawned: usize = 0;
         defer for (threads[0..spawned]) |t| t.join();
         for (threads) |*t| {
-            t.* = try std.Thread.spawn(.{ .stack_size = WORKER_STACK_SIZE }, resolveWorker, .{ names.values(), &next, &oom, gpa, io, dns_deadline, resolver });
+            t.* = try std.Thread.spawn(.{ .stack_size = WORKER_STACK_SIZE }, resolveWorker, .{ names.values(), &next, &oom, gpa, io, timeout_secs, resolver });
             spawned += 1;
         }
     }
@@ -2009,7 +1995,7 @@ test "collectGroups leaves resource failures eligible for a deferred DNS probe" 
     try std.testing.expectEqual(@as(usize, 2), stats.tested);
 }
 
-test "resolveWorker shares one DNS deadline across queued hostnames" {
+test "resolveWorker gives a queued hostname a fresh budget after a timeout" {
     const Resolver = struct {
         first_deadline: *i128,
         second_deadline: *i128,
@@ -2017,10 +2003,11 @@ test "resolveWorker shares one DNS deadline across queued hostnames" {
         fn lookup(self: @This(), io: Io, host: []const u8, deadline: i128, addresses: []Io.net.IpAddress) ![]Io.net.IpAddress {
             if (std.mem.eql(u8, host, "first.example")) {
                 self.first_deadline.* = deadline;
-                try io.sleep(.fromMilliseconds(20), .awake);
-            } else {
-                self.second_deadline.* = deadline;
+                const until: Io.Clock.Timestamp = .{ .raw = .fromNanoseconds(@intCast(deadline)), .clock = .awake };
+                try until.wait(io);
+                return error.Timeout;
             }
+            self.second_deadline.* = deadline;
             addresses[0] = try Io.net.IpAddress.parse("192.0.2.1", 0);
             return addresses[0..1];
         }
@@ -2033,15 +2020,15 @@ test "resolveWorker shares one DNS deadline across queued hostnames" {
     var first_deadline: i128 = 0;
     var second_deadline: i128 = 0;
 
-    const deadline = netutil.deadlineNs(std.testing.io, 1);
-    resolveWorker(&names, &next, &oom, gpa, std.testing.io, deadline, Resolver{
+    resolveWorker(&names, &next, &oom, gpa, std.testing.io, 1, Resolver{
         .first_deadline = &first_deadline,
         .second_deadline = &second_deadline,
     });
 
-    try std.testing.expectEqual(deadline, first_deadline);
-    try std.testing.expectEqual(deadline, second_deadline);
-    for (names) |name| try std.testing.expectEqual(@as(usize, 1), name.addresses.len);
+    try std.testing.expectEqual(@as(?anyerror, error.Timeout), names[0].err);
+    try std.testing.expectEqual(@as(?anyerror, null), names[1].err);
+    try std.testing.expectEqual(@as(usize, 1), names[1].addresses.len);
+    try std.testing.expect(second_deadline - first_deadline >= std.time.ns_per_s);
 }
 
 test "collectGroups keeps DNS timeout without restarting the lookup" {
