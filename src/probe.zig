@@ -38,7 +38,7 @@ pub const Strategy = enum {
 };
 
 /// Preference class for `best` ranking (higher = preferred when latencies are comparable).
-/// VLESS² = REALITY gRPC; VLESS³ = REALITY TCP vision — matching HyNet subscription labels.
+/// VLESS² = REALITY gRPC; VLESS³ = REALITY TCP Vision and XHTTP.
 /// Enum order breaks exact latency ties. Strict uses its own class order.
 pub const PrefClass = enum {
     hysteria2,
@@ -51,7 +51,7 @@ pub const PrefClass = enum {
         return switch (proxy.kind) {
             .vless => switch (proxy.transport) {
                 .grpc => .vless2,
-                .tcp => .vless3,
+                .tcp, .xhttp => .vless3,
                 else => null,
             },
             .shadowsocks => .shadowsocks,
@@ -139,7 +139,7 @@ pub fn probeOne(
             break :blk try ss.probe(gpa, io, proxy.host, proxy.port, method, password, target, timeout_secs, bind, addresses, stage, dialed);
         },
         .trojan => blk: {
-            if (proxy.transport == .grpc or proxy.transport == .other) return error.UnsupportedTransport;
+            if (proxy.transport != .tcp and proxy.transport != .ws) return error.UnsupportedTransport;
             if (proxy.security != .tls) return error.UnsupportedSecurity;
             const sni_owned = try proxy.getParamDecoded(gpa, "sni");
             defer if (sni_owned) |s| gpa.free(s);
@@ -169,9 +169,6 @@ pub fn probeOne(
         },
         .vless => blk: {
             if (proxy.security != .reality) return error.UnsupportedSecurity;
-            if (proxy.transport == .other) return error.UnsupportedTransport;
-            if (proxy.transport == .ws) return error.UnsupportedTransport;
-
             const enc_owned = try proxy.getParamDecoded(gpa, "encryption");
             defer if (enc_owned) |e| gpa.free(e);
             const enc = enc_owned orelse "none";
@@ -188,19 +185,25 @@ pub fn probeOne(
             const flow_owned = try proxy.getParamDecoded(gpa, "flow");
             defer if (flow_owned) |f| gpa.free(f);
             const flow = flow_owned orelse "";
-            const service_owned = try proxy.getParamDecoded(gpa, "serviceName");
-            defer if (service_owned) |s| gpa.free(s);
-            const service = service_owned orelse "";
-            const use_grpc = proxy.transport == .grpc;
-            if (use_grpc) {
-                const mode_owned = try proxy.getParamDecoded(gpa, "mode");
-                defer if (mode_owned) |m| gpa.free(m);
-                const mode = mode_owned orelse "gun";
-                if (!std.mem.eql(u8, mode, "gun") and mode.len != 0) return error.UnsupportedGrpcMode;
-            }
-            const authority_owned = try proxy.getParamDecoded(gpa, "authority");
-            defer if (authority_owned) |a| gpa.free(a);
-            const authority = authority_owned orelse "";
+            var params_arena = std.heap.ArenaAllocator.init(gpa);
+            defer params_arena.deinit();
+            const params = params_arena.allocator();
+            const transport: reality.Transport = switch (proxy.transport) {
+                .tcp => .{ .tcp = flow },
+                .grpc => grpc: {
+                    const mode = (try proxy.getParamDecoded(params, "mode")) orelse "";
+                    if (mode.len != 0 and !std.mem.eql(u8, mode, "gun")) return error.UnsupportedGrpcMode;
+                    break :grpc .{ .grpc = .{
+                        .service = (try proxy.getParamDecoded(params, "serviceName")) orelse "",
+                        .authority = (try proxy.getParamDecoded(params, "authority")) orelse "",
+                    } };
+                },
+                .xhttp => xhttp: {
+                    if (flow.len != 0) return error.UnsupportedXhttpFlow;
+                    break :xhttp .{ .xhttp = try parseXhttp(params, proxy) };
+                },
+                else => return error.UnsupportedTransport,
+            };
             break :blk try reality.probeVless(
                 gpa,
                 io,
@@ -210,10 +213,7 @@ pub fn probeOne(
                 sni,
                 pbk,
                 sid,
-                flow,
-                use_grpc,
-                service,
-                authority,
+                transport,
                 target,
                 timeout_secs,
                 bind,
@@ -226,6 +226,72 @@ pub fn probeOne(
         .vmess => error.SkippedVmess,
         .unsupported => error.UnsupportedProtocol,
     };
+}
+
+fn parseXhttp(arena: std.mem.Allocator, proxy: proxy_uri.Proxy) !@FieldType(reality.Transport, "xhttp") {
+    try validateXhttpMode(try proxy.getParamDecoded(arena, "mode"));
+    var options: @FieldType(reality.Transport, "xhttp") = .{
+        .path = (try proxy.getParamDecoded(arena, "path")) orelse "",
+        .authority = (try proxy.getParamDecoded(arena, "host")) orelse "",
+    };
+    const Extra = struct {
+        mode: ?[]const u8 = null,
+        xPaddingObfsMode: ?bool = null,
+        noGRPCHeader: ?bool = null,
+        downloadSettings: ?std.json.Value = null,
+        xPaddingBytes: ?std.json.Value = null,
+    };
+    if (util.getQueryParam(proxy.query, "extra")) |raw| {
+        const form = try arena.dupe(u8, raw);
+        std.mem.replaceScalar(u8, form, '+', ' ');
+        var decoded = try util.urlDecodeStrict(arena, form);
+        if (decoded.len >= 3 and std.ascii.eqlIgnoreCase(decoded[0..3], "%7B")) {
+            std.mem.replaceScalar(u8, decoded, '+', ' ');
+            decoded = try util.urlDecodeStrict(arena, decoded);
+        }
+        const json = std.mem.trim(u8, decoded, " \t\r\n");
+        if (json.len != 0) {
+            const extra = std.json.parseFromSliceLeaky(Extra, arena, json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidXhttpExtra,
+            };
+            try validateXhttpMode(extra.mode);
+            if ((extra.xPaddingObfsMode orelse false) or (extra.noGRPCHeader orelse false) or extra.downloadSettings != null)
+                return error.UnsupportedXhttpExtra;
+            if (extra.xPaddingBytes) |padding| {
+                options.padding = switch (padding) {
+                    .string => |value| try parseXhttpPadding(value),
+                    .integer => |value| if (value == 0) .{} else blk: {
+                        const bytes = std.math.cast(u32, value) orelse return error.InvalidXhttpPadding;
+                        break :blk .{ .min = bytes, .max = bytes };
+                    },
+                    else => return error.InvalidXhttpPadding,
+                };
+                return options;
+            }
+        }
+    }
+    if (try proxy.getParamDecoded(arena, "x_padding_bytes")) |padding|
+        options.padding = try parseXhttpPadding(padding);
+    if (try proxy.getParamDecoded(arena, "xPaddingBytes")) |padding|
+        options.padding = try parseXhttpPadding(padding);
+    return options;
+}
+
+fn validateXhttpMode(mode: ?[]const u8) error{UnsupportedXhttpMode}!void {
+    const value = mode orelse return;
+    if (value.len != 0 and !std.mem.eql(u8, value, "auto") and !std.mem.eql(u8, value, "stream-one"))
+        return error.UnsupportedXhttpMode;
+}
+
+fn parseXhttpPadding(value: []const u8) error{InvalidXhttpPadding}!reality.XhttpPadding {
+    if (value.len == 0) return .{};
+    const sep = std.mem.findScalar(u8, value, '-') orelse value.len;
+    const min = std.fmt.parseUnsigned(u32, value[0..sep], 10) catch return error.InvalidXhttpPadding;
+    if (sep == value.len) return if (min == 0) .{} else .{ .min = min, .max = min };
+    const max = std.fmt.parseUnsigned(u32, value[sep + 1 ..], 10) catch return error.InvalidXhttpPadding;
+    if (min == 0 or min > max) return error.InvalidXhttpPadding;
+    return .{ .min = min, .max = max };
 }
 
 /// How many failed attempts per candidate may be retried, and only when `isTransient`.
@@ -575,6 +641,12 @@ pub fn failHint(err: anyerror) []const u8 {
         => "unreachable",
         error.GrpcEmptyResponse => "empty/no-data",
         error.GrpcBadStatus => "grpc/status",
+        error.XhttpBadStatus => "xhttp/status",
+        error.UnsupportedXhttpMode => "xhttp/unsupported-mode",
+        error.UnsupportedXhttpFlow => "xhttp/unsupported-flow",
+        error.UnsupportedXhttpExtra => "xhttp/unsupported-extra",
+        error.InvalidXhttpExtra => "xhttp/invalid-extra",
+        error.InvalidXhttpPadding => "xhttp/invalid-padding",
         // Server picked h2 for a ws transport: the HTTP/1.1 upgrade gets HTTP/2 frames.
         error.WsAlpnHttp2 => "alpn/h2-breaks-ws",
         // The URI listed more ALPN protocols than a probe will carry.
@@ -2142,6 +2214,52 @@ test "failHint classifies write and buffer errors" {
     try std.testing.expectEqualStrings("unsupported-obfs", failHint(error.UnsupportedObfs));
 }
 
+test "XHTTP reads panel defaults and configured padding from share links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const address = "vless://00000000-1111-2222-3333-444444444444@192.0.2.10:443?type=xhttp&security=reality";
+    const cases = [_]struct { query: []const u8, min: u32, max: u32 }{
+        .{ .query = "", .min = 100, .max = 1000 },
+        .{ .query = "&mode=auto&extra=%7B%22scMaxEachPostBytes%22%3A%221000000%22%2C+%22scMinPostsIntervalMs%22%3A%2230%22%2C+%22xPaddingBytes%22%3A%22100-1000%22%7D", .min = 100, .max = 1000 },
+        .{ .query = "&mode=stream-one&x_padding_bytes=500%2D1500&extra=%7B%22noGRPCHeader%22:false,%22xPaddingObfsMode%22:false,%22downloadSettings%22:null%7D", .min = 500, .max = 1500 },
+        .{ .query = "&x_padding_bytes=500-1500&extra=%257B%2522xPaddingBytes%2522%253A%25221500-1600%2522%257D", .min = 1500, .max = 1600 },
+        .{ .query = "&extra=%7B%22mode%22:%22stream-one%22,%22xPaddingBytes%22:800%7D", .min = 800, .max = 800 },
+    };
+    for (cases) |case| {
+        const raw = try std.mem.concat(gpa, u8, &.{ address, case.query });
+        const proxy = try proxy_uri.parse(gpa, raw);
+
+        const options = try parseXhttp(gpa, proxy);
+
+        try std.testing.expectEqual(reality.XhttpPadding{ .min = case.min, .max = case.max }, options.padding);
+    }
+}
+
+test "XHTTP rejects incompatible options and malformed padding" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const address = "vless://00000000-1111-2222-3333-444444444444@192.0.2.10:443?type=xhttp&security=reality";
+    const cases = [_]struct { query: []const u8, err: anyerror }{
+        .{ .query = "&extra=%7B%22xPaddingObfsMode%22:true%7D", .err = error.UnsupportedXhttpExtra },
+        .{ .query = "&extra=%7B%22noGRPCHeader%22:true%7D", .err = error.UnsupportedXhttpExtra },
+        .{ .query = "&extra=%7B%22downloadSettings%22:%7B%7D%7D", .err = error.UnsupportedXhttpExtra },
+        .{ .query = "&mode=packet-up", .err = error.UnsupportedXhttpMode },
+        .{ .query = "&mode=auto&extra=%7B%22mode%22:%22stream-up%22%7D", .err = error.UnsupportedXhttpMode },
+        .{ .query = "&extra=%7B", .err = error.InvalidXhttpExtra },
+        .{ .query = "&x_padding_bytes=1500-500", .err = error.InvalidXhttpPadding },
+        .{ .query = "&x_padding_bytes=0-500", .err = error.InvalidXhttpPadding },
+        .{ .query = "&extra=%7B%22xPaddingBytes%22:-1%7D", .err = error.InvalidXhttpPadding },
+    };
+    for (cases) |case| {
+        const raw = try std.mem.concat(gpa, u8, &.{ address, case.query });
+        const proxy = try proxy_uri.parse(gpa, raw);
+
+        try std.testing.expectError(case.err, parseXhttp(gpa, proxy));
+    }
+}
+
 test "PrefClass.fromProxy maps vless transport and protocols" {
     const gpa = std.testing.allocator;
     const v2_line =
@@ -2150,6 +2268,7 @@ test "PrefClass.fromProxy maps vless transport and protocols" {
     const v3_line =
         \\vless://00000000-1111-2222-3333-444444444444@192.0.2.10:8444?security=reality&type=tcp&flow=xtls-rprx-vision&sni=example.com&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123456789abcdef#VLESS3
     ;
+    const xhttp_line = "vless://00000000-1111-2222-3333-444444444444@192.0.2.10:443?security=reality&type=xhttp&mode=auto&path=%2Ftest";
     const ss_line = "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTp0ZXN0LXBhc3N3b3Jk@192.0.2.1:8388#ss";
     const tj_line = "trojan://password@192.0.2.1:443?security=tls&type=ws&sni=example.com&path=%2F#tj";
 
@@ -2157,6 +2276,8 @@ test "PrefClass.fromProxy maps vless transport and protocols" {
     defer v2.deinit(gpa);
     var v3 = try proxy_uri.parse(gpa, v3_line);
     defer v3.deinit(gpa);
+    var xhttp = try proxy_uri.parse(gpa, xhttp_line);
+    defer xhttp.deinit(gpa);
     var ss_p = try proxy_uri.parse(gpa, ss_line);
     defer ss_p.deinit(gpa);
     var tj = try proxy_uri.parse(gpa, tj_line);
@@ -2164,6 +2285,9 @@ test "PrefClass.fromProxy maps vless transport and protocols" {
 
     try std.testing.expect(PrefClass.fromProxy(v2) == .vless2);
     try std.testing.expect(PrefClass.fromProxy(v3) == .vless3);
+    try std.testing.expectEqual(proxy_uri.Transport.xhttp, xhttp.transport);
+    try std.testing.expectEqual(@as(?PrefClass, .vless3), PrefClass.fromProxy(xhttp));
+    try std.testing.expect(volumeRefusalIgnored(xhttp));
     try std.testing.expect(PrefClass.fromProxy(ss_p) == .shadowsocks);
     try std.testing.expect(PrefClass.fromProxy(tj) == .trojan);
 }

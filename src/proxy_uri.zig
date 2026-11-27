@@ -14,6 +14,7 @@ pub const Transport = enum {
     tcp,
     ws,
     grpc,
+    xhttp,
     other,
 };
 
@@ -91,6 +92,7 @@ fn parseTransport(type_param: ?[]const u8) Transport {
     if (std.ascii.eqlIgnoreCase(t, "tcp") or std.ascii.eqlIgnoreCase(t, "raw") or t.len == 0) return .tcp;
     if (std.ascii.eqlIgnoreCase(t, "ws")) return .ws;
     if (std.ascii.eqlIgnoreCase(t, "grpc")) return .grpc;
+    if (std.ascii.eqlIgnoreCase(t, "xhttp") or std.ascii.eqlIgnoreCase(t, "splithttp")) return .xhttp;
     return .other;
 }
 

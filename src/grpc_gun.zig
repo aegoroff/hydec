@@ -101,27 +101,20 @@ fn writeFrameHeader(out: []u8, length: u24, typ: u8, flags: u8, stream_id: u31) 
 }
 
 /// RFC 7541 §5.1 string length: 7-bit prefix, H bit clear (no Huffman). Lengths of 127
-/// and up spill into a continuation byte. Caller guarantees `len` <= 255.
+/// and up use a base-128 continuation.
 fn writeStringLen(out: []u8, len: usize) usize {
     if (len < 127) {
         out[0] = @intCast(len);
         return 1;
     }
     out[0] = 127;
-    const rest = len - 127;
-    if (rest < 128) {
-        out[1] = @intCast(rest);
-        return 2;
-    }
-    out[1] = @intCast((rest & 0x7f) | 0x80);
-    out[2] = @intCast(rest >> 7);
-    return 3;
+    return 1 + writeVarint(out[1..], len - 127);
 }
 
 fn writeLiteralHeader(out: []u8, name: []const u8, value: []const u8) error{ BufferTooSmall, HeaderFieldTooLong }!usize {
-    if (name.len > 255 or value.len > 255) return error.HeaderFieldTooLong;
-    // Worst case: 1 representation byte + 2 length bytes per string.
-    if (out.len < 1 + 2 + name.len + 2 + value.len) return error.BufferTooSmall;
+    if (name.len > 4096 or value.len > 4096) return error.HeaderFieldTooLong;
+    if (out.len < 1 + hpackStringLen(name.len) + name.len + hpackStringLen(value.len) + value.len)
+        return error.BufferTooSmall;
     var i: usize = 0;
     out[i] = 0x00;
     i += 1;
@@ -132,6 +125,10 @@ fn writeLiteralHeader(out: []u8, name: []const u8, value: []const u8) error{ Buf
     @memcpy(out[i..][0..value.len], value);
     i += value.len;
     return i;
+}
+
+fn hpackStringLen(len: usize) usize {
+    return if (len < 127) 1 else 1 + varintSize(len - 127);
 }
 
 pub fn buildClientPrefaceSettings(out: []u8) error{BufferTooSmall}!usize {
@@ -172,6 +169,19 @@ pub fn buildGunHeaders(out: []u8, service_name: []const u8, authority: []const u
     writeFrameHeader(out[0..9], @intCast(hp), 0x01, 0x04, 1);
     @memcpy(out[9..][0..hp], hpack[0..hp]);
     return 9 + hp;
+}
+
+pub fn buildXhttpHeaders(out: []u8, path: []const u8, authority: []const u8, referer: []const u8) !usize {
+    if (out.len < 9) return error.BufferTooSmall;
+    var n: usize = 9;
+    n += try writeLiteralHeader(out[n..], ":method", "POST");
+    n += try writeLiteralHeader(out[n..], ":scheme", "https");
+    n += try writeLiteralHeader(out[n..], ":path", path);
+    n += try writeLiteralHeader(out[n..], ":authority", authority);
+    n += try writeLiteralHeader(out[n..], "content-type", "application/grpc");
+    n += try writeLiteralHeader(out[n..], "referer", referer);
+    writeFrameHeader(out[0..9], @intCast(n - 9), 0x01, 0x04, 1);
+    return n;
 }
 
 /// True if an HTTP/2 HEADERS block indicates `:status: 200`.
@@ -507,8 +517,8 @@ pub fn vlessFromGrpcData(payload: []const u8) ![]const u8 {
 
 test "writeLiteralHeader encodes string lengths as HPACK integers" {
     var buf: [1024]u8 = undefined;
-    for ([_]usize{ 0, 1, 126, 127, 128, 200, 255 }) |len| {
-        const value_arr: [255]u8 = @splat('v');
+    for ([_]usize{ 0, 1, 126, 127, 128, 200, 255, 256, 512 }) |len| {
+        const value_arr: [512]u8 = @splat('v');
         const value = value_arr[0..len];
         const n = try writeLiteralHeader(&buf, "x", value);
 
@@ -524,9 +534,9 @@ test "writeLiteralHeader encodes string lengths as HPACK integers" {
     }
 }
 
-test "writeLiteralHeader rejects fields longer than 255" {
+test "writeLiteralHeader rejects fields longer than 4096" {
     var buf: [512]u8 = undefined;
-    const long: [256]u8 = @splat('a');
+    const long: [4097]u8 = @splat('a');
     try std.testing.expectError(error.HeaderFieldTooLong, writeLiteralHeader(&buf, &long, "x"));
     try std.testing.expectError(error.HeaderFieldTooLong, writeLiteralHeader(&buf, "x", &long));
 }
