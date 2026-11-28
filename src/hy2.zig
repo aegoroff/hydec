@@ -65,7 +65,7 @@ pub fn probe(
     target: util.Target,
     timeout_secs: u32,
     bind_spec: ?[]const u8,
-    addresses: ?[]Io.net.IpAddress,
+    addresses: ?*netutil.ProbeAddresses,
     stage: *util.Stage,
     dialed: ?*Io.net.IpAddress,
 ) !u64 {
@@ -84,9 +84,9 @@ pub fn probe(
     };
 
     stage.* = .connect;
-    var storage: [MAX_PEERS]Io.net.IpAddress = undefined;
-    const known: []Io.net.IpAddress = addresses orelse &.{};
-    const peers = if (known.len != 0) known else try destinations(io, proxy, deadline, &storage);
+    var local_addresses: netutil.ProbeAddresses = .{};
+    const cache = addresses orelse &local_addresses;
+    const peers = try cache.resolve(io, proxy.host, proxy.port, deadline);
     const winner = try connectPeers(io, peers, deadline, Connector{ .gpa = gpa, .opts = opts, .roots = roots, .bind_spec = bind_spec });
     defer winner.connection.deinit();
     const peer = peers[winner.index];
@@ -220,14 +220,6 @@ const Connector = struct {
         };
     }
 };
-
-fn destinations(io: Io, proxy: proxy_uri.Proxy, deadline: i128, storage: *[MAX_PEERS]Io.net.IpAddress) ![]Io.net.IpAddress {
-    if (Io.net.IpAddress.parse(proxy.host, proxy.port)) |ip| {
-        storage[0] = ip;
-        return storage[0..1];
-    } else |_| {}
-    return netutil.resolveAllUntil(io, proxy.host, proxy.port, deadline, storage);
-}
 
 fn bindSocket(io: Io, peer: Io.net.IpAddress, bind_spec: ?[]const u8) !Io.net.Socket {
     var local: Io.net.IpAddress = switch (peer) {

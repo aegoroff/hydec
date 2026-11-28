@@ -152,7 +152,7 @@ pub fn probe(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]Io.net.IpAddress,
+    addresses: ?*netutil.ProbeAddresses,
     stage: *util.Stage,
     dialed: ?*Io.net.IpAddress,
 ) !u64 {

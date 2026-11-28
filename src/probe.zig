@@ -116,7 +116,7 @@ pub fn probeOne(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]Io.net.IpAddress,
+    addresses: ?*netutil.ProbeAddresses,
     stage: *util.Stage,
     dialed: ?*Io.net.IpAddress,
 ) !u64 {
@@ -371,13 +371,14 @@ pub fn probeLatency(
 ) !Latency {
     if (resolution_error) |err| return err;
 
+    var address_cache: netutil.ProbeAddresses = .{ .resolved = addresses orelse &.{} };
     const Prober = struct {
         gpa: std.mem.Allocator,
         io: Io,
         proxy: proxy_uri.Proxy,
         timeout_secs: u32,
         bind: ?[]const u8,
-        addresses: ?[]Io.net.IpAddress,
+        addresses: *netutil.ProbeAddresses,
         stage: *util.Stage,
         dialed: *?Io.net.IpAddress,
 
@@ -389,12 +390,12 @@ pub fn probeLatency(
         }
     };
     var samples: [PROBE_ATTEMPTS]u64 = undefined;
-    const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind, .addresses = addresses, .stage = stage, .dialed = dialed }, &samples);
+    const retries = try collectSamples(Prober{ .gpa = gpa, .io = io, .proxy = proxy, .timeout_secs = timeout_secs, .bind = bind, .addresses = &address_cache, .stage = stage, .dialed = dialed }, &samples);
     var latency = Latency.fromSamples(&samples);
     latency.retries = retries;
     if (check_volume) {
         var one: Io.net.IpAddress = undefined;
-        _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, addresses, stage, &one) catch |err| switch (err) {
+        _ = probeOne(gpa, io, proxy, util.VOLUME_TARGET, timeout_secs, bind, &address_cache, stage, &one) catch |err| switch (err) {
             error.VolumeRefused => {
                 if (!volumeRefusalIgnored(proxy)) return err;
                 std.log.warn("volume check skipped for {s}:{d}: download refused", .{ proxy.host, proxy.port });
@@ -1221,7 +1222,8 @@ test "printed uri uses the ipv6 that answered, not an unreachable ipv4" {
         server.socket.address,
     };
     var connected: Io.net.IpAddress = undefined;
-    const stream = try netutil.connectHostPortWithAddresses(io, "example.com", 9, 2, null, &addresses, &connected);
+    var cache: netutil.ProbeAddresses = .{ .resolved = &addresses };
+    const stream = try netutil.connectHostPortWithAddresses(io, "example.com", 9, 2, null, &cache, &connected);
     stream.close(io);
     try std.testing.expect(connected == .ip6);
 

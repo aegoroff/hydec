@@ -4,7 +4,65 @@ const Io = std.Io;
 const posix = std.posix;
 const util = @import("util.zig");
 
-/// Dial previously resolved addresses when available; an empty list means resolve again.
+/// Addresses for one candidate, shared by all its probe attempts.
+pub const ProbeAddresses = struct {
+    resolved: []Io.net.IpAddress = &.{},
+    storage: [MAX_RACED_ADDRESSES]Io.net.IpAddress = undefined,
+
+    pub fn resolve(self: *ProbeAddresses, io: Io, host: []const u8, port: u16, deadline: i128) ![]Io.net.IpAddress {
+        if (self.resolved.len == 0) {
+            self.resolved = if (Io.net.IpAddress.parse(host, port)) |addr| blk: {
+                self.storage[0] = addr;
+                break :blk self.storage[0..1];
+            } else |_| try resolveAllUntil(io, host, port, deadline, &self.storage);
+        }
+        return self.resolved;
+    }
+
+    fn record(self: *ProbeAddresses, count: *usize, addresses: []const Io.net.IpAddress) void {
+        if (count.* > self.storage.len) return;
+        if (addresses.len > self.storage.len - count.*) {
+            count.* = self.storage.len + 1;
+            return;
+        }
+        @memcpy(self.storage[count.*..][0..addresses.len], addresses);
+        count.* += addresses.len;
+    }
+
+    // Keep the first dial overlapped with DNS. Cache only a complete answer that
+    // is already available, so a successful connection never waits for DNS.
+    fn cacheCompletedLookup(
+        self: *ProbeAddresses,
+        io: Io,
+        queue: *Io.Queue(Io.net.HostName.LookupResult),
+        future: *Io.Future(Io.net.HostName.LookupError!void),
+        initial_count: usize,
+        connected: ?Io.net.IpAddress,
+    ) void {
+        var count = initial_count;
+        while (count <= self.storage.len) {
+            var results: [8]Io.net.HostName.LookupResult = undefined;
+            const n = queue.getUncancelable(io, &results, 0) catch {
+                future.await(io) catch return;
+                self.resolved = self.storage[0..count];
+                const peer = connected orelse return;
+                for (self.resolved, 0..) |address, index| {
+                    if (address.eql(&peer)) {
+                        promoteAddress(self.resolved, index);
+                        break;
+                    }
+                }
+                return;
+            };
+            if (n == 0) return;
+            for (results[0..n]) |result| {
+                if (result == .address) self.record(&count, &.{result.address});
+            }
+        }
+    }
+};
+
+/// Dial previously resolved addresses when available.
 ///
 /// Optional bind spec for outbound probe sockets (see `applyBind`).
 /// `null` → kernel chooses the source (unchanged behavior). An empty spec is
@@ -17,10 +75,11 @@ pub fn connectHostPortWithAddresses(
     port: u16,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]Io.net.IpAddress,
+    addresses: ?*ProbeAddresses,
     dialed: ?*Io.net.IpAddress,
 ) !Io.net.Stream {
-    if (addresses) |resolved| {
+    if (addresses) |cache| {
+        const resolved = cache.resolved;
         if (resolved.len > 0) {
             const stream = try connectAddressesUntil(io, resolved, deadlineNs(io, timeout_secs), bind);
             // promoteAddress left the peer that connected at index 0.
@@ -39,7 +98,7 @@ pub fn connectHostPortWithAddresses(
         return stream;
     } else |_| {}
 
-    return connectHostnameTimed(io, host, port, timeout_secs, bind, dialed);
+    return connectHostnameTimed(io, host, port, timeout_secs, bind, addresses, dialed);
 }
 
 fn saveDialed(dialed: ?*Io.net.IpAddress, address: Io.net.IpAddress) void {
@@ -146,15 +205,14 @@ fn connectHostnameTimed(
     port: u16,
     timeout_secs: u32,
     bind: ?[]const u8,
+    cache: ?*ProbeAddresses,
     dialed: ?*Io.net.IpAddress,
 ) !Io.net.Stream {
     const hostname = try Io.net.HostName.init(host);
     const deadline = deadlineNs(io, timeout_secs);
 
     var canonical_name_buffer: [Io.net.HostName.max_len]u8 = undefined;
-    // `lookup` is documented never to block with a capacity of at least 16, so the
-    // resolver task never waits on this side of the queue, and it closes the queue
-    // before returning — which is what ends the poll loop below.
+    // Buffer results while dialing. The resolver closes the queue before returning.
     var lookup_buffer: [32]Io.net.HostName.LookupResult = undefined;
     var lookup_queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&lookup_buffer);
 
@@ -182,6 +240,9 @@ fn connectHostnameTimed(
         while (lookup_queue.getOneUncancelable(io)) |_| {} else |_| {}
     }
 
+    var cached_count: usize = 0;
+    var connected: ?Io.net.IpAddress = null;
+    defer if (cache) |addresses| addresses.cacheCompletedLookup(io, &lookup_queue, &lookup_future, cached_count, connected);
     var last_err: anyerror = error.UnknownHostName;
     var saw_address = false;
 
@@ -224,7 +285,9 @@ fn connectHostnameTimed(
         };
         if (address_count == 0) continue;
         saw_address = true;
+        if (cache) |addresses_cache| addresses_cache.record(&cached_count, addresses[0..address_count]);
         if (connectAddressesUntil(io, addresses[0..address_count], deadline, bind)) |stream| {
+            connected = addresses[0];
             saveDialed(dialed, addresses[0]);
             return stream;
         } else |err| {
@@ -398,8 +461,9 @@ test "hostname dial uses supplied addresses without resolving again" {
     var server = try addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
     var addresses = [_]Io.net.IpAddress{.{ .ip4 = .loopback(server.socket.address.getPort()) }};
+    var cache: ProbeAddresses = .{ .resolved = &addresses };
 
-    const stream = try connectHostPortWithAddresses(io, "not a hostname", 1, 2, null, &addresses, null);
+    const stream = try connectHostPortWithAddresses(io, "not a hostname", 1, 2, null, &cache, null);
     stream.close(io);
     try std.testing.expectEqual(server.socket.address.getPort(), addresses[0].ip4.port);
 }
@@ -413,10 +477,48 @@ test "dial promotes the address that connected" {
         .{ .ip4 = .loopback(1) },
         .{ .ip4 = .loopback(server.socket.address.getPort()) },
     };
+    var cache: ProbeAddresses = .{ .resolved = &addresses };
 
-    const stream = try connectHostPortWithAddresses(io, "example.com", 9, 2, null, &addresses, null);
+    const stream = try connectHostPortWithAddresses(io, "example.com", 9, 2, null, &cache, null);
     stream.close(io);
     try std.testing.expectEqual(server.socket.address.getPort(), addresses[0].ip4.port);
+}
+
+test "TCP probe caches the full DNS answer and promotes the connected address" {
+    const io = std.testing.io;
+    var cache: ProbeAddresses = .{};
+    const first: Io.net.IpAddress = .{ .ip4 = .loopback(443) };
+    const connected: Io.net.IpAddress = .{ .ip6 = .loopback(443) };
+    var queued: [2]Io.net.HostName.LookupResult = undefined;
+    var queue: Io.Queue(Io.net.HostName.LookupResult) = .init(&queued);
+    var future: Io.Future(Io.net.HostName.LookupError!void) = .{ .any_future = null, .result = {} };
+    var count: usize = 0;
+    cache.record(&count, &.{ first, connected });
+
+    cache.cacheCompletedLookup(io, &queue, &future, count, connected);
+    try std.testing.expectEqual(@as(usize, 0), cache.resolved.len);
+
+    const later: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 2 }, .port = 443 } };
+    try queue.putOneUncancelable(io, .{ .address = later });
+    queue.close(io);
+    cache.cacheCompletedLookup(io, &queue, &future, count, connected);
+
+    try std.testing.expectEqualSlices(Io.net.IpAddress, &.{ connected, first, later }, cache.resolved);
+}
+
+test "probe address resolution caches success and leaves errors retryable" {
+    const io = std.testing.io;
+    var cache: ProbeAddresses = .{};
+
+    try std.testing.expectError(error.Timeout, cache.resolve(io, "localhost", 443, monoNow(io) - 1));
+    try std.testing.expectEqual(@as(usize, 0), cache.resolved.len);
+    const first = try cache.resolve(io, "localhost", 443, deadlineNs(io, 2));
+    const reused = try cache.resolve(io, "not a hostname", 1, monoNow(io) - 1);
+
+    try std.testing.expect(first.len > 0);
+    try std.testing.expectEqual(first.ptr, reused.ptr);
+    try std.testing.expectEqual(first.len, reused.len);
+    try std.testing.expectEqual(@as(u16, 443), reused[0].getPort());
 }
 
 test "hostname dial fails fast when no unit of concurrency is available" {

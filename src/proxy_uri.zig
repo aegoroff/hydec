@@ -228,7 +228,10 @@ fn parseTrojan(gpa: std.mem.Allocator, line: []const u8) !Proxy {
 fn parseHysteria2(gpa: std.mem.Allocator, line: []const u8) !Proxy {
     const rest = afterScheme(line);
     const no_frag = stripFragment(rest);
-    const address_part = if (std.mem.findScalar(u8, no_frag, '?')) |q| no_frag[0..q] else no_frag;
+    const query_start = std.mem.findScalar(u8, no_frag, '?');
+    const address_part = no_frag[0 .. query_start orelse no_frag.len];
+    const query = if (query_start) |q| no_frag[q + 1 ..] else "";
+    if (util.getQueryParam(query, "mport") != null) return error.UnsupportedHysteriaPortHopping;
     const authority = stripPath(address_part);
     const hostport = if (std.mem.findScalarLast(u8, authority, '@')) |at| authority[at + 1 ..] else authority;
     if (hostPortExplicit(hostport)) {
@@ -250,7 +253,6 @@ fn parseHysteria2(gpa: std.mem.Allocator, line: []const u8) !Proxy {
         };
     }
 
-    const query = if (std.mem.findScalar(u8, no_frag, '?')) |q| no_frag[q + 1 ..] else "";
     const hp = try util.splitHostPortOrDefault(stripPath(address_part), 443);
     return .{
         .kind = .hysteria2,
@@ -497,6 +499,10 @@ test "parse hysteria2 reports unsupported port hopping" {
 
     try std.testing.expectError(error.UnsupportedHysteriaPortHopping, parse(gpa, "hy2://auth@server.test:443,5000-6000/?sni=server.test"));
     try std.testing.expectError(error.UnsupportedHysteriaPortHopping, parse(gpa, "hy2://[2001:db8::1]:5000-6000"));
+    try std.testing.expectError(error.UnsupportedHysteriaPortHopping, parse(gpa, "hy2://auth@server.test?mport=20000-30000"));
+    try std.testing.expectError(error.UnsupportedHysteriaPortHopping, parse(gpa, "hysteria2://[2001:db8::1]:443/?sni=server.test&mport=443%2C5000-6000#node"));
+    try std.testing.expectError(error.UnsupportedHysteriaPortHopping, parse(gpa, "hy2://server.test?mport="));
+    try std.testing.expectError(error.UnsupportedHysteriaPortHopping, parse(gpa, "hy2://server.test?mport"));
 }
 
 test "parse hysteria2" {
@@ -511,7 +517,7 @@ test "parse hysteria2" {
     try std.testing.expectEqualStrings("", util.getQueryParam(p.query, "obfs").?);
     try std.testing.expectEqualStrings("Hy2", p.name.?);
 
-    var bare = try parse(gpa, "hysteria2://[2001:db8::1]?sni=example.com");
+    var bare = try parse(gpa, "hysteria2://[2001:db8::1]?sni=example.com#?mport=20000-30000");
     defer bare.deinit(gpa);
     try std.testing.expectEqualStrings("2001:db8::1", bare.host);
     try std.testing.expectEqual(@as(u16, 443), bare.port);

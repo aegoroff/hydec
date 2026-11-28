@@ -761,7 +761,7 @@ fn connect(
     sid_hex: []const u8,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]Io.net.IpAddress,
+    addresses: ?*netutil.ProbeAddresses,
     stage: *util.Stage,
     dialed: ?*Io.net.IpAddress,
 ) !void {
@@ -1026,7 +1026,7 @@ pub fn probeVless(
     target: util.Target,
     timeout_secs: u32,
     bind: ?[]const u8,
-    addresses: ?[]Io.net.IpAddress,
+    addresses: ?*netutil.ProbeAddresses,
     stage: *util.Stage,
     dialed: ?*Io.net.IpAddress,
 ) !u64 {
