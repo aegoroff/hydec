@@ -43,6 +43,39 @@ pub fn lock() *Io.RwLock {
     return &ca_state.rw;
 }
 
+/// Windows Trojan verification can replace the shared roots while QUIC is connecting.
+pub fn snapshot(gpa: std.mem.Allocator, io: Io, bundle: *const Certificate.Bundle) !Certificate.Bundle {
+    const rw = lock();
+    try rw.lockShared(io);
+    defer rw.unlockShared(io);
+
+    var copy: Certificate.Bundle = .empty;
+    errdefer copy.deinit(gpa);
+    try copy.bytes.appendSlice(gpa, bundle.bytes.items);
+    try copy.map.ensureTotalCapacityContext(gpa, bundle.map.count(), .{ .cb = &copy });
+    var entries = bundle.map.iterator();
+    while (entries.next()) |entry| {
+        copy.map.putAssumeCapacityNoClobberContext(entry.key_ptr.*, entry.value_ptr.*, .{ .cb = &copy });
+    }
+    return copy;
+}
+
+test "CA snapshot keeps certificates and their index after the original is freed" {
+    const gpa = std.testing.allocator;
+    var bundle: Certificate.Bundle = .empty;
+    defer bundle.deinit(gpa);
+    try bundle.bytes.appendSlice(gpa, "cert-root");
+    try bundle.map.putContext(gpa, .{ .start = 5, .end = 9 }, 0, .{ .cb = &bundle });
+
+    var copy = try snapshot(gpa, std.testing.io, &bundle);
+    defer copy.deinit(gpa);
+    bundle.deinit(gpa);
+    bundle = .empty;
+
+    try std.testing.expectEqualStrings("cert-root", copy.bytes.items);
+    try std.testing.expectEqual(@as(?u32, 0), copy.find("root"));
+}
+
 test "deinitCaBundle frees a partial failed rescan" {
     // Arrange: rescan can allocate before returning an error, leaving loaded=false.
     const gpa = std.testing.allocator;

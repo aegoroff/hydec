@@ -296,7 +296,7 @@ fn buildRoot(gpa: std.mem.Allocator, description: []const u8) !*zig_cli.BaseComm
             gpa.destroy(ping);
         };
         _ = try ping.addArgument(
-            zig_cli.Argument.init("PROXY", "Full proxy URI (ss://, trojan://, vless://)", .string).withRequired(true),
+            zig_cli.Argument.init("PROXY", "Full proxy URI (ss://, trojan://, vless://, hy2://, hysteria2://)", .string).withRequired(true),
         );
         _ = try addTimeoutOption(ping);
         _ = try addInterfaceOption(ping);

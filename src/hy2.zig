@@ -25,8 +25,11 @@ const Options = struct {
             const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
             if (eq + 1 == pair.len) continue;
             const name = pair[0..eq];
-            if (std.mem.eql(u8, name, "obfs") or std.mem.eql(u8, name, "obfs-password"))
-                return error.UnsupportedObfs;
+            if (std.mem.eql(u8, name, "obfs")) {
+                const mode = try util.urlDecodeStrict(arena, pair[eq + 1 ..]);
+                if (!std.ascii.eqlIgnoreCase(mode, "plain")) return error.UnsupportedObfs;
+            }
+            if (std.mem.eql(u8, name, "obfs-password")) return error.UnsupportedObfs;
             if (std.mem.eql(u8, name, "ech")) return error.UnsupportedHysteriaEch;
         }
         const name = try proxy.getParamDecoded(arena, "sni") orelse "";
@@ -44,7 +47,7 @@ fn parsePin(input: []const u8) ![Sha256.digest_length]u8 {
     var hex: [Sha256.digest_length * 2]u8 = undefined;
     var len: usize = 0;
     for (input) |byte| {
-        if (byte == ':') continue;
+        if (byte == ':' or byte == '-') continue;
         if (len == hex.len) return error.InvalidHysteriaPin;
         hex[len] = byte;
         len += 1;
@@ -71,7 +74,14 @@ pub fn probe(
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const opts = try Options.parse(arena.allocator(), proxy);
-    const roots = if (opts.insecure) null else try ca_bundle.ensureCaBundle(gpa, io);
+    var roots_snapshot: std.crypto.Certificate.Bundle = .empty;
+    defer if (builtin.target.os.tag == .windows) roots_snapshot.deinit(gpa);
+    const roots: ?*const std.crypto.Certificate.Bundle = if (opts.insecure) null else blk: {
+        const shared = try ca_bundle.ensureCaBundle(gpa, io);
+        if (builtin.target.os.tag != .windows) break :blk shared;
+        roots_snapshot = try ca_bundle.snapshot(gpa, io, shared);
+        break :blk &roots_snapshot;
+    };
 
     stage.* = .connect;
     var storage: [MAX_PEERS]Io.net.IpAddress = undefined;
@@ -534,7 +544,25 @@ test "Hysteria URI options decode the SNI and enforce a SHA-256 fingerprint" {
     try std.testing.expectEqualStrings("test.example", opts.server_name);
     try std.testing.expect(opts.insecure);
     try std.testing.expectEqual(@as(u8, 0x01), opts.pin.?[0]);
+    const block = "01-23:45-67:89-AB:CD-EF";
+    const grouped = block ++ ":" ++ block ++ "-" ++ block ++ ":" ++ block;
+    try std.testing.expectEqual(opts.pin.?, try parsePin(grouped));
     try std.testing.expectError(error.InvalidHysteriaPin, parsePin("01:23"));
+}
+
+test "Hysteria URI accepts an empty or plain obfuscation mode" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var proxy = try proxy_uri.parse(gpa, "hy2://auth@127.0.0.1");
+    defer proxy.deinit(gpa);
+    for ([_][]const u8{ "obfs=", "obfs=plain", "obfs=%50LAIN" }) |query| {
+        proxy.query = query;
+
+        const opts = try Options.parse(gpa, proxy);
+
+        try std.testing.expectEqualStrings("auth", opts.auth);
+    }
 }
 
 test "Hysteria URI rejects obfuscation and ECH before dialing" {

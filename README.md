@@ -7,10 +7,10 @@ Requires **Zig 0.17.1** ([mise](https://mise.jdx.dev/) pin in `mise.toml`, or in
 ## Features
 
 - Fetches an **HTTPS-only** subscription URL (HTTP redirects rejected) and base64-decodes URI lines
-- Probes **Shadowsocks** (AEAD), **Trojan** (TLS / WebSocket), **VLESS REALITY** (TCP vision and gRPC gun), and **Hysteria 2** (QUIC, `hysteria2://` and `hy2://`)
+- Probes **Shadowsocks** (AEAD), **Trojan** (TLS / WebSocket), **VLESS REALITY** (TCP Vision, gRPC gun, XHTTP `stream-one` over HTTP/2), and **Hysteria 2** (QUIC, `hysteria2://` and `hy2://`)
 - Skips VMess (counted in stats)
 - Groups by host/IP: different IPs in parallel, same IP sequentially
-- Ranks by **protocol preference** (VLESS gRPC / Trojan / Hysteria 2 → VLESS TCP → SS), with 2× / 3× demotion thresholds and a minimum latency gap. Override with `--strategy fastest` or `strict`
+- Ranks by **protocol preference** (VLESS gRPC / Trojan / Hysteria 2 → VLESS TCP Vision / XHTTP → SS), with 2× / 3× demotion thresholds and a minimum latency gap. Override with `--strategy fastest` or `strict`
 - Optional `--prefer-stable` ranks by the worst probe and puts candidates that needed a retry last
 - Optional `--check-volume` downloads 40 KB through each tunnel to catch nodes that DPI freezes after the first ~16 KB
 - Optional `--interface` / `-I` binds probe sockets to a source IP or Linux device name
@@ -45,6 +45,7 @@ hydec best -v -t 5 https://example.com/sub
 hydec best -I 192.168.1.10 https://example.com/sub
 hydec best -I eth0 https://example.com/sub          # Linux; needs CAP_NET_RAW / root
 hydec best --strategy fastest https://example.com/sub
+hydec best --raw https://example.com/sub
 hydec best --prefer-stable --check-volume -t 3 https://example.com/sub
 hydec ping 'ss://...#remark'
 hydec ping -t 10 -I wlan0 'vless://...'
@@ -64,8 +65,11 @@ hydec ping --check-volume 'trojan://...'
 | `--strategy` | `best` only: ranking policy (`hydec`, `fastest`, `strict`). Default: `hydec` |
 | `--prefer-stable` | `best` only: rank by the worst of the 3 probes instead of the median; a candidate that needed a retry loses to every candidate that did not (see below) |
 | `--check-volume` | `best` and `ping`: after the latency probes, download 40 KB through the tunnel once; a stall fails the proxy (`volume/stalled`) |
+| `--raw` | `best` only. Print the original winning URI with its hostname and query intact |
 | `-V`, `--version` | Print version |
 | `-h`, `--help` | Help |
+
+Hysteria 2 probes support plain QUIC. The `obfs` parameter may be omitted, empty, or set to `plain`. A `pinSHA256` fingerprint may use uppercase or lowercase hexadecimal, with optional `:` or `-` separators.
 
 ### Ranking (`best`)
 
@@ -82,7 +86,7 @@ By default, candidates with median latency at most **10%** above the lowest elig
 `hydec` winner selection:
 
 1. Start with the **VLESS²** (REALITY gRPC), **Trojan**, and **Hysteria 2** tier. Use its lowest median for the demotion rules below.
-2. Prefer **VLESS³** (REALITY TCP vision) when the top tier's median is **>2×** its median.
+2. Prefer **VLESS³** (REALITY TCP Vision and XHTTP) when the top tier's median is **>2×** its median.
 3. **Shadowsocks** becomes eligible when the top tier's median is **≥3×** the SS median. If VLESS³ is also available, keep VLESS³ unless it is **>3×** slower than SS.
 4. If the top tier has no successful probes, prefer VLESS³ unless it is **>2×** slower than SS.
 5. If only SS succeeds, choose SS.
@@ -103,7 +107,7 @@ The latency probes move only a few hundred bytes, so a node whose sessions DPI f
 
 - **stderr:** download progress, optional verbose probe lines, summary stats, winner line  
   `Best: 59ms 192.168.11.1 — 🇸🇪 SHADOWSOCKS - Швеция`
-- **stdout:** winning proxy URI (one line). When `best` can replace the hostname with an IP address from DNS, it preserves the query parameters (including any explicit `sni`) and the fragment. Otherwise it prints the original URI.
+- **stdout** contains one winning proxy URI. When possible, `best` replaces the hostname with the IP address reached by the probe. It preserves the fragment and query parameters. For Trojan, VLESS REALITY and Hysteria 2, it adds `sni=<original hostname>` if `sni` was missing or empty. With `--raw`, or when IP substitution is unavailable, it prints the original URI.
 
 ### Output (`ping`)
 

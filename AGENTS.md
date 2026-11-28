@@ -19,23 +19,24 @@ Non-interactive CLI with subcommands: `best` (subscription → preferred proxy) 
 |----------|--------|
 | Shadowsocks | AEAD methods |
 | Trojan | TLS; WebSocket transport. The main TLS handshake negotiates ALPN and ws fails `WsAlpnHttp2` when the server picks h2; without `alpn=` ws offers `http/1.1` only, like Xray (`WithNextProto`) and sing-box / podkop (`SetNextProtos`) |
-| VLESS | REALITY only; TCP vision (`xtls-rprx-vision`, inner HTTPS) and gRPC gun |
+| VLESS | REALITY only. TCP Vision (`xtls-rprx-vision`, inner HTTPS), gRPC gun, and XHTTP `stream-one` over HTTP/2 (`mode=auto` also accepted). |
+| Hysteria 2 | Plain QUIC via `quicz` with `hy2://` or `hysteria2://`. The `obfs` parameter may be omitted, empty, or set to `plain`. Port hopping, obfuscation modes such as Salamander and Gecko, and ECH are unsupported. |
 | VMess | Skipped (counted in stats) |
 
 **Behavior (`best`)**
 
 1. Fetch subscription URL (**HTTPS only**; plaintext schemes → `InsecureSubscriptionUrl`). Redirects are followed only while the resolved target stays HTTPS; `http://` hops are rejected. Scheme is normalized to lowercase for `std.http.Client`.
-2. Base64-decode body; iterate URI lines.
-3. Group proxies by `host` (IP); probe **different hosts in parallel**, **same host sequentially**. Every entry is probed: a failure (even a connect timeout) never skips the host's remaining entries.
-4. Each candidate: **3 probes**; one transient failure (timeout / reset / EOF, `isTransient`) is retried once, any other error fails it immediately; keep **median** latency per preference class. With `--check-volume`, a candidate that passed gets one more unretried attempt (under the full `-t` timeout, not counted toward latency): tunnel to `util.VOLUME_DOMAIN` (`speed.cloudflare.com`), trace warmup, then a `VOLUME_BYTES` (40000) download that must arrive whole (`util.VOLUME_TARGET`); a timeout after the connection is established (`Timeout` / `ConnectionTimedOut`) is `VolumeStalled`, while a connect timeout stays `ConnectTimeout`; a well-formed non-200 download reply is `VolumeRefused`, logged and ignored only after a successful warmup (Cloudflare refused, not the node); it fails VLESS TCP, which has no warmup. Latency = full attempt from dial to the steady reply (handshake, WS upgrade, test requests — warmup + steady, or one request after the inner TLS for vision); Trojan's CA bundle load is excluded, but still counts against `-t`.
-5. Rank with `selectWinner` / `selectBestClass` according to `--strategy` (`hydec` default, `fastest`, `strict`). `hydec`: prefer VLESS² (gRPC) / Trojan → VLESS³ (TCP) → SS, where VLESS² and Trojan are one tier represented by the faster of the two (VLESS² on a tie). Demote the VLESS²/Trojan tier→VLESS³ when it is **>2×** slower; tier→SS when **≥3×** (then keep VLESS³ unless it is **>3×** slower than SS); with no VLESS²/Trojan, demote VLESS³→SS when **>2×** slower. Each demotion also needs an absolute gap of **>15 ms** (`MIN_DEMOTE_GAP_MS`). `fastest`: lowest latency (tie → higher class). `strict`: never demote. `--prefer-stable` (orthogonal to the strategy) ranks by `Rank`: the worst sample instead of the median, and a candidate that needed a retry loses to every clean one; `selectBestRanked` lets classes whose best was retried compete only when no class has a clean best. Within the winning scope (`fastest`: all classes; `hydec`: winning tier; `strict`: winning class; with `--prefer-stable`, restricted to candidates matching the winning `Rank`), candidates within **10%** of the lowest eligible median are compared by mean latency, then lower median, then higher class.
-6. Log winner to **stderr** (`Best: …ms host — name`), then print the raw winning URI to **stdout**. Progress / verbose / errors also go to **stderr** via `std.log`.
+2. Accept base64 or plaintext subscriptions and iterate over the URI lines.
+3. Group proxies by resolved IP, merging groups that share an address. Probe different groups in parallel with up to 64 workers and each group sequentially. A failure leaves the group's remaining entries eligible for probing.
+4. Each candidate: **3 probes**; one transient failure (timeout / reset / EOF, `isTransient`) is retried once, any other error fails it immediately; keep **median** latency per preference class. With `--check-volume`, a candidate that passed gets one more unretried attempt (under the full `-t` timeout, not counted toward latency): tunnel to `util.VOLUME_DOMAIN` (`speed.cloudflare.com`), trace warmup, then a `VOLUME_BYTES` (40000) download that must arrive whole (`util.VOLUME_TARGET`); a timeout after the connection is established (`Timeout` / `ConnectionTimedOut`) is `VolumeStalled`, while a connect timeout stays `ConnectTimeout`; a well-formed non-200 download reply is `VolumeRefused`, logged and ignored only after a successful warmup (Cloudflare refused, not the node); it fails VLESS TCP, which has no warmup. Latency = full attempt from dial to the steady reply (handshake, WS upgrade, test requests — warmup + steady, or one request after the inner TLS for vision); Trojan and Hysteria 2 exclude CA bundle loading from measured latency and count it against `-t`.
+5. Rank with `selectWinner` and `selectBestClass`. The `hydec` strategy starts with VLESS² (REALITY gRPC), Trojan and Hysteria 2 in one tier and uses the fastest class for demotion. It demotes that tier to VLESS³ (REALITY TCP Vision or XHTTP) when the top tier is **>2×** slower. Shadowsocks becomes eligible when the top tier is **≥3×** slower. In that case, prefer VLESS³ if available unless it is **>3×** slower than Shadowsocks. With the top tier absent, demote VLESS³ to Shadowsocks when VLESS³ is **>2×** slower. Every demotion also needs an absolute gap of **>15 ms** (`MIN_DEMOTE_GAP_MS`). The `fastest` strategy compares all classes. The `strict` strategy uses the first successful class in VLESS² → Trojan → Hysteria 2 → VLESS³ → Shadowsocks order. With `--prefer-stable`, strategies use the worst sample and consider candidates that needed a retry only if every candidate needed one. Within the eligible scope, candidates within **10%** of the lowest median are compared by mean, then median, then class (VLESS² → Trojan → VLESS³ → Shadowsocks → Hysteria 2). The eligible scope is all classes for `fastest`, the winning tier for `hydec`, or the winning class for `strict`. With `--prefer-stable` it is further restricted to candidates matching the winning `Rank`.
+6. Log the winner to **stderr** (`Best: …ms host — name`) and print its URI to **stdout**. By default, replace the hostname with the IP reached by the probe when possible. For Trojan, VLESS REALITY and Hysteria 2, preserve the original hostname as `sni` if that parameter is missing or empty. `--raw` prints the original URI. Progress, verbose output and errors also go to **stderr** via `std.log`.
 
 **Behavior (`ping`)**
 
 1. Parse one proxy URI from the CLI.
 2. Probe it **3 times** (same retry rule as `best`, plus the volume attempt with `--check-volume`); log `OK: …` or `FAIL: …` to **stderr**.
-3. Exit `0` on success, `1` on probe failure.
+3. Exit `0` on success, `1` on probe failure, or `2` for invalid CLI input or an invalid proxy URI.
 
 **`--interface` / `-I`**
 
@@ -53,12 +54,13 @@ Optional bind spec for **probe** sockets only (subscription fetch unchanged):
 | Path | Role |
 |------|------|
 | `src/main.zig` | Entry, orchestration |
-| `src/cli.zig` | Commands: `best <URI>`, `ping <PROXY>`; `-t/--timeout`, `-I/--interface`, `-v/--verbose` (`best`), `--strategy` (`best`; default `hydec`), `--prefer-stable` (`best`), `--check-volume` (`best`, `ping`), `-V/--version` |
+| `src/cli.zig` | Commands: `best <URI>`, `ping <PROXY>`; `-t/--timeout`, `-I/--interface`, `-v/--verbose` (`best`), `--strategy` (`best`; default `hydec`), `--prefer-stable` and `--raw` (`best`), `--check-volume` (`best`, `ping`), `-V/--version` |
 | `src/fetch.zig` | Download subscription (HTTPS-only gate) |
 | `src/subscription.zig` | Base64 decode, line iteration |
 | `src/proxy_uri.zig` | URI parse (kind, host/port, query, `#name`) |
 | `src/probe.zig` | Group-by-host parallel `findBest`, preference ranking, `probeOne` / `probeLatency` |
-| `src/ss.zig` / `trojan.zig` / `reality.zig` | Protocol probes |
+| `src/ss.zig` / `trojan.zig` / `reality.zig` / `hy2.zig` | Protocol probes |
+| `src/ca_bundle.zig` | Process-wide CA cache and Windows QUIC snapshots |
 | `src/tls_client.zig` | TLS client based on Zig 0.17 `std.crypto.tls.Client`, with ALPN support |
 | `src/alpn.zig` | `alpn=` parsing and transport-specific defaults |
 | `src/vless.zig` / `grpc_gun.zig` / `ws.zig` | Framing helpers |
@@ -149,7 +151,7 @@ Prefer focused unit tests (URI parse, framing, grouping). Live subscription prob
 
 - Version via `-Dversion=...` (default `0.1.0-dev`).
 - Multi-target archives: `just ver=0.1.0 build-all` (see `justfile`).
-- CI / tagged releases: `.forgejo/workflows/ci.yaml` (Forgejo; `just build-all` + OpenWrt apk on push/PR/tag). No GitHub Actions workflow or git-cliff config in-repo.
+- CI / tagged releases: `.forgejo/workflows/ci.yaml` (Forgejo; `just build-all` + OpenWrt apk on push/PR/tag). Tagged releases use `cliff.toml` to generate their changelog.
 
 ## Commit and PR guidelines
 
