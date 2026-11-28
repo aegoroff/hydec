@@ -239,6 +239,7 @@ fn parseXhttp(arena: std.mem.Allocator, proxy: proxy_uri.Proxy) !@FieldType(real
         xPaddingObfsMode: ?bool = null,
         noGRPCHeader: ?bool = null,
         downloadSettings: ?std.json.Value = null,
+        headers: ?std.json.ArrayHashMap([]const u8) = null,
         xPaddingBytes: ?std.json.Value = null,
     };
     if (util.getQueryParam(proxy.query, "extra")) |raw| {
@@ -256,7 +257,8 @@ fn parseXhttp(arena: std.mem.Allocator, proxy: proxy_uri.Proxy) !@FieldType(real
                 else => return error.InvalidXhttpExtra,
             };
             try validateXhttpMode(extra.mode);
-            if ((extra.xPaddingObfsMode orelse false) or (extra.noGRPCHeader orelse false) or extra.downloadSettings != null)
+            if ((extra.xPaddingObfsMode orelse false) or (extra.noGRPCHeader orelse false) or extra.downloadSettings != null or
+                (if (extra.headers) |headers| headers.map.count() != 0 else false))
                 return error.UnsupportedXhttpExtra;
             if (extra.xPaddingBytes) |padding| {
                 options.padding = switch (padding) {
@@ -1166,7 +1168,7 @@ pub fn findBest(
 const PrintedLine = struct { text: []const u8, owned: bool };
 
 /// Podkop dials `server` from the URI and resolves a domain through its own DoH.
-/// Hand it the address the probe connected to. `sni` in the query stays the name.
+/// Preserve the TLS name when replacing the host with the dialed address.
 fn printedLine(gpa: std.mem.Allocator, winner: *const WorkItem, raw_output: bool) !PrintedLine {
     if (raw_output) return .{ .text = winner.raw, .owned = false };
     if (Io.net.IpAddress.parse(winner.proxy.host, winner.proxy.port)) |_| {
@@ -1177,7 +1179,10 @@ fn printedLine(gpa: std.mem.Allocator, winner: *const WorkItem, raw_output: bool
         error.OutOfMemory => return err,
         else => return .{ .text = winner.raw, .owned = false },
     };
-    if (winner.proxy.kind != .hysteria2) return .{ .text = text, .owned = true };
+    switch (winner.proxy.kind) {
+        .trojan, .vless, .hysteria2 => {},
+        else => return .{ .text = text, .owned = true },
+    }
     errdefer gpa.free(text);
 
     const frag_at = std.mem.findScalar(u8, text, '#') orelse text.len;
@@ -1254,10 +1259,13 @@ test "printed uri uses the probe address when grouping stored none" {
     try std.testing.expectEqualStrings("trojan://pw@203.0.113.9:443?security=tls&sni=example.com", line.text);
 }
 
-test "printed hysteria2 URI preserves the default TLS name with an IP authority" {
+test "printed TLS proxy URIs preserve the server name with an IP authority" {
     const gpa = std.testing.allocator;
-    const prefix = "hy2://pass@example.com:8443/";
-    const rendered = "hy2://pass@[2001:db8::1]:8443/";
+    const schemes = [_][]const u8{
+        "hy2://pass@",
+        "trojan://pass@",
+        "vless://00000000-1111-2222-3333-444444444444@",
+    };
     const cases = [_]struct { suffix: []const u8, want: []const u8 }{
         .{ .suffix = "#name", .want = "?sni=example.com#name" },
         .{ .suffix = "?insecure=0#name", .want = "?insecure=0&sni=example.com#name" },
@@ -1265,24 +1273,26 @@ test "printed hysteria2 URI preserves the default TLS name with an IP authority"
         .{ .suffix = "?insecure=0&sni#name", .want = "?insecure=0&sni=example.com#name" },
         .{ .suffix = "?sni=alt%2Eexample#name", .want = "?sni=alt%2Eexample#name" },
     };
-    for (cases) |case| {
-        const raw = try gpa.print("{s}{s}", .{ prefix, case.suffix });
-        defer gpa.free(raw);
-        var proxy = try proxy_uri.parse(gpa, raw);
-        defer proxy.deinit(gpa);
-        const item: WorkItem = .{
-            .raw = raw,
-            .proxy = proxy,
-            .addresses = &.{},
-            .dialed = try Io.net.IpAddress.parse("2001:db8::1", 8443),
-        };
-        const want = try gpa.print("{s}{s}", .{ rendered, case.want });
-        defer gpa.free(want);
+    for (schemes) |scheme| {
+        for (cases) |case| {
+            const raw = try gpa.print("{s}example.com:8443/{s}", .{ scheme, case.suffix });
+            defer gpa.free(raw);
+            var proxy = try proxy_uri.parse(gpa, raw);
+            defer proxy.deinit(gpa);
+            const item: WorkItem = .{
+                .raw = raw,
+                .proxy = proxy,
+                .addresses = &.{},
+                .dialed = try Io.net.IpAddress.parse("2001:db8::1", 8443),
+            };
+            const want = try gpa.print("{s}[2001:db8::1]:8443/{s}", .{ scheme, case.want });
+            defer gpa.free(want);
 
-        const line = try printedLine(gpa, &item, false);
-        defer if (line.owned) gpa.free(line.text);
+            const line = try printedLine(gpa, &item, false);
+            defer if (line.owned) gpa.free(line.text);
 
-        try std.testing.expectEqualStrings(want, line.text);
+            try std.testing.expectEqualStrings(want, line.text);
+        }
     }
 }
 
@@ -2225,6 +2235,8 @@ test "XHTTP reads panel defaults and configured padding from share links" {
         .{ .query = "&mode=stream-one&x_padding_bytes=500%2D1500&extra=%7B%22noGRPCHeader%22:false,%22xPaddingObfsMode%22:false,%22downloadSettings%22:null%7D", .min = 500, .max = 1500 },
         .{ .query = "&x_padding_bytes=500-1500&extra=%257B%2522xPaddingBytes%2522%253A%25221500-1600%2522%257D", .min = 1500, .max = 1600 },
         .{ .query = "&extra=%7B%22mode%22:%22stream-one%22,%22xPaddingBytes%22:800%7D", .min = 800, .max = 800 },
+        .{ .query = "&extra=%7B%22headers%22:%7B%7D%7D", .min = 100, .max = 1000 },
+        .{ .query = "&extra=%7B%22headers%22:null%7D", .min = 100, .max = 1000 },
     };
     for (cases) |case| {
         const raw = try std.mem.concat(gpa, u8, &.{ address, case.query });
@@ -2245,6 +2257,8 @@ test "XHTTP rejects incompatible options and malformed padding" {
         .{ .query = "&extra=%7B%22xPaddingObfsMode%22:true%7D", .err = error.UnsupportedXhttpExtra },
         .{ .query = "&extra=%7B%22noGRPCHeader%22:true%7D", .err = error.UnsupportedXhttpExtra },
         .{ .query = "&extra=%7B%22downloadSettings%22:%7B%7D%7D", .err = error.UnsupportedXhttpExtra },
+        .{ .query = "&extra=%7B%22headers%22:%7B%22X-Route%22:%22fixture%22%7D%7D", .err = error.UnsupportedXhttpExtra },
+        .{ .query = "&extra=%7B%22headers%22:%5B%5D%7D", .err = error.InvalidXhttpExtra },
         .{ .query = "&mode=packet-up", .err = error.UnsupportedXhttpMode },
         .{ .query = "&mode=auto&extra=%7B%22mode%22:%22stream-up%22%7D", .err = error.UnsupportedXhttpMode },
         .{ .query = "&extra=%7B", .err = error.InvalidXhttpExtra },

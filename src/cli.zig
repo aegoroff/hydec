@@ -107,27 +107,29 @@ fn dupeOpt(gpa: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
     return null;
 }
 
-fn wantsHelp(args: []const []const u8) bool {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return true;
-    }
-    return false;
-}
-
-fn wantsVersion(args: []const []const u8) bool {
-    for (args) |arg| {
-        if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) return true;
-    }
-    return false;
-}
-
-fn shortTakesValue(options: []const zig_cli.Option, short: u8) bool {
+fn optionTakesValue(options: []const zig_cli.Option, arg: []const u8) bool {
     for (options) |opt| {
-        if (opt.short) |s| {
-            if (s == short) return opt.option_type != .bool;
-        }
+        if (opt.matches(arg)) return opt.option_type != .bool;
     }
     return false;
+}
+
+const RequestedAction = enum { run, help, version };
+
+fn requestedAction(options: []const zig_cli.Option, args: []const []const u8) RequestedAction {
+    if (args.len == 0) return .help;
+    var version = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (optionTakesValue(options, arg)) {
+            i += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
+        if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) version = true;
+    }
+    return if (version) .version else .run;
 }
 
 fn normalizeArgs(
@@ -138,8 +140,10 @@ fn normalizeArgs(
     var list: std.ArrayList([]const u8) = .empty;
     errdefer list.deinit(gpa);
 
-    for (args) |arg| {
-        if (arg.len >= 3 and arg[0] == '-' and arg[1] != '-' and shortTakesValue(options, arg[1])) {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (arg.len >= 3 and optionTakesValue(options, arg[0..2])) {
             try list.append(gpa, arg[0..2]);
             try list.append(gpa, arg[2..]);
             continue;
@@ -154,6 +158,10 @@ fn normalizeArgs(
             }
         }
         try list.append(gpa, arg);
+        if (optionTakesValue(options, arg) and i + 1 < args.len) {
+            i += 1;
+            try list.append(gpa, args[i]);
+        }
     }
     return try list.toOwnedSlice(gpa);
 }
@@ -441,12 +449,12 @@ pub fn parse(gpa: std.mem.Allocator, io: Io, args: std.process.Args) !ParseResul
 
     const raw_args = try collectArgs(gpa, args);
     defer freeCollectedArgs(gpa, raw_args);
-    const arg_slice = try normalizeArgs(gpa, normalizeOptionsFor(root, raw_args), raw_args);
-    defer gpa.free(arg_slice);
+    const options = normalizeOptionsFor(root, raw_args);
 
-    if (arg_slice.len == 0 or wantsHelp(arg_slice)) {
-        if (arg_slice.len >= 1) {
-            if (root.findSubcommand(arg_slice[0])) |sub| {
+    const action = requestedAction(options, raw_args);
+    if (action == .help) {
+        if (raw_args.len >= 1) {
+            if (root.findSubcommand(raw_args[0])) |sub| {
                 const usage = try gpa.print("hydec {s}", .{sub.name});
                 defer gpa.free(usage);
                 try printHelp(io, sub, usage);
@@ -456,13 +464,16 @@ pub fn parse(gpa: std.mem.Allocator, io: Io, args: std.process.Args) !ParseResul
         try printHelp(io, root, "hydec");
         return .help;
     }
-    if (wantsVersion(arg_slice)) {
+    if (action == .version) {
         return .version;
     }
 
-    if (arg_slice.len == 0 or root.findSubcommand(arg_slice[0]) == null) {
+    if (root.findSubcommand(raw_args[0]) == null) {
         return error.UnknownCommand;
     }
+
+    const arg_slice = try normalizeArgs(gpa, options, raw_args);
+    defer gpa.free(arg_slice);
 
     capture = .{ .gpa = gpa };
     var parser = zig_cli.Parser.init(gpa);
@@ -513,6 +524,44 @@ test "normalizeArgs expands attached interface" {
     try std.testing.expectEqual(@as(usize, 3), normalized.len);
     try std.testing.expectEqualStrings("-I", normalized[0]);
     try std.testing.expectEqualStrings("eth0", normalized[1]);
+}
+
+test "normalizeArgs preserves a separate option value that looks like another option" {
+    const gpa = std.testing.allocator;
+    const options = [_]zig_cli.Option{
+        zig_cli.Option.init("timeout", "timeout", "", .int).withShort('t'),
+        zig_cli.Option.init("interface", "interface", "", .string).withShort('I'),
+    };
+    const raw = [_][]const u8{ "-I", "--timeout=--help" };
+
+    const normalized = try normalizeArgs(gpa, &options, &raw);
+    defer gpa.free(normalized);
+
+    try std.testing.expectEqualSlices([]const u8, &raw, normalized);
+}
+
+test "help and version are recognized only as standalone options" {
+    const options = [_]zig_cli.Option{
+        zig_cli.Option.init("timeout", "timeout", "", .int).withShort('t'),
+        zig_cli.Option.init("interface", "interface", "", .string).withShort('I'),
+    };
+    const cases = [_]struct {
+        raw: []const []const u8,
+        want: RequestedAction,
+    }{
+        .{ .raw = &.{"--timeout=--help"}, .want = .run },
+        .{ .raw = &.{"--timeout=--version"}, .want = .run },
+        .{ .raw = &.{"-t-h"}, .want = .run },
+        .{ .raw = &.{ "-I", "-t--help" }, .want = .run },
+        .{ .raw = &.{ "--interface", "--version" }, .want = .run },
+        .{ .raw = &.{ "--interface=--help", "-V" }, .want = .version },
+        .{ .raw = &.{ "--version", "-t3", "--help" }, .want = .help },
+        .{ .raw = &.{"--help=--version"}, .want = .run },
+        .{ .raw = &.{}, .want = .help },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.want, requestedAction(&options, case.raw));
+    }
 }
 
 test "parseStrategy defaults to hydec and rejects unknown names" {
